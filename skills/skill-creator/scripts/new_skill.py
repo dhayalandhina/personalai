@@ -145,7 +145,8 @@ def validate(name: str | None = None, root: Path | None = None, run_selftests: b
                     continue
                 cmd = [sys.executable, str(sp), "--selftest"] if sp.suffix == ".py" else ["bash", str(sp), "--selftest"]
                 try:
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env={**os.environ, "DD_SKILL_DIR": str(d)})
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+                                       env={**os.environ, "DD_SKILL_DIR": str(d), "DD_AGENT": "1"})
                     if r.returncode != 0:
                         problems.append(f"{d.name}/{sp.name}: selftest failed: {(r.stderr or r.stdout)[-200:]}")
                 except subprocess.TimeoutExpired:

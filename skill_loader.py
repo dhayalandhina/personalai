@@ -196,9 +196,11 @@ class SkillLibrary:
             raise FileNotFoundError(f"{name}: no script '{script}' (have: {s.scripts})")
         cmd = [sys.executable, str(p)] if p.suffix == ".py" else ["bash", str(p)]
         cmd += [str(a) for a in (args or [])]
-        full_env = {**os.environ, "DD_SKILL_DIR": str(s.path), **(env or {})}
+        # DD_AGENT=1 + stdin=DEVNULL: scripts run by the agent can never pass an owner-only TTY gate
+        full_env = {**os.environ, "DD_SKILL_DIR": str(s.path), "DD_AGENT": "1", **(env or {})}
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=full_env)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=full_env,
+                               stdin=subprocess.DEVNULL)
             return {"ok": r.returncode == 0, "code": r.returncode,
                     "stdout": r.stdout[-20000:], "stderr": r.stderr[-4000:]}
         except subprocess.TimeoutExpired:

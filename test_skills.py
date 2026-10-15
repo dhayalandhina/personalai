@@ -27,9 +27,10 @@ def main() -> int:
             if sp.suffix not in (".py", ".sh"):
                 continue
             cmd = [sys.executable, str(sp), "--selftest"] if sp.suffix == ".py" else ["bash", str(sp), "--selftest"]
-            env = {**os.environ, "DD_SKILL_DIR": str(s.path), "DD_HOME": str(ROOT / ".dd-test")}
+            env = {**os.environ, "DD_SKILL_DIR": str(s.path), "DD_HOME": str(ROOT / ".dd-test"), "DD_AGENT": "1"}
             try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+                # stdin=DEVNULL: never inherit the terminal, so no script can block on input()
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env, stdin=subprocess.DEVNULL)
             except subprocess.TimeoutExpired:
                 failures.append(f"{s.name}/{script}: selftest timeout")
                 continue

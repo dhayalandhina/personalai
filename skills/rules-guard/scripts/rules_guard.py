@@ -81,7 +81,10 @@ def cmd_show() -> int:
 
 
 def owner_gate(action: str) -> bool:
-    """Only an interactive human terminal passes. Agent subprocesses have no TTY."""
+    """Only an interactive human terminal passes. Agent subprocesses run with DD_AGENT=1 and stdin=DEVNULL."""
+    if os.environ.get("DD_AGENT"):
+        print(f"REFUSED: `{action}` is owner-only; refused inside the agent loop (DD_AGENT set).")
+        return False
     if not sys.stdin.isatty():
         print(f"REFUSED: `{action}` is owner-only and needs an interactive terminal (no TTY).")
         return False
@@ -129,14 +132,16 @@ def cmd_reinit() -> int:
 def selftest() -> int:
     tmp = tempfile.mkdtemp(prefix="dd-rules-")
     os.environ["DD_HOME"] = tmp
+    os.environ["DD_AGENT"] = "1"  # selftest must never prompt, even when run from a real terminal
     assert cmd_init() == 0
     assert cmd_verify() == 0
     rules, _ = paths()
     os.chmod(rules, 0o644)
     rules.write_text(rules.read_text() + "\n17. injected rule\n")
     assert cmd_verify() == 1, "tamper must be detected"
-    # owner gate must refuse without TTY (selftest runs non-interactive)
+    # owner gate must refuse inside the agent (DD_AGENT) and without a TTY — never prompt
     assert cmd_reinit() == 1
+    assert cmd_update(str(rules)) == 1
     shutil.rmtree(tmp, ignore_errors=True)
     print("rules_guard selftest ok")
     return 0
