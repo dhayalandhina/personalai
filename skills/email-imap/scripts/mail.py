@@ -159,7 +159,8 @@ def draft(to: str, subject: str, body: str, reply_to_uid: str | None = None) -> 
         except Exception:
             pass
     msg.set_content(body)
-    path = home() / "mail" / "drafts" / f"{int(time.time())}_{re.sub(r'[^\w]+', '_', subject)[:40]}.eml"
+    slug = re.sub(r"[^\w]+", "_", subject)[:40]  # outside the f-string: py3.10/3.11 forbid backslashes there
+    path = home() / "mail" / "drafts" / f"{int(time.time())}_{slug}.eml"
     path.write_bytes(bytes(msg))
     return {"ok": True, "draft": str(path), "to": to, "subject": subject, "sent": False}
 

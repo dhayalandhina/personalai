@@ -89,7 +89,8 @@ def render(md: str) -> str:
                     buf += "*" + escape(t[2:-2]) + "*"
                 elif t.startswith("["):
                     m = re.match(r"\[([^\]]+)\]\(([^)\s]+)\)", t)
-                    buf += f"[{escape(m.group(1))}]({m.group(2).replace(')', '\\)')})"
+                    url = m.group(2).replace(")", "\\)")  # outside the f-string: py3.10/3.11 compat
+                    buf += f"[{escape(m.group(1))}]({url})"
                 else:
                     t = re.sub(r"^(#{1,3})\s+(.*)$", lambda m: f"**{m.group(2)}**", t, flags=re.M)
                     for sub in re.split(r"(\*\*[^*\n]+\*\*)", t):
