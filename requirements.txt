@@ -1,0 +1,14 @@
+# core skills are stdlib-only. These power web-search, documents, data-analysis, browser, voice.
+ddgs>=9.0
+pypdf>=5.0
+python-docx>=1.1
+openpyxl>=3.1
+reportlab>=4.0
+pandas>=2.2
+matplotlib>=3.9
+pillow>=10.0
+playwright>=1.45
+# optional (install when you use the skill):
+# faster-whisper, piper-tts            -> voice
+# torch, diffusers, transformers, accelerate, imageio, imageio-ffmpeg -> diffusers backends
+# rembg                                 -> image background removal
