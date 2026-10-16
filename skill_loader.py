@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -229,7 +230,17 @@ class SkillLibrary:
 
     # ---------- tool calling glue ----------
     def tool_schemas(self) -> list[dict]:
+        # Small local models guess names; enums + an explicit skill/script list stop most bad calls.
+        names = list(self.skills)
+        pairs = ", ".join(f"{s.name}/{sc}" for s in self.skills.values() for sc in s.scripts)
         return [
+            {"type": "function", "function": {
+                "name": "run_shell",
+                "description": "Run a shell command on this computer and return its output "
+                               "(read-only/safe commands; destructive commands are blocked). "
+                               "Use this whenever the user asks to run, check or list something.",
+                "parameters": {"type": "object", "required": ["command"],
+                               "properties": {"command": {"type": "string"}}}}},
             {"type": "function", "function": {
                 "name": "list_skills",
                 "description": "List available skills with one-line descriptions.",
@@ -238,12 +249,12 @@ class SkillLibrary:
                 "name": "load_skill",
                 "description": "Load the full instructions of a skill before doing its task.",
                 "parameters": {"type": "object", "required": ["name"],
-                               "properties": {"name": {"type": "string"}}}}},
+                               "properties": {"name": {"type": "string", "enum": names}}}}},
             {"type": "function", "function": {
                 "name": "run_skill_script",
-                "description": "Run a helper script that belongs to a skill.",
+                "description": f"Run a helper script of a skill. Valid skill/script pairs: {pairs}",
                 "parameters": {"type": "object", "required": ["name", "script"],
-                               "properties": {"name": {"type": "string"},
+                               "properties": {"name": {"type": "string", "enum": names},
                                               "script": {"type": "string"},
                                               "args": {"type": "array", "items": {"type": "string"}}}}}},
             {"type": "function", "function": {
@@ -260,8 +271,16 @@ class SkillLibrary:
                 return self.index_prompt()
             if tool == "load_skill":
                 return self.load(args["name"])
+            if tool == "run_shell":
+                return json.dumps(self.run("shell-and-files", "safe_exec.py", [str(args.get("command", ""))]))
             if tool == "run_skill_script":
-                return json.dumps(self.run(args["name"], args["script"], args.get("args") or []))
+                name, script = self._resolve_script(str(args.get("name", "")), str(args.get("script", "")))
+                raw = args.get("args") or []
+                if script == "safe_exec.py":  # the whole command is ONE argument
+                    argv = [raw if isinstance(raw, str) else " ".join(str(a) for a in raw)]
+                else:
+                    argv = shlex.split(raw) if isinstance(raw, str) else [str(a) for a in raw]
+                return json.dumps(self.run(name, script, argv))
             if tool == "read_skill_reference":
                 return self.reference(args["name"], args["file"])
             return f"unknown tool {tool}"
@@ -269,6 +288,23 @@ class SkillLibrary:
             return f"error: {e}"
 
     # ---------- internals ----------
+    def _resolve_script(self, name: str, script: str) -> tuple[str, str]:
+        """Forgive common small-model mistakes: 'skill/script.py', missing '.py', script name passed as skill."""
+        if "/" in script:
+            name, script = script.split("/", 1)
+        if name in self.skills and script in self.skills[name].scripts:
+            return name, script
+        want = {script, f"{script}.py", f"{script}.sh", f"{name}.py", f"{name}.sh"} - {"", ".py", ".sh"}
+        if name in self.skills:
+            for sc in self.skills[name].scripts:
+                if sc in want:
+                    return name, sc
+        hits = [(s.name, sc) for s in self.skills.values() for sc in s.scripts if sc in want]
+        if len(hits) == 1:
+            return hits[0]
+        raise KeyError(f"no script '{script}' in skill '{name}'. Valid: "
+                       + ", ".join(f"{s.name}/{sc}" for s in self.skills.values() for sc in s.scripts))
+
     def _get(self, name: str) -> Skill:
         if name not in self.skills:
             raise KeyError(f"unknown skill '{name}' (have: {', '.join(self.skills) or 'none'})")
