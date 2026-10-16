@@ -48,6 +48,15 @@ python3 examples/dd_loop_ollama.py     # chat
 ```
 Personal rules: edit a copy of `skills/rules-guard/assets/RULES.default.md`, then `python3 skills/rules-guard/scripts/rules_guard.py update --file my_rules.md` (owner terminal only). Rules, memory, learning data and `.env` live in `~/.dd/` — never in this repo.
 
+## JARVIS mode (voice)
+```bash
+pip3 install faster-whisper
+python3 examples/dd_jarvis.py               # push-to-talk: Enter start, Enter stop
+python3 examples/dd_jarvis.py --hands-free  # always listening: "Jarvis, innaiku weather enna?"
+python3 examples/dd_jarvis.py --text        # type, dd speaks back
+```
+Mic via ffmpeg, speech-to-text via faster-whisper (local), brain = same dd agent loop + skills, voice via macOS `say` (Piper/espeak elsewhere). First run asks macOS for microphone permission for your terminal app.
+
 ## Use from any agent
 - **dd's own loop (Ollama / llama.cpp)**: see `examples/dd_loop_ollama.py` — `SkillLibrary.index_prompt()` in the system prompt, `tool_schemas()` as tools, `dispatch()` for calls.
 - **Claude Code / Claude Agent SDK**: copy or symlink `skills/*` into `.claude/skills/` — the format is identical; skills appear as slash commands and load on trigger.
