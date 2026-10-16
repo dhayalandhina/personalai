@@ -15,6 +15,8 @@ python3 scripts/healthcheck.py                 # one JSON: host, disk, ram, cpu 
 python3 scripts/healthcheck.py --brief         # one-line summary for Telegram "/status"
 bash scripts/backup.sh                         # tar.gz of $DD_HOME (minus browser-profile, tmp, video renders) → $DD_BACKUP_DIR (default ~/dd-backups), keeps last 14
 bash scripts/backup.sh restore FILE.tar.gz     # restores into $DD_HOME (current one moved to $DD_HOME.bak)
+bash scripts/disk_cleanup.sh                   # PREVIEW: regenerable caches + sizes (deletes nothing)
+bash scripts/disk_cleanup.sh --clean           # owner terminal only, typed YES; dd itself is refused
 ```
 
 ## Service cheat-sheet (local, free)
@@ -27,7 +29,7 @@ bash scripts/backup.sh restore FILE.tar.gz     # restores into $DD_HOME (current
 
 ## Rules
 - `/status` reply = `healthcheck.py --brief` output, nothing else, unless something is red — then one line per red item with the fix command.
-- Disk < 10 % free → first suggest cleaning `$DD_HOME/video/`, old backups, Ollama models not used in 30 days (`models.py list`), never user files.
+- Disk < 10 % free → run `disk_cleanup.sh` (preview) and show Dhina the list. Never delete anything yourself: he runs `--clean` in his own terminal. The script only knows regenerable caches; passwords, Keychain, Chrome profile, Documents/Desktop/Downloads/Photos, Trash, `_Review_Before_Delete`, models and project folders are never on its list.
 - Restart a service only when its check fails; say what was restarted.
 - Backups run weekly (via `scheduler-reminders` `--action system-ops`) and before any `rules_guard.py update`. Backup contains memory + learning data → stays local, never uploaded to a public repo.
 - Logs: `$DD_HOME/logs/dd.log` (rotate at 10 MB). Read the last 100 lines on a crash; grep the first `Traceback`.
