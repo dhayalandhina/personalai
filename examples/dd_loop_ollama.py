@@ -112,6 +112,15 @@ def main(argv: list[str]) -> int:
     if dry:
         print(turn(messages, "plan list pannu", model_fn))
         return 0
+    try:  # preflight: fail at boot with the fix, not on the first message with a traceback
+        with urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=3) as r:
+            names = [m["name"] for m in json.loads(r.read().decode()).get("models", [])]
+    except Exception:
+        print(f"Ollama not reachable at {OLLAMA}. Install: brew install ollama  (or https://ollama.com/download), then: ollama serve")
+        return 1
+    if MODEL not in names and f"{MODEL}:latest" not in names:
+        print(f"Model '{MODEL}' not pulled. Run: ollama pull {MODEL}   (have: {', '.join(names) or 'none'})")
+        return 1
     if "--once" in argv:
         print(turn(messages, argv[argv.index("--once") + 1], model_fn))
         return 0
