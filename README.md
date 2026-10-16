@@ -1,11 +1,11 @@
 # dd-skills — skill library for dd (personal AI assistant)
 
-25 drop-in skills in the open **Agent Skills** format (`skills/<name>/SKILL.md` + `scripts/` + `references/` + `assets/`), a progressive-disclosure loader, a validator that runs every script's `--selftest`, and an example zero-key agent loop on Ollama. Everything is free / open-source / self-hosted. No paid APIs anywhere.
+26 drop-in skills in the open **Agent Skills** format (`skills/<name>/SKILL.md` + `scripts/` + `references/` + `assets/`), a progressive-disclosure loader, a validator that runs every script's `--selftest`, and an example zero-key agent loop on Ollama. Everything is free / open-source / self-hosted. No paid APIs anywhere.
 
 ```
 dd-skills/
 ├── skill_loader.py        # index → load → run (3 levels), Ollama/OpenAI tool schemas, keyword routing
-├── test_skills.py         # validates all 25 skills + runs 33 selftests (run after every change)
+├── test_skills.py         # validates all 26 skills + runs 33 selftests (run after every change)
 ├── examples/dd_loop_ollama.py   # minimal agent loop: rules check → memory recall → tool calls → log
 ├── install.sh             # pip deps, ~/.dd layout, rules lock, briefing config
 ├── requirements.txt
@@ -34,6 +34,7 @@ dd-skills/
     ├── local-models         Ollama manage, hardware advisor, bench, dd Modelfile builder
     ├── n8n-automation       self-hosted n8n REST: workflows, executions, webhooks, scaffolds
     ├── system-ops           healthcheck (/status), backup/restore of ~/.dd
+    ├── mac-control          JARVIS actions: apps, websites, volume, music, screenshot, lock + instant router
     └── skill-creator        dd scaffolds + validates its own new skills
 ```
 
@@ -41,7 +42,7 @@ dd-skills/
 ```bash
 git clone https://github.com/dhayalandhina/personalai && cd personalai
 bash install.sh                        # deps, ~/.dd, locks the default rules, briefing config
-python3 test_skills.py                 # must print "ALL GOOD: 25 skills valid"
+python3 test_skills.py                 # must print "ALL GOOD: 26 skills valid"
 cp .env.example ~/.dd/.env && chmod 600 ~/.dd/.env   # fill TELEGRAM_BOT_TOKEN etc. (optional per skill)
 ollama pull qwen2.5-coder:7b-instruct-q4_K_M        # or run: python3 skills/local-models/scripts/models.py recommend
 python3 examples/dd_loop_ollama.py     # chat

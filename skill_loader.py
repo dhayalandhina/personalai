@@ -242,6 +242,17 @@ class SkillLibrary:
                 "parameters": {"type": "object", "required": ["command"],
                                "properties": {"command": {"type": "string"}}}}},
             {"type": "function", "function": {
+                "name": "mac_action",
+                "description": "Do something on the Mac: open-app/quit-app (args: [app name]), open-url ([url]), "
+                               "search-web ([query]), volume ([0-100|up|down|mute|unmute]), media ([play|pause|next|previous]), "
+                               "notify ([text]), time, battery, wifi, apps, screenshot, lock, dark-mode ([on|off|toggle]), "
+                               "clipboard ([get] or [set, text]).",
+                "parameters": {"type": "object", "required": ["action"],
+                               "properties": {"action": {"type": "string", "enum": [
+                                   "open-app", "quit-app", "open-url", "search-web", "volume", "media", "notify", "time",
+                                   "battery", "wifi", "apps", "screenshot", "lock", "dark-mode", "clipboard"]},
+                                   "args": {"type": "array", "items": {"type": "string"}}}}}},
+            {"type": "function", "function": {
                 "name": "list_skills",
                 "description": "List available skills with one-line descriptions.",
                 "parameters": {"type": "object", "properties": {}}}},
@@ -271,6 +282,10 @@ class SkillLibrary:
                 return self.index_prompt()
             if tool == "load_skill":
                 return self.load(args["name"])
+            if tool == "mac_action":
+                raw = args.get("args") or []
+                argv = [raw] if isinstance(raw, str) else [str(a) for a in raw]
+                return json.dumps(self.run("mac-control", "mac.py", [str(args.get("action", ""))] + argv))
             if tool == "run_shell":
                 return json.dumps(self.run("shell-and-files", "safe_exec.py", [str(args.get("command", ""))]))
             if tool == "run_skill_script":
