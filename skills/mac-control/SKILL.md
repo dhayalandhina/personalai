@@ -3,7 +3,7 @@ name: mac-control
 description: Control Dhina's Mac like JARVIS — open/quit apps, open websites, volume, music play/pause/next, notifications, time, battery, Wi-Fi, screenshot, lock screen, clipboard, dark mode, running apps. Plus a fast intent router so common spoken/typed commands ("chrome open pannu", "volume 30", "mani enna") run instantly without waiting for the LLM. Use for any request to do something on the computer itself.
 triggers: [open, quit, close app, volume, sound, mute, play, pause, next song, music, spotify, screenshot, lock, battery, wifi, time, mani, clipboard, dark mode, notification, chrome, safari, vscode]
 metadata:
-  version: "1.0"
+  version: "1.1"
   owner: dhina
 ---
 
@@ -25,11 +25,19 @@ python3 scripts/mac.py screenshot [--out ~/Desktop/shot.png]
 python3 scripts/mac.py lock
 python3 scripts/mac.py dark-mode on | off | toggle
 python3 scripts/mac.py clipboard get | set "text"
+python3 scripts/mac.py open-folder downloads | desktop | documents | personalai
+python3 scripts/mac.py weather | news                             # via daily-briefing
+python3 scripts/mac.py remind 10m "call amma"                     # via scheduler-reminders
 python3 scripts/mac.py route "chrome open pannu"                  # fast router: JSON {action,args} or {"action": null}
 ```
 
 ## Fast router
 `route` maps common English + Thanglish phrases to an action. The dd loop calls it before the LLM; a hit runs immediately and replies in one line. A miss goes to the LLM as usual. Add phrases in `ROUTES` inside `scripts/mac.py`.
+
+Examples it understands: "chrome open pannu", "downloads folder", "volume 30", "adutha paattu", "innaiku weather enna", "innaiku news", "20 nimisham la tea kudikka remind pannu", "remind me in 2 hours to call client", "mani enna".
+Weather/news/reminder routes only fire on clear phrasing, so coding requests like "news feed component fix pannu" still go to the LLM.
+
+Reminders fire from the dd loop and JARVIS mode (checked every 30 s): Mac notification + printed + spoken in JARVIS mode.
 
 ## Rules
 - These actions are reversible and need no confirmation.

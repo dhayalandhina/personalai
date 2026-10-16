@@ -92,10 +92,60 @@ def build(action: str, args: list[str]) -> list[list[str]]:
     raise ValueError(f"unknown action '{action}'")
 
 
+SKILLS = Path(__file__).resolve().parents[2]
+FOLDERS = {"downloads": "~/Downloads", "download": "~/Downloads", "desktop": "~/Desktop", "documents": "~/Documents",
+           "home": "~", "personalai": "~/personalai", "applications": "/Applications", "pictures": "~/Pictures"}
+
+
+def skill_script(skill: str, script: str, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(SKILLS / skill / "scripts" / script), *args], capture_output=True,
+                          text=True, timeout=timeout, stdin=subprocess.DEVNULL, env={**os.environ, "DD_AGENT": "1"})
+
+
+def run_skill_action(action: str, args: list[str]) -> dict:
+    """Router actions served by other skills (weather/news via daily-briefing, remind via scheduler-reminders)."""
+    if action == "weather":
+        r = skill_script("daily-briefing", "briefing.py", ["--json", "--weather-only"])
+        try:
+            w = json.loads(r.stdout)["weather"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return {"ok": False, "action": action, "error": "weather fetch failed"}
+        if "error" in w:
+            return {"ok": False, "action": action, "error": w["error"]}
+        return {"ok": True, "action": action, "say": f"{w['location']}: ippo {w['now_c']}°C, {w['sky']}, max {w['today_max_c']}, "
+                                                       f"mazhai chance {w['rain_chance_pct']}%."}
+    if action == "news":
+        r = skill_script("daily-briefing", "briefing.py", ["--json", "--news-only", "--max", "2"])
+        try:
+            items = [f"{i['title']}" for s in json.loads(r.stdout)["news"] if s["ok"] for i in s["items"]][:5]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            items = []
+        if not items:
+            return {"ok": False, "action": action, "error": "news feeds fetch aagala"}
+        return {"ok": True, "action": action, "say": "Top news: " + " | ".join(items)}
+    if action == "remind":
+        when, text = args[0], args[1]
+        r = skill_script("scheduler-reminders", "reminders.py", ["add", text, "--in", when])
+        try:
+            res = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            return {"ok": False, "action": action, "error": r.stderr[-200:] or "reminder add failed"}
+        if not res.get("ok"):
+            return {"ok": False, "action": action, "error": res.get("error", "reminder add failed")}
+        return {"ok": True, "action": action, "say": f"Ok, {res['due']} ku '{text}' remind panren."}
+    raise ValueError(action)
+
+
 def run(action: str, args: list[str]) -> dict:
     if action == "time":
         return {"ok": True, "action": "time", "say": time.strftime("Ippo mani %I:%M %p, %A %d %B")}
-    cmds = build(action, args)
+    if action in ("weather", "news", "remind"):
+        return run_skill_action(action, args)
+    if action == "open-folder":
+        path = os.path.expanduser(FOLDERS.get(args[0].lower(), args[0]) if args else "~")
+        cmds = [["open", path]]
+    else:
+        cmds = build(action, args)
     if DRY:
         return {"ok": True, "action": action, "dry_run": True, "would_run": cmds}
     out = []
@@ -113,7 +163,16 @@ APP_WORDS = "|".join(sorted(map(re.escape, APPS), key=len, reverse=True))
 SITE_WORDS = "|".join(sorted(map(re.escape, SITES), key=len, reverse=True))
 OPEN = r"(?:open|thira|start|launch|run|kaattu)\w*"
 CLOSE = r"(?:close|quit|mooodu|moodu|kill|stop)\w*"
+FOLDER_WORDS = "|".join(sorted(map(re.escape, FOLDERS), key=len, reverse=True))
+DUR = r"(\d+)\s*(min|mins|minutes?|nimisham|nimidam|nimisam|h|hr|hrs|hours?|mani\s+neram|mani\s+nearam)"
 ROUTES: list[tuple[str, str, object]] = [
+    (rf"\bremind\s+me\s+in\s+{DUR}\s+(?:to\s+)?(.+)$", "remind", "remind_en"),
+    (rf"\b{DUR}\s+(?:la|le|kalichu|kazhichu|aprom|apram)\s+(.+?)\s+(?:nu\s+|ah\s+|a\s+)?(?:remind|nyabagapaduthu|sollu)\w*", "remind", "remind_ta"),
+    (rf"\b(?:{OPEN})\s+({FOLDER_WORDS})\s+folder\b|\b({FOLDER_WORDS})\s+folder\s+(?:ah\s+|a\s+)?(?:{OPEN})|\b({FOLDER_WORDS})\s+folder\b", "open-folder", "grp"),
+    (r"\b(?:innaiku|today|ippo|now)\s+(?:weather|temperature)\b|\b(?:weather|temperature)\s+(?:enna|eppadi|evlo|sollu|how|today|innaiku)\b"
+     r"|^(?:weather|temperature)$|\bmazhai\s+(?:varuma|varumaa|irukka|irukuma|varum)\b|\bveyil\s+(?:evlo|enna)\b", "weather", []),
+    (r"\b(?:innaiku|today|latest|top|indha)\s+(?:news|seithi|headlines)\b|\b(?:news|seithi|headlines)\s+(?:enna|sollu|kaattu|what|today|innaiku)\b"
+     r"|^(?:news|headlines)$", "news", []),
     (rf"\b(?:{OPEN})\s+({SITE_WORDS})\b|\b({SITE_WORDS})\s+(?:ah\s+|a\s+)?(?:{OPEN})", "open-url", "site"),
     (rf"\b(?:{OPEN})\s+({APP_WORDS})\b|\b({APP_WORDS})\s+(?:ah\s+|a\s+|app\s+)?(?:{OPEN})", "open-app", "app"),
     (rf"\b(?:{CLOSE})\s+({APP_WORDS})\b|\b({APP_WORDS})\s+(?:ah\s+|a\s+|app\s+)?(?:{CLOSE})", "quit-app", "app"),
@@ -145,7 +204,11 @@ def route(text: str) -> dict:
         if not m:
             continue
         groups = [g for g in m.groups() if g] if m.groups() else []
-        if kind == "num":
+        if kind in ("remind_en", "remind_ta"):
+            n, unit, what = groups[0], groups[1], groups[2].strip(" .")
+            u = "m" if unit.startswith(("m", "n")) and "mani" not in unit else "h"
+            args = [f"{n}{u}", what]
+        elif kind == "num":
             args = [groups[0]]
         elif kind in ("app", "site", "grp"):
             args = [groups[0]]
@@ -160,7 +223,7 @@ def route(text: str) -> dict:
     return {"action": None}
 
 
-REPLIES = {"open-app": "{0} open panniten.", "quit-app": "{0} close panniten.", "open-url": "{0} open panniten.",
+REPLIES = {"open-folder": "{0} folder open panniten.", "open-app": "{0} open panniten.", "quit-app": "{0} close panniten.", "open-url": "{0} open panniten.",
            "search-web": "Google la '{0}' search panniten.", "volume": "Volume {0}.", "media": "Music {0}.",
            "screenshot": "Screenshot eduthuten, Desktop la irukku.", "lock": "Screen lock panniten.",
            "dark-mode": "Dark mode {0}.", "notify": "Notification potten."}
@@ -193,7 +256,13 @@ def selftest() -> int:
         "adutha paattu podu": ("media", ["next"]), "paattu podu": ("media", ["play"]), "screenshot edu": ("screenshot", []),
         "mani enna?": ("time", []), "battery evlo irukku": ("battery", []), "mac lock pannu": ("lock", []),
         "dark mode on pannu": ("dark-mode", ["on"]), "google pannu ollama latest version": ("search-web", ["ollama latest version"]),
-        "aguaclan erp la invoice bug fix pannu": (None, None), "innaiku news enna": (None, None),
+        "aguaclan erp la invoice bug fix pannu": (None, None), "write a poem about rain": (None, None),
+        "news feed component la bug fix pannu": (None, None), "weather app ku api design pannu": (None, None),
+        "innaiku news enna": ("news", []), "weather eppadi": ("weather", []), "mazhai varuma": ("weather", []),
+        "downloads folder open pannu": ("open-folder", ["downloads"]), "desktop folder": ("open-folder", ["desktop"]),
+        "remind me in 10 minutes to call amma": ("remind", ["10m", "call amma"]),
+        "20 nimisham la tea kudikka remind pannu": ("remind", ["20m", "tea kudikka"]),
+        "2 mani neram kalichu client ku call pannanum nu nyabagapaduthu": ("remind", ["2h", "client ku call pannanum"]),
     }
     for text, (action, args) in cases.items():
         r = route(text)
@@ -207,6 +276,11 @@ def selftest() -> int:
     assert d["handled"] and d["say"] == "chrome open panniten." and d["dry_run"], d
     assert do("time enna")["say"].startswith("Ippo mani")
     assert do("write a poem") == {"handled": False}
+    assert do("downloads folder open pannu")["would_run"] == [["open", os.path.expanduser("~/Downloads")]]
+    import tempfile
+    os.environ["DD_HOME"] = tempfile.mkdtemp(prefix="dd-mac-")
+    rm = do("remind me in 10 minutes to call amma")
+    assert rm["handled"] and rm["ok"] and "call amma" in rm["say"], rm
     print(f"mac selftest ok ({len(cases)} router phrases, dry-run builds)")
     return 0
 

@@ -14,6 +14,8 @@ import re
 import os
 import subprocess
 import sys
+import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -128,6 +130,39 @@ def stub_model(messages: list[dict], tools: list[dict]) -> dict:
     return {"role": "assistant", "content": "Dry-run ok — skill loaded, script ran, loop closed."}
 
 
+def check_reminders(on_fire=None) -> list[dict]:
+    """Fire due reminders once: Mac notification + print + optional callback (JARVIS speaks it)."""
+    r = run_script("scheduler-reminders", "reminders.py", ["due"])
+    try:
+        items = json.loads(r["stdout"] or "[]")
+    except json.JSONDecodeError:
+        return []
+    for it in items:
+        if it.get("action") == "daily-briefing":
+            text = run_script("daily-briefing", "briefing.py", [])["stdout"].strip() or "Briefing fetch aagala."
+        else:
+            text = f"Reminder: {it['text']}"
+        if "mac-control" in LIB.skills:
+            run_script("mac-control", "mac.py", ["notify", text[:200]])
+        print(f"\n⏰ {text}")
+        if on_fire:
+            on_fire(text)
+    return items
+
+
+def start_reminder_watcher(on_fire=None, every: int = 30) -> threading.Thread:
+    def loop():
+        while True:
+            try:
+                check_reminders(on_fire)
+            except Exception as e:  # never kill the chat because of a reminder
+                print(f"\n(reminder check failed: {e})")
+            time.sleep(every)
+    t = threading.Thread(target=loop, daemon=True, name="dd-reminders")
+    t.start()
+    return t
+
+
 def preflight() -> str | None:
     """None when Ollama is up and MODEL is pulled; otherwise the exact fix to show."""
     try:
@@ -158,6 +193,7 @@ def main(argv: list[str]) -> int:
     if "--once" in argv:
         print(turn(messages, argv[argv.index("--once") + 1], model_fn))
         return 0
+    start_reminder_watcher()
     print(f"dd ready ({MODEL}). Ctrl-C to exit.")
     while True:
         try:

@@ -231,6 +231,7 @@ def main(argv: list[str]) -> int:
                  "\n\nVOICE MODE: your reply is spoken aloud. 1-2 short sentences, no tables, no lists; "
                  "put code only when asked (it is shown, not read)."}]
     print(f"JARVIS mode — dd ({dd.MODEL}), STT whisper-{STT_MODEL}, TTS {'say' if MAC else 'piper/espeak'}")
+    dd.start_reminder_watcher(lambda text: speak(text, mute))
     speak("Vanakkam Dhina. dd ready.", mute)
     try:
         hands_free(messages, mute) if "--hands-free" in argv else push_to_talk(messages, mute, typed)
