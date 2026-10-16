@@ -20,6 +20,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from skill_loader import SkillLibrary  # noqa: E402
 
+def _load_env() -> None:
+    """~/.dd/.env values apply unless the shell already set them."""
+    p = Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / ".env"
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            k, sep, v = line.strip().partition("=")
+            if sep and not k.startswith("#") and v.strip():
+                os.environ.setdefault(k.strip(), v.strip().strip('"\''))
+
+
+_load_env()
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 MODEL = os.environ.get("DD_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
 LIB = SkillLibrary(ROOT / "skills")
