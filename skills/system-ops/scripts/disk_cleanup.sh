@@ -123,11 +123,12 @@ selftest() {
   head -c 2000000 /dev/zero > "$t/.npm/_cacache/blob"
   echo pw > "$t/Library/Application Support/Google/Chrome/Default/Login Data"
   echo doc > "$t/Documents/a.txt"; echo keep > "$t/_Review_Before_Delete/x"
-  local out; out=$(CLEAN_HOME="$t" preview)
+  H="$t"; chrome_running() { return 1; }   # everything below works only inside the temp home
+  local out; out=$(preview)
   echo "$out" | grep -q "pip download cache" || { echo "preview missing pip"; return 1; }
   echo "$out" | grep -q "Application Support" && { echo "preview lists protected path"; return 1; }
+  echo "$out" | grep -q "npm download cache" || { echo "preview missing npm"; return 1; }
   DD_AGENT=1 clean >/dev/null && { echo "agent must be refused"; return 1; }
-  H="$t"; chrome_running() { return 1; }
   delete_targets >/dev/null
   [ ! -e "$t/Library/Caches/pip" ] && [ ! -e "$t/.npm/_cacache" ] && [ ! -e "$t/Library/Caches/Google/Chrome" ] || { echo "caches not removed"; return 1; }
   [ -f "$t/Library/Application Support/Google/Chrome/Default/Login Data" ] || { echo "Chrome profile touched!"; return 1; }
