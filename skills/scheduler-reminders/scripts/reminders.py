@@ -156,9 +156,14 @@ def listing(all_: bool = False) -> list[dict]:
 
 
 def due() -> list[dict]:
+    """Claim due items atomically: BEGIN IMMEDIATE takes the write lock before reading, so the background
+    service and an open dd/JARVIS session never fire the same reminder twice."""
     ts = int(time.time())
     out = []
-    with db() as con:
+    con = db()
+    con.isolation_level = None  # manual transaction control
+    try:
+        con.execute("BEGIN IMMEDIATE")
         rows = con.execute("SELECT * FROM reminders WHERE done=0 AND due<=?", (ts,)).fetchall()
         for r in rows:
             out.append({"id": r["id"], "text": r["text"], "action": r["action"], "due": fmt(r["due"])})
@@ -166,6 +171,13 @@ def due() -> list[dict]:
                 con.execute("UPDATE reminders SET due=?, fired=? WHERE id=?", (int(next_cron(r["cron"], now()).timestamp()), ts, r["id"]))
             else:
                 con.execute("UPDATE reminders SET done=1, fired=? WHERE id=?", (ts, r["id"]))
+        con.execute("COMMIT")
+    except Exception:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
     return out
 
 
@@ -214,6 +226,14 @@ def selftest() -> int:
     assert len(d) == 1 and d[0]["text"] == "past item", d
     assert due() == []  # never fires twice
     assert len(listing()) == 2 and len(listing(True)) == 3
+    # two watchers at once (background service + open dd session) -> exactly one fires it
+    import threading
+    add("race item", at="2026-01-01 09:00")
+    got: list[list[dict]] = []
+    ths = [threading.Thread(target=lambda: got.append(due())) for _ in range(4)]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    assert sum(len(g) for g in got) == 1, got
     assert snooze(1, "30m")["updated"] == 1 and len(listing()) == 3
     assert delete(1)["deleted"] == 1
     print("reminders selftest ok")

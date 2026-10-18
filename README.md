@@ -49,6 +49,15 @@ python3 examples/dd_loop_ollama.py     # chat
 ```
 Personal rules: edit a copy of `skills/rules-guard/assets/RULES.default.md`, then `python3 skills/rules-guard/scripts/rules_guard.py update --file my_rules.md` (owner terminal only). Rules, memory, learning data and `.env` live in `~/.dd/` — never in this repo.
 
+## Background mode (keeps your Mac free)
+```bash
+bash skills/system-ops/scripts/background.sh install    # returns at once; setup runs detached at low priority
+bash skills/system-ops/scripts/background.sh status
+```
+Installs voice (faster-whisper + base model) and a launchd background service that only fires reminders as Mac notifications —
+no mic, no screen/app control, no LLM, lowest CPU/IO priority. Talk to dd only when you want: `python3 examples/dd_loop_ollama.py`
+or `python3 examples/dd_jarvis.py`. Stop anytime: `background.sh stop` / `uninstall`.
+
 ## JARVIS mode (voice)
 ```bash
 pip3 install faster-whisper

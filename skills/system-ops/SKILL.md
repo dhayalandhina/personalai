@@ -17,6 +17,8 @@ bash scripts/backup.sh                         # tar.gz of $DD_HOME (minus brows
 bash scripts/backup.sh restore FILE.tar.gz     # restores into $DD_HOME (current one moved to $DD_HOME.bak)
 bash scripts/disk_cleanup.sh                   # PREVIEW: regenerable caches + sizes (deletes nothing)
 bash scripts/disk_cleanup.sh --clean           # owner terminal only, typed YES; dd itself is refused
+bash scripts/background.sh install [--with-7b] # one-time setup, detached + low priority; Mac notification when done
+bash scripts/background.sh status | stop | start | uninstall   # background service (owner terminal only)
 ```
 
 ## Service cheat-sheet (local, free)
@@ -26,6 +28,9 @@ bash scripts/disk_cleanup.sh --clean           # owner terminal only, typed YES;
 | ComfyUI | `curl -s localhost:8188/system_stats` | `cd ComfyUI && source .venv/bin/activate && python main.py --listen 127.0.0.1` |
 | n8n | `curl -s $N8N_URL/healthz` | `npx n8n` or `docker compose up -d n8n` |
 | dd loop | `pgrep -f dd/main.py` | `python3 main.py` (launchd/systemd unit in `references/`) |
+
+## Background mode
+`background.sh install` installs faster-whisper + the Whisper base model and a launchd agent (`com.dhina.dd`) that runs `examples/dd_daemon.py`: reminders → Mac notifications every 30 s. It never uses the mic, never controls the screen or apps, never loads the LLM, and runs at nice 10 with `ProcessType=Background`, so Dhina keeps full use of his Mac. `--with-7b` pulls qwen2.5:7b only when ≥ 12 GB is free. dd itself is refused from install/stop/uninstall.
 
 ## Rules
 - `/status` reply = `healthcheck.py --brief` output, nothing else, unless something is red — then one line per red item with the fix command.
