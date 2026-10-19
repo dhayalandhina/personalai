@@ -25,10 +25,21 @@ def to_wav(src: str, out: str) -> float:
     return round(float(p.stdout.strip() or 0), 2)
 
 
+def wav_samples(wav: str):
+    """16 kHz mono 16-bit wav (what to_wav writes) -> float32 array. Passing samples skips faster-whisper's
+    PyAV decoder, which breaks with PyAV >= 19 (faster-whisper 1.2.1 passes the removed `metadata_errors` arg)."""
+    import wave
+    import numpy as np  # installed with faster-whisper
+    with wave.open(wav, "rb") as w:
+        if (w.getsampwidth(), w.getnchannels(), w.getframerate()) != (2, 1, 16000):
+            raise ValueError("expected 16 kHz mono 16-bit wav")
+        return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+
+
 def transcribe_fw(wav: str, lang: str, model: str) -> dict:
     from faster_whisper import WhisperModel  # pip install faster-whisper
     m = WhisperModel(model, device="auto", compute_type="auto")
-    segments, info = m.transcribe(wav, language=None if lang == "auto" else lang, vad_filter=True)
+    segments, info = m.transcribe(wav_samples(wav), language=None if lang == "auto" else lang, vad_filter=True)
     text = " ".join(s.text.strip() for s in segments)
     return {"text": text, "language": info.language, "language_prob": round(info.language_probability, 2), "engine": f"faster-whisper/{model}"}
 

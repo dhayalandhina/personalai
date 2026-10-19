@@ -9,6 +9,8 @@
   do "text"                         route + run in one step (what the dd loop calls)
   --selftest
 Off macOS (or with DD_MAC_DRY=1) commands are printed, not run.
+On the cloud server (DD_HOST=server) `do` only handles time / weather / news / remind; Mac actions go to the LLM,
+which says it can't control the Mac from there.
 """
 from __future__ import annotations
 
@@ -23,6 +25,11 @@ import urllib.parse
 from pathlib import Path
 
 DRY = platform.system() != "Darwin" or os.environ.get("DD_MAC_DRY") == "1"
+SERVER_OK = {"time", "weather", "news", "remind"}  # router actions that make sense on the cloud server
+
+
+def on_server() -> bool:
+    return os.environ.get("DD_HOST") == "server"
 
 # Spoken names -> real app names
 APPS = {
@@ -196,9 +203,21 @@ ROUTES: list[tuple[str, str, object]] = [
 ]
 
 
+# voice transcripts spell numbers out ("remind me in ten minutes") — turn them into digits before a time unit
+_ONES = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9}
+_NUM_WORDS = {**_ONES, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "an": 1, "a": 1,
+              "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60}
+for _tens, _tv in (("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50)):
+    for _o, _ov in _ONES.items():
+        _NUM_WORDS[f"{_tens} {_o}"] = _NUM_WORDS[f"{_tens}-{_o}"] = _tv + _ov
+_NUM_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, _NUM_WORDS), key=len, reverse=True)) + r")"
+                     r"(?=\s+(?:min|mins|minutes?|h|hr|hrs|hours?|nimisham|nimidam|nimisam)\b)")
+
+
 def route(text: str) -> dict:
     t = re.sub(r"[^\w\s\-.']", " ", text.lower()).strip()
     t = re.sub(r"\s+", " ", t)
+    t = _NUM_RE.sub(lambda m: str(_NUM_WORDS[m.group(1)]), t)
     for pat, action, kind in ROUTES:
         m = re.search(pat, t)
         if not m:
@@ -231,7 +250,7 @@ REPLIES = {"open-folder": "{0} folder open panniten.", "open-app": "{0} open pan
 
 def do(text: str) -> dict:
     r = route(text)
-    if not r["action"]:
+    if not r["action"] or (on_server() and r["action"] not in SERVER_OK):
         return {"handled": False}
     res = run(r["action"], r["args"])
     if not res.get("ok"):
@@ -263,6 +282,9 @@ def selftest() -> int:
         "remind me in 10 minutes to call amma": ("remind", ["10m", "call amma"]),
         "20 nimisham la tea kudikka remind pannu": ("remind", ["20m", "tea kudikka"]),
         "2 mani neram kalichu client ku call pannanum nu nyabagapaduthu": ("remind", ["2h", "client ku call pannanum"]),
+        "Remind me in ten minutes to call the client.": ("remind", ["10m", "call the client"]),
+        "remind me in twenty five minutes to stretch": ("remind", ["25m", "stretch"]),
+        "remind me in an hour to call a friend": ("remind", ["1h", "call a friend"]),
     }
     for text, (action, args) in cases.items():
         r = route(text)
@@ -281,7 +303,13 @@ def selftest() -> int:
     os.environ["DD_HOME"] = tempfile.mkdtemp(prefix="dd-mac-")
     rm = do("remind me in 10 minutes to call amma")
     assert rm["handled"] and rm["ok"] and "call amma" in rm["say"], rm
-    print(f"mac selftest ok ({len(cases)} router phrases, dry-run builds)")
+    os.environ["DD_HOST"] = "server"  # cloud server: Mac actions are not handled, reminders/time still are
+    assert do("chrome open pannu") == {"handled": False}
+    assert do("volume 30 vei") == {"handled": False}
+    assert do("mani enna?")["handled"]
+    assert do("20 nimisham la tea kudikka remind pannu")["ok"]
+    os.environ.pop("DD_HOST")
+    print(f"mac selftest ok ({len(cases)} router phrases, dry-run builds, server mode)")
     return 0
 
 

@@ -79,6 +79,16 @@ def rms(wav_path: Path) -> float:
 
 
 # ---------------- speech to text ----------------
+def wav_samples(wav_path: Path):
+    """16 kHz mono 16-bit wav -> float32 array. Passing samples (not a path) skips faster-whisper's PyAV
+    decoder, which breaks with PyAV >= 19 (faster-whisper 1.2.1 passes the removed `metadata_errors` arg)."""
+    import numpy as np  # installed with faster-whisper
+    with wave.open(str(wav_path), "rb") as w:
+        if (w.getsampwidth(), w.getnchannels(), w.getframerate()) != (2, 1, 16000):
+            raise ValueError("expected 16 kHz mono 16-bit wav")
+        return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+
+
 def transcribe(wav_path: Path) -> str:
     global _whisper
     if rms(wav_path) < 150:  # silence / mic blocked
@@ -86,7 +96,7 @@ def transcribe(wav_path: Path) -> str:
     if _whisper is None:
         from faster_whisper import WhisperModel  # pip install faster-whisper
         _whisper = WhisperModel(STT_MODEL, device="auto", compute_type="int8")
-    segs, _ = _whisper.transcribe(str(wav_path), language=None if STT_LANG == "auto" else STT_LANG,
+    segs, _ = _whisper.transcribe(wav_samples(wav_path), language=None if STT_LANG == "auto" else STT_LANG,
                                   vad_filter=True, initial_prompt=THANGLISH_HINT, beam_size=1)
     return " ".join(s.text.strip() for s in segs).strip()
 

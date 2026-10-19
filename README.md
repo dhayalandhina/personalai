@@ -5,8 +5,9 @@
 ```
 dd-skills/
 ├── skill_loader.py        # index → load → run (3 levels), Ollama/OpenAI tool schemas, keyword routing
-├── test_skills.py         # validates all 26 skills + runs 33 selftests (run after every change)
+├── test_skills.py         # validates all 26 skills + runs 36 selftests (run after every change)
 ├── examples/dd_loop_ollama.py   # minimal agent loop: rules check → memory recall → tool calls → log
+├── examples/dd_telegram.py      # Telegram bot runner (text + voice notes, reminders) — the cloud server mode
 ├── install.sh             # pip deps, ~/.dd layout, rules lock, briefing config
 ├── requirements.txt
 └── skills/
@@ -58,6 +59,19 @@ Installs voice (faster-whisper + base model) and a launchd background service th
 no mic, no screen/app control, no LLM, lowest CPU/IO priority. Talk to dd only when you want: `python3 examples/dd_loop_ollama.py`
 or `python3 examples/dd_jarvis.py`. Stop anytime: `background.sh stop` / `uninstall`.
 
+## Cloud mode (free 24/7 server — the Mac does nothing)
+dd runs on an **Oracle Cloud Always Free** VM and you talk to it on Telegram (text or voice notes). Free limit in 2026: Ampere A1, 2 OCPU / 12 GB RAM, 200 GB disk.
+1. Oracle Cloud account (Visa/Mastercard credit card for verification; RuPay is declined). Create instance → image **Ubuntu 24.04**, shape **VM.Standard.A1.Flex**, **2 OCPU / 12 GB**, download the SSH key.
+2. Telegram → @BotFather → `/newbot` → copy the token.
+3. From the Mac: `chmod 400 ~/Downloads/ssh-key-*.key && ssh -i ~/Downloads/ssh-key-*.key ubuntu@SERVER_IP`
+4. On the server:
+```bash
+sudo apt-get update -y && sudo apt-get install -y git && sudo git clone https://github.com/dhayalandhina/personalai /opt/dd && bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh install
+```
+It asks for the bot token (hidden), then shows `/pair CODE` — send that to your bot. Then message the bot: `hi`, `/help`, a voice note, `20 nimisham la tea kudikka remind pannu`.
+Server commands: `bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh status | update | token | pair`.
+Safety: dd runs as user `dd` (no sudo, read-only system dirs), only your paired Telegram account gets answers, nothing listens on the internet — don't open port 11434. Replies are slower than on the Mac (2 CPU cores, no GPU).
+
 ## JARVIS mode (voice)
 ```bash
 pip3 install faster-whisper
@@ -79,4 +93,4 @@ Mic via ffmpeg, speech-to-text via faster-whisper (local), brain = same dd agent
 - Nothing here edits the locked rules. Learned preferences lose to rules on conflict.
 
 ## Status
-Validated on 15 Oct 2026: 25 skills, 33 scripts, all selftests passing (`test_skills.py`). Live ComfyUI / Ollama / Telegram / IMAP paths need those services on your machine; their scripts fail gracefully with the install line when absent.
+Validated on 19 Oct 2026: 26 skills, 36 scripts, all selftests passing (`test_skills.py`), plus `examples/*.py --selftest` (agent loop, JARVIS, daemon, Telegram bot) and a full `cloud_setup.sh install` run on Ubuntu 24.04 (systemd/Ollama stubbed). Live ComfyUI / Ollama / Telegram / IMAP paths need those services on your machine; their scripts fail gracefully with the install line when absent.

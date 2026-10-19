@@ -137,6 +137,11 @@ class SkillLibrary:
     def __init__(self, root: str | os.PathLike | None = None):
         self.root = Path(root) if root else Path(__file__).resolve().parent / "skills"
         self.skills: dict[str, Skill] = {}
+        # Hidden skills are never offered to the model on this machine, but stay runnable internally
+        # (e.g. the reminder/time router inside mac-control on the cloud server).
+        self.hidden = {s.strip() for s in os.environ.get("DD_HIDE_SKILLS", "").split(",") if s.strip()}
+        if os.environ.get("DD_HOST") == "server":
+            self.hidden.add("mac-control")  # a cloud server cannot control the Mac
         self.reload()
 
     # ---------- discovery ----------
@@ -158,12 +163,16 @@ class SkillLibrary:
     def names(self) -> list[str]:
         return list(self.skills)
 
+    def offered(self) -> list[Skill]:
+        """Skills the model may see and call on this machine."""
+        return [s for s in self.skills.values() if s.name not in self.hidden]
+
     # ---------- level 1: index ----------
     def index_prompt(self) -> str:
         lines = ["<available_skills>",
                  "Load a skill with load_skill(name) BEFORE doing the task it covers.",
                  "Run its helpers with run_skill_script(name, script, args)."]
-        for s in self.skills.values():
+        for s in self.offered():
             lines.append(f"- {s.name}: {s.description}")
         lines.append("</available_skills>")
         return "\n".join(lines)
@@ -231,9 +240,9 @@ class SkillLibrary:
     # ---------- tool calling glue ----------
     def tool_schemas(self) -> list[dict]:
         # Small local models guess names; enums + an explicit skill/script list stop most bad calls.
-        names = list(self.skills)
-        pairs = ", ".join(f"{s.name}/{sc}" for s in self.skills.values() for sc in s.scripts)
-        return [
+        names = [s.name for s in self.offered()]
+        pairs = ", ".join(f"{s.name}/{sc}" for s in self.offered() for sc in s.scripts)
+        tools = [
             {"type": "function", "function": {
                 "name": "run_shell",
                 "description": "Run a shell command on this computer and return its output "
@@ -274,15 +283,22 @@ class SkillLibrary:
                 "parameters": {"type": "object", "required": ["name", "file"],
                                "properties": {"name": {"type": "string"}, "file": {"type": "string"}}}}},
         ]
+        if "mac-control" not in self.skills or "mac-control" in self.hidden:
+            tools = [t for t in tools if t["function"]["name"] != "mac_action"]
+        return tools
 
     def dispatch(self, tool: str, args: dict | None = None) -> str:
         args = args or {}
         try:
             if tool == "list_skills":
                 return self.index_prompt()
+            if tool in ("load_skill", "read_skill_reference") and str(args.get("name", "")) in self.hidden:
+                return f"error: skill '{args['name']}' is not available on this machine"
             if tool == "load_skill":
                 return self.load(args["name"])
             if tool == "mac_action":
+                if "mac-control" in self.hidden:
+                    return "error: mac_action is not available on this machine (dd is running on the cloud server, not the Mac)"
                 raw = args.get("args") or []
                 argv = [raw] if isinstance(raw, str) else [str(a) for a in raw]
                 return json.dumps(self.run("mac-control", "mac.py", [str(args.get("action", ""))] + argv))
@@ -290,6 +306,8 @@ class SkillLibrary:
                 return json.dumps(self.run("shell-and-files", "safe_exec.py", [str(args.get("command", ""))]))
             if tool == "run_skill_script":
                 name, script = self._resolve_script(str(args.get("name", "")), str(args.get("script", "")))
+                if name in self.hidden:
+                    return f"error: skill '{name}' is not available on this machine"
                 raw = args.get("args") or []
                 if script == "safe_exec.py":  # the whole command is ONE argument
                     argv = [raw if isinstance(raw, str) else " ".join(str(a) for a in raw)]
