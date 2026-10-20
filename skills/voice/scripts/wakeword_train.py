@@ -300,15 +300,22 @@ def audio_features():
     return AudioFeatures(melspec_onnx_model_path=mel, embedding_onnx_model_path=emb, ncpu=2)
 
 
-def stage_feats(work: Path) -> None:
+def stage_feats(work: Path, chunk: int = 1000) -> None:
+    """Embeddings in chunks of `chunk` clips (memory-mapped input) — the clip arrays are GBs, RAM is not."""
     np = _np()
     af = audio_features()
     for name in ("pos", "neg"):
-        x = np.load(work / f"{name}.npy")
+        x = np.load(work / f"{name}.npy", mmap_mode="r")
         t0 = time.time()
-        emb = af.embed_clips((x * 32767).astype(np.int16), batch_size=64)
+        parts = []
+        for i in range(0, len(x), chunk):
+            xi = (np.asarray(x[i:i + chunk]) * 32767).astype(np.int16)
+            parts.append(af.embed_clips(xi, batch_size=64).astype(np.float32))
+            del xi
+            print(f"{name} {min(i + chunk, len(x))}/{len(x)} {time.time() - t0:.0f}s", flush=True)
+        emb = np.concatenate(parts)
         print(f"{name} embeddings {emb.shape} in {time.time() - t0:.0f}s", flush=True)
-        np.save(work / f"{name}_emb.npy", emb.astype(np.float32))
+        np.save(work / f"{name}_emb.npy", emb)
 
 
 def fit_head(X, y, hidden: int = 96, seed: int = 0):
