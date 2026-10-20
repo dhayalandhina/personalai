@@ -29,6 +29,13 @@ python3 scripts/tts.py "Innaiku briefing ready." --out reply.wav [--voice en_US-
 ```
 `--ogg` makes a Telegram-ready voice note (opus). Tamil script is never produced by dd, so Thanglish text is spoken by an English voice — keep sentences short; for proper Tamil pronunciation use a Tamil Piper voice if one is installed (`--voice ta_IN-...`).
 
+## Wake word ("dee dee") — train dd's own, free
+```bash
+pip3 install piper-tts openwakeword scipy scikit-learn
+python3 scripts/wakeword_train.py all          # ~30-40 min CPU: Piper voices → clips → openWakeWord embeddings → head
+```
+Writes `assets/wake_dd.npz` (~1 MB). The Mac app loads it next to the pre-trained "hey jarvis" model (`examples/dd_listen.py` `DDHead`): "dee dee" / "hey dee dee" then wakes dd too. Fires only when two 80 ms chunks agree; wakes with no command raise its threshold by itself (`DD_WAKE_DD_THRESHOLD`, default 0.9; `DD_WAKE_DD=0` turns it off). Held-out-voice recall / false-positive rates are printed and saved to `report.json` in the work dir. Positives/negatives are synthetic (Piper, 900+ speakers) — if it misses *your* voice, add 20-30 real recordings of you saying it to the positives and retrain.
+
 ## Rules
 1. Reply to a voice note in text by default; speak only when asked or for video narration.
 2. Never store raw audio in memory; store the transcript only if it contains a durable fact.
