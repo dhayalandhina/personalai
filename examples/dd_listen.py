@@ -121,7 +121,7 @@ class Segmenter:
         utt, spoken = b"".join(self.frames), self.speech_frames * FRAME_MS
         if forced:  # steady noise kept it "speaking" for the whole window: treat that level as room noise from now on
             avg = self.energy_sum / max(1, len(self.frames))
-            for _ in range(40):
+            for _ in range(15):  # enough to lift p90 for ~3 s; forgotten once the room is quiet again
                 self._idle_level(avg)
         self.reset()
         self.last_forced = forced
@@ -645,7 +645,7 @@ def selftest() -> int:
     for f in _tone(9000):
         lis.feed(f)
     assert calls["n"] == 0 and "continuous audio" in lis.last_heard, (calls, lis.last_heard)
-    for f in _quiet(2500):  # the room goes quiet again -> the floor relaxes
+    for f in _quiet(3200):  # the room goes quiet again -> the floor relaxes
         lis.feed(f)
     assert lis.seg.threshold() < 1000, lis.seg.threshold()
     lis.followup_until = now["t"] + 8
@@ -656,6 +656,8 @@ def selftest() -> int:
     lis.stt = fake_stt
 
     # an utterance Whisper can't read is still visible as "(sound, no words)"
+    for f in _quiet(3200):  # let the floor relax after the long dictation
+        lis.feed(f)
     heard = iter([""])
     speak_utt()
     assert lis.last_heard.startswith("(sound, no words"), lis.last_heard
