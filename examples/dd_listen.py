@@ -486,6 +486,11 @@ def default_speak(text: str) -> None:
     dd_jarvis.speak(text, mute=False)
 
 
+def default_stop_speaking() -> bool:
+    import dd_jarvis
+    return dd_jarvis.stop_speaking()
+
+
 def make_handle():
     """The brain: same dd agent loop + skills; short answers for speech (num_predict cap keeps it quick)."""
     try:
@@ -613,7 +618,7 @@ def make_wake_detector():
 class Listener:
     def __init__(self, source=None, stt_fn=None, speak=None, handle=None, on_state=None, on_heard=None,
                  on_problem=None, followup_s: float | None = None, clock=time.monotonic, log=print,
-                 inline: bool = False, wake=None):
+                 inline: bool = False, wake=None, stop_speak=None):
         self.source = source or mic_source
         # wake: a WakeDetector (default: openwakeword if installed), False = none (Whisper text wake only)
         self.wake = make_wake_detector() if wake is None else (wake or None)
@@ -638,6 +643,8 @@ class Listener:
         self.followup_until = 0.0
         self.tail = 0            # frames still to drop after dd finished speaking (its own echo)
         self.speaking = False
+        self.pending_wake = False  # a wake heard while dd spoke (barge-in): armed as soon as it is quiet
+        self.stop_speak_fn = stop_speak or default_stop_speaking
         self.zero_run = 0        # consecutive all-zero frames (mic blocked -> digital silence)
         self.problem_sent = False
         self.last_heard = ""
@@ -688,6 +695,13 @@ class Listener:
             self.speaking = False
             self.tail = 20  # 400 ms: let the room go quiet before listening again
         self.set_state("listening")
+
+    def interrupt(self) -> None:
+        """Stop the sentence being spoken (barge-in); say() then returns and the room goes back to listening."""
+        try:
+            self.stop_speak_fn()
+        except Exception as e:
+            self.log(f"  (could not stop speaking: {e})")
 
     def on_wake(self, score: float) -> None:
         """'hey jarvis' detected: short sound (without pausing the mic), then the next utterance is the command."""
@@ -784,6 +798,15 @@ class Listener:
             return
         if self.speaking or self.tail > 0:
             self.tail = max(0, self.tail - (0 if self.speaking else 1))
+            if self.speaking and self.wake is not None and self.wake.feed(frame):  # barge-in: "hey jarvis" mid-sentence
+                self.log("  wake: hey jarvis while speaking — cutting the reply")
+                self.interrupt()
+                self.pending_wake = True
+            return
+        if self.pending_wake:  # the wake that interrupted dd: arm now that it is quiet
+            self.pending_wake = False
+            self.tail = 0
+            self.on_wake(self.wake.last_score if self.wake is not None else 1.0)
             return
         if self.state in ("paused", "starting"):
             self.set_state("listening")
@@ -1152,6 +1175,19 @@ def selftest() -> int:
     for f in _quiet(200):
         lg.feed(f)
     assert lg.state == "listening" and len(gate_stt_calls) == 2
+    # barge-in: "hey jarvis" while dd is talking cuts the sentence, then arms as soon as it is quiet
+    stops = []
+    lg.stop_speak_fn = lambda: stops.append(1) or True
+    lg.speaking, fw.fire_in = True, 1
+    lg.feed(_quiet(20)[0])
+    assert stops == [1] and lg.pending_wake and lg.state == "listening"
+    lg.speaking = False  # say() returned
+    lg.feed(_quiet(20)[0])
+    assert not lg.pending_wake and lg.state == "recording" and lg.armed_until > now["t"], lg.state
+    now["t"] += 30
+    for f in _quiet(200):
+        lg.feed(f)
+    assert lg.state == "listening"
 
     # 4a. whisper cache probe: only a snapshot that holds model.bin counts as "already downloaded"
     import stat as _stat

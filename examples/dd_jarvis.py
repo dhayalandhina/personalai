@@ -125,22 +125,64 @@ def for_speech(text: str) -> str:
     return t[:900]
 
 
+PREFERRED_VOICES = ("Rishi", "Veena", "Samantha")  # Indian-English voices read Thanglish far more naturally
+_voice: str | None = None
+_speaking: subprocess.Popen | None = None
+
+
+def pick_voice() -> str:
+    """DD_VOICE if set, else the first preferred voice installed on this Mac ('' = system default). Cached."""
+    global _voice
+    if _voice is not None:
+        return _voice
+    _voice = os.environ.get("DD_VOICE", "")
+    if not _voice and MAC and shutil.which("say"):
+        try:
+            listing = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10).stdout
+            names = {line.split()[0] for line in listing.splitlines() if line.strip()}
+            _voice = next((v for v in PREFERRED_VOICES if v in names), "")
+        except Exception:
+            _voice = ""
+    return _voice
+
+
+def stop_speaking() -> bool:
+    """Barge-in: cut the current sentence (you said 'hey jarvis' while dd was talking). True if something stopped."""
+    p = _speaking
+    if p is not None and p.poll() is None:
+        try:
+            p.kill()
+        except Exception:
+            return False
+        return True
+    return False
+
+
+def _play(cmd: list[str]) -> None:
+    global _speaking
+    _speaking = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _speaking.wait()
+    finally:
+        _speaking = None
+
+
 def speak(text: str, mute: bool = False) -> None:
     line = for_speech(text)
     if mute or not line:
         return
     if MAC and shutil.which("say"):
         cmd = ["say", "-r", os.environ.get("DD_SAY_RATE", "190")]
-        if os.environ.get("DD_VOICE"):
-            cmd += ["-v", os.environ["DD_VOICE"]]
-        subprocess.run(cmd + [line], check=False)
+        if pick_voice():
+            cmd += ["-v", pick_voice()]
+        _play(cmd + [line])
         return
     wav = TMP / "reply.wav"
     r = dd.run_script("voice", "tts.py", [line, "--out", str(wav)])
     player = shutil.which("afplay") or shutil.which("ffplay") or shutil.which("aplay")
     if r["ok"] and player:
         extra = ["-nodisp", "-autoexit", "-loglevel", "error"] if player.endswith("ffplay") else []
-        subprocess.run([player, *extra, str(wav)], check=False)
+        _play([player, *extra, str(wav)])
 
 
 # ---------------- main loop ----------------
@@ -178,6 +220,18 @@ def check_deps(typed: bool) -> str | None:
 
 
 def selftest() -> int:
+    # voice pick is cached and never raises; barge-in stops a running player and reports it
+    global _voice
+    _voice = None
+    assert isinstance(pick_voice(), str) and pick_voice() == pick_voice()
+    assert stop_speaking() is False
+    import threading
+    t = threading.Thread(target=_play, args=(["sleep", "5"],), daemon=True)
+    t.start()
+    time.sleep(0.3)
+    assert stop_speaking() is True
+    t.join(timeout=3)
+    assert not t.is_alive() and _speaking is None
     assert split_wake("Jarvis, innaiku weather enna?") == (True, "innaiku weather enna?")
     assert split_wake("hey jarvis") == (True, "")
     assert split_wake("dd status kaattu") == (True, "status kaattu")
