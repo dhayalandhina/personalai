@@ -70,5 +70,13 @@ if [ -f "$MIC_SRC" ] && { [ ! -x "$MIC_BIN" ] || [ "$MIC_SRC" -nt "$MIC_BIN" ]; 
   fi
 fi
 
+# self-update: fast-forward the code at every start (bounded; offline or diverged = skip)
+if [ -d "$REPO/.git" ] && [ "${DD_NO_UPDATE:-}" != "1" ]; then
+  git -C "$REPO" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=10 pull --ff-only -q >/dev/null 2>&1 &
+  gp=$!; for _ in $(seq 1 20); do kill -0 "$gp" 2>/dev/null || break; sleep 1; done
+  kill "$gp" 2>/dev/null; wait "$gp" 2>/dev/null
+  echo "code now: $(git -C "$REPO" log --oneline -1 2>/dev/null | cut -c1-60)"
+fi
+
 cd "$REPO" || exit 1
 exec "$PY" examples/dd_app.py

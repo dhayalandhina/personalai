@@ -104,8 +104,26 @@ class AppCore:
             tip = "\nUn voice threshold ku keezha — konjam pakkathula / sathamaa pesu."
         return f"Heard: {heard}\nmic peak {r.get('peak')}, speech starts above {r.get('threshold')}{tip}"
 
+    def update(self) -> tuple[bool, str]:
+        """git pull --ff-only in the dd folder. (changed, message)"""
+        repo = dd.ROOT
+        before = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+        r = subprocess.run(["git", "-C", str(repo), "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=10",
+                            "pull", "--ff-only", "-q"], capture_output=True, text=True, timeout=60)
+        after = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
+        if r.returncode != 0:
+            return False, f"update aagala: {(r.stderr or r.stdout).strip()[-200:]}"
+        if before == after:
+            return False, f"already latest ({after})"
+        return True, f"updated {before} → {after} — dd restart aagudhu"
+
+    def relaunch(self) -> None:
+        """Quit and reopen (macOS): a detached shell reopens the app after we exit."""
+        subprocess.Popen(["/bin/sh", "-c", "sleep 2; open -a dd || open -a /Applications/dd.app || true"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
     def menu_labels(self) -> list[str]:
-        return [self.listening_label(), self.last_label(), "Mic test (3 s)", "Open chat", "Status", "Quit dd"]
+        return [self.listening_label(), self.last_label(), "Mic test (3 s)", "Open chat", "Status", "Update dd", "Quit dd"]
 
     def open_chat(self) -> list[str]:
         cmd = [sys.executable, str(CHAT)]
@@ -125,7 +143,7 @@ def run_menu_bar(core: AppCore) -> int:
     class DDBar(rumps.App):
         def __init__(self):
             super().__init__("dd", title=core.icon(), quit_button=None)
-            self.menu = ["Pause listening", "Heard: (nothing yet)", "Mic test (3 s)", "Open chat", "Status", None, "Quit dd"]
+            self.menu = ["Pause listening", "Heard: (nothing yet)", "Mic test (3 s)", "Open chat", "Status", "Update dd", None, "Quit dd"]
             self.menu["Heard: (nothing yet)"].set_callback(None)
             self.timer = rumps.Timer(self.refresh, 0.4)
             self.timer.start()
@@ -153,6 +171,15 @@ def run_menu_bar(core: AppCore) -> int:
         @rumps.clicked("Status")
         def status(self, _):
             rumps.alert("dd", core.status_text())
+
+        @rumps.clicked("Update dd")
+        def update(self, _):
+            changed, msg = core.update()
+            notify(msg)
+            if changed:
+                core.relaunch()
+                core.stop()
+                rumps.quit_application()
 
         @rumps.clicked("Quit dd")
         def quit(self, _):
@@ -241,7 +268,9 @@ def selftest() -> int:
         lis.feed(f)
     assert core.test_result and core.test_result["heard"] == "jarvis mani enna", core.test_result
     assert "Heard: jarvis mani enna" in core.test_text() and "mic peak" in core.test_text()
-    assert "Mic test (3 s)" in core.menu_labels() and "mic " in core.last_label()
+    assert "Mic test (3 s)" in core.menu_labels() and "mic " in core.last_label() and "Update dd" in core.menu_labels()
+    changed, msg = core.update()  # this checkout is at HEAD of its branch or offline: never an exception
+    assert isinstance(changed, bool) and msg
 
     # start/stop the ears thread
     lis.stop.wait = lambda *_: None

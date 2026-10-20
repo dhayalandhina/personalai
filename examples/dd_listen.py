@@ -133,11 +133,17 @@ def wake_words() -> set[str]:
     return WAKE_FORMS | extra
 
 
-def _is_wake(cand: str, forms: set[str]) -> bool:
+def _is_wake(cand: str, forms: set[str], loose: bool = False) -> bool:
+    """loose=True also accepts garbled repeats of the wake word ("gavis", "narvis", "jarvi") after a real one."""
     c = re.sub(r"[^a-z0-9]", "", cand)
     if not c:
         return False
-    return c in forms or (len(c) >= 4 and difflib.SequenceMatcher(None, c, "jarvis").ratio() >= 0.75)
+    if c in forms:
+        return True
+    if len(c) < 4:
+        return False
+    r = difflib.SequenceMatcher(None, c, "jarvis").ratio()
+    return r >= 0.75 or (loose and len(c) <= 8 and r >= 0.6)
 
 
 def parse_wake(text: str) -> tuple[bool, str]:
@@ -150,7 +156,7 @@ def parse_wake(text: str) -> tuple[bool, str]:
             if i + n > len(words) or not _is_wake("".join(words[i:i + n]), forms):
                 continue
             rest = words[i + n:]
-            while rest and (_is_wake(rest[0], forms) or rest[0] in LEAD_SKIP):  # "dd jarvis ..." / "dd, hey ..."
+            while rest and (_is_wake(rest[0], forms, loose=True) or rest[0] in LEAD_SKIP):  # "dd jarvis gavis narvis ..."
                 rest = rest[1:]
             return True, " ".join(rest).strip()
     return False, text.strip()
@@ -378,18 +384,18 @@ class Listener:
             self.tail = 20  # 400 ms: let the room go quiet before listening again
         self.set_state("listening")
 
-    def ack(self) -> None:
-        """Wake word heard, no command yet: a short system sound (instant) or a spoken 'Sollu.'"""
+    def ack(self, sound_only: bool = False) -> None:
+        """Wake word heard. sound_only: a short system sound (command already understood, action follows).
+        Otherwise a spoken 'Sollu.' — unmistakable: dd is waiting for the command."""
         tink = Path("/System/Library/Sounds/Tink.aiff")
-        if MAC and tink.exists() and os.environ.get("DD_MUTE") != "1":
-            self.set_state("speaking")
+        if sound_only and MAC and tink.exists() and os.environ.get("DD_MUTE") != "1":
             self.speaking = True
             try:
                 subprocess.run(["afplay", str(tink)], check=False, timeout=5)
             finally:
                 self.speaking, self.tail = False, 10
-            self.set_state("listening")
-        else:
+            return
+        if not sound_only:
             self.say("Sollu.")
 
     def process(self, utt: bytes) -> None:
@@ -423,6 +429,8 @@ class Listener:
             self.set_state("recording")
             return
         command = cmd if woke else text
+        if woke:
+            self.ack(sound_only=True)  # "heard you" — instant, before the action or the model
         self.set_state("thinking")
         t1 = self.clock()
         if self.handle is None:
@@ -617,6 +625,8 @@ def selftest() -> int:
 
     # 2. wake word parsing — the ways Whisper writes "dd"/"jarvis", and words that must NOT wake
     cases = {
+        "ok dd, jarvis, gavis, Narvis": (True, ""), "jarvis jarvis jarvis": (True, ""), "Jarvis. Jarvi, chrome open pannu": (True, "chrome open pannu"),
+        "dd narvis volume 30": (True, "volume 30"),
         "enna rvis, open chrome.": (True, "open chrome"), "dd, jarvis, ennaiku,": (True, "ennaiku"),
         "Hendemiz.": (False, "Hendemiz."), "na jan tharvisan tannaw": (False, "na jan tharvisan tannaw"),
         "D.D. open chrome": (True, "open chrome"), "Didi, volume 30.": (True, "volume 30"),
