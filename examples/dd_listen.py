@@ -333,7 +333,8 @@ def whisper_cached(name: str, hub: Path | None = None) -> bool:
 
 def _load(name: str):
     from faster_whisper import WhisperModel  # pip install faster-whisper
-    return WhisperModel(name, device="auto", compute_type="int8")
+    # already downloaded -> never touch the hub again for it (a flaky line must not stall a cached model)
+    return WhisperModel(name, device="auto", compute_type="int8", local_files_only=whisper_cached(name))
 
 
 def load_whisper():

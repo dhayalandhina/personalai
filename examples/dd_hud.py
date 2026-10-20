@@ -91,6 +91,7 @@ class HudPanel:
         import AppKit  # pyobjc-framework-Cocoa (installed with rumps)
         from Foundation import NSMakeRect
         self.AppKit, self.NSMakeRect = AppKit, NSMakeRect
+        AppKit.NSApplication.sharedApplication()  # the window server connection must exist before any window
         rect = NSMakeRect(0, 0, W, H)
         panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(rect, 1 << 7, 2, False)
         panel.setLevel_(25)                                # status-window level: above full-screen video too
