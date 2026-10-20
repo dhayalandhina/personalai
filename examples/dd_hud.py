@@ -57,7 +57,7 @@ class HudModel:
             title = f"“{l.last_command}”" if l.last_command else "…"
             return {"mode": "think", "title": title, "sub": "yosikkiren…", "energy": 0.35}
         if st == "speaking":
-            return {"mode": "speak", "title": l.last_said or "…", "sub": "dd", "energy": 0.6}
+            return {"mode": "speak", "title": l.last_said or "…", "sub": getattr(l, "last_timing", "") or "dd", "energy": 0.6}
         if now < l.followup_until:  # idle, but you may continue without the wake word
             return {"mode": "wait", "title": l.last_said or "…",
                     "sub": f"innum edhavadhu? sollu  ·  {l.followup_until - now:.0f} s",

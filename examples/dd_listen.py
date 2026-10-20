@@ -652,6 +652,7 @@ class Listener:
         self.last_command = ""   # what dd is acting on right now (HUD: shown while thinking)
         self.last_said = ""      # dd's latest spoken reply (HUD: shown while speaking + follow-up window)
         self.woke_at = 0.0       # clock() of the last wake (HUD: countdown)
+        self.last_timing = ""    # "stt 0.8s · brain 1.4s" of the last answer (HUD / log)
         self.level = 0.0         # recent peak mic level (RMS), for the menu / log — "is the mic even hearing me?"
         self._level_win: deque[float] = deque(maxlen=25)
         self._frames = 0
@@ -775,7 +776,9 @@ class Listener:
             reply = self.handle(command) or "Done."
         except Exception as e:
             reply = f"Mudiyala: {type(e).__name__}: {str(e)[:120]}"
-        self.log(f"  you> {command}\n  dd> {reply}  ({self.clock() - t1:.1f}s)")
+        brain_s = self.clock() - t1
+        self.last_timing = f"stt {secs:.1f}s · brain {brain_s:.1f}s"
+        self.log(f"  you> {command}\n  dd> {reply}  ({brain_s:.1f}s; {self.last_timing})")
         self.say(spoken_form(reply))
         self.followup_until = self.clock() + self.followup_s
 
