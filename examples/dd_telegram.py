@@ -453,7 +453,7 @@ class Bot:
         if cmd == "/reminders":
             return self.script("scheduler-reminders", "reminders.py", ["list"])
         if cmd == "/status":
-            return self.script("system-ops", "healthcheck.py", ["--brief"])
+            return f"brain: {dd.brain_label()}\n" + self.script("system-ops", "healthcheck.py", ["--brief"])
         if cmd == "/rules":
             return self.script("rules-guard", "rules_guard.py", ["show"])
         if cmd == "/learn":
@@ -633,12 +633,13 @@ def run_bot() -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     problem = dd.preflight()
-    log(f"dd telegram bot started (model {dd.MODEL}); brain: {problem or 'ok'}")
+    log(f"dd telegram bot started; brain: {dd.brain_label()} ({problem or 'ok'})")
+    threading.Thread(target=dd.warm, daemon=True, name="dd-warm").start()
     threading.Thread(target=bot.worker, daemon=True, name="dd-llm").start()
     threading.Thread(target=bot.cmd_worker, daemon=True, name="dd-cmds").start()
     dd.start_reminder_watcher(on_fire=lambda text: bot.safe_send(bot.owner, "⏰ " + text))
     hello = "Paired ✅ — ini dd unakku mattum reply pannum. /help paaru.\n" if claimed else ""
-    bot.safe_send(bot.owner, hello + f"dd online ✅ ({dd.MODEL})" + (f"\nBrain: {problem}" if problem else ""))
+    bot.safe_send(bot.owner, hello + f"dd online ✅ ({dd.brain_label()})" + (f"\nBrain: {problem}" if problem else ""))
     backoff = 5
     while not bot.stop.is_set():
         try:
