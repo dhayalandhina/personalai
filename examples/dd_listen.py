@@ -142,6 +142,8 @@ def _is_wake(cand: str, forms: set[str], loose: bool = False) -> bool:
         return True
     if len(c) < 4:
         return False
+    if len(c) <= 6 and re.fullmatch(r"d[eiy]+[dt][eiy]+", c):
+        return True  # "diti", "dedee", "didy": Whisper's spellings of a spoken "dee dee" (not data/deed/daddy)
     r = difflib.SequenceMatcher(None, c, "jarvis").ratio()
     return r >= 0.75 or (loose and len(c) <= 8 and r >= 0.6)
 
@@ -1146,6 +1148,8 @@ def selftest() -> int:
         "the dd mani enna": (True, "mani enna"), "okay dd news sollu": (True, "news sollu"),
         "address check pannu": (False, "address check pannu"), "add this file": (False, "add this file"),
         "I'd like tea": (False, "I'd like tea"), "deadline is tomorrow": (False, "deadline is tomorrow"),
+        "Diti.": (True, ""), "Dedee, volume up": (True, "volume up"), "Titi.": (False, "Titi."),
+        "Daddy, open chrome": (False, "Daddy, open chrome"), "the deed is done": (False, "the deed is done"),
         "": (False, ""),
     }
     for text, want in cases.items():
