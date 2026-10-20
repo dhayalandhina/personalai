@@ -83,6 +83,9 @@ python3 examples/dd_jarvis.py --text        # type, dd speaks back
 ```
 Mic via ffmpeg, speech-to-text via faster-whisper (local), brain = same dd agent loop + skills, voice via macOS `say` (Piper/espeak elsewhere). First run asks macOS for microphone permission for your terminal app.
 
+## The brain (local by default, free cloud tier optional)
+dd thinks with the local Ollama model. A 3B/7B model on a laptop is honest but limited; for sharper, faster answers you can **opt in** to a free-tier cloud model by putting one key in `~/.dd/.env` — `GROQ_API_KEY` (console.groq.com), `GEMINI_API_KEY` (aistudio.google.com/apikey), `CEREBRAS_API_KEY` or `OPENROUTER_API_KEY`. Same loop, same skills and tools (OpenAI-compatible tool calling); when the cloud call fails or the daily free quota is hit, dd switches to the local model for a while and says so in the log (`brain: … — local model for 10 min`). `DD_BRAIN=ollama` forces local; `DD_BRAIN_MODEL` picks another model id. Trade-off to know: with a cloud brain your messages and tool results leave the machine (the provider's free-tier terms apply; nothing else does — rules, memory, logs stay local). Status menu / `brain:` log line show which brain answered.
+
 ## The team (500 specialists)
 Every message is routed to the best-fitting employee from `skills/employees` (50 roles × 10 specialisations: engineering, data, design, content & marketing, business & ops, personal, hospitality). dd then works as that specialist — their skills, a "done when" bar and a verify checklist are prepended to the task. Same local brain underneath; the profile adds focus and a checklist, not IQ. `python3 skills/employees/scripts/employees.py find "task"` shows who would take it; on Telegram `/team task`. Small talk gets no employee; `DD_EMPLOYEES=0` turns it off.
 

@@ -40,7 +40,8 @@ MAX_NAME = 64
 MAX_DESC = 1024
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 # Never handed to a script the agent launches: the bot keeps these in its own memory only.
-SECRET_ENV = ("TELEGRAM_BOT_TOKEN", "DD_PAIR_SECRET")
+SECRET_ENV = ("TELEGRAM_BOT_TOKEN", "DD_PAIR_SECRET", "GROQ_API_KEY", "GEMINI_API_KEY", "CEREBRAS_API_KEY",
+              "OPENROUTER_API_KEY")  # never visible to tools / shell commands the model runs
 
 
 @dataclass

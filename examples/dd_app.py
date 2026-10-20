@@ -171,7 +171,7 @@ class AppCore:
     def status_text(self) -> str:
         r = dd.LIB.run("system-ops", "healthcheck.py", ["--brief"], timeout=60)
         brief = (r["stdout"] or r["stderr"]).strip()[:250] or "status kidaikkala"
-        return f"ears: {self.listener.state}\nlast heard: {self.last or '-'}\n{brief}"
+        return f"ears: {self.listener.state}\nbrain: {dd.brain_label()}\nlast heard: {self.last or '-'}\n{brief}"
 
 
 def run_menu_bar(core: AppCore) -> int:

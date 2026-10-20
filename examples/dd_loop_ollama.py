@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -105,7 +106,7 @@ def keep_alive():
         return v
 
 
-def chat(messages: list[dict], tools: list[dict], **options) -> dict:
+def ollama_chat(messages: list[dict], tools: list[dict], **options) -> dict:
     req_body = {"model": MODEL, "messages": messages, "tools": tools, "stream": False,
                 "keep_alive": keep_alive(),
                 "options": {"temperature": 0.3, "num_ctx": int(os.environ.get("DD_NUM_CTX", "8192")), **options}}
@@ -115,13 +116,140 @@ def chat(messages: list[dict], tools: list[dict], **options) -> dict:
         return json.loads(r.read().decode())["message"]
 
 
+# ---- the brain: local Ollama by default; a free cloud tier (OpenAI-compatible) when its key is in ~/.dd/.env ----
+# Opt-in: your messages (and tool results) go to that provider. Falls back to the local model whenever the cloud
+# call fails or is rate-limited. DD_BRAIN=ollama forces local; DD_BRAIN=<name> picks one; DD_BRAIN_MODEL overrides.
+CLOUD_BRAINS = {  # name: (chat/completions URL, key env var, default model) — free tiers as of Oct 2026
+    "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY", "openai/gpt-oss-120b"),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "GEMINI_API_KEY",
+               "gemini-3.5-flash-lite"),
+    "cerebras": ("https://api.cerebras.ai/v1/chat/completions", "CEREBRAS_API_KEY", "gpt-oss-120b"),
+    "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY", "openai/gpt-oss-120b:free"),
+}
+_cloud_down_until = 0.0  # after a cloud failure dd stays local until this time
+
+
+def brain() -> tuple[str, str, str, str] | None:
+    """(name, url, key, model) of the cloud brain to use, or None = local Ollama."""
+    want = os.environ.get("DD_BRAIN", "auto").strip().lower()
+    if want in ("ollama", "local", "off", "0"):
+        return None
+    for name in ([want] if want in CLOUD_BRAINS else list(CLOUD_BRAINS)):
+        url, keyvar, default_model = CLOUD_BRAINS[name]
+        key = os.environ.get(keyvar, "").strip()
+        if key:
+            return name, url, key, os.environ.get("DD_BRAIN_MODEL", "").strip() or default_model
+    return None
+
+
+def brain_label() -> str:
+    b = brain()
+    return f"{b[0]} / {b[3]}" + (" (cloud down — local for now)" if time.time() < _cloud_down_until else "") \
+        if b else f"local ollama / {MODEL}"
+
+
+def openai_messages(messages: list[dict]) -> list[dict]:
+    """Ollama-style history -> OpenAI chat format: tool calls get ids, tool results carry tool_call_id,
+    arguments become JSON strings, Ollama-only keys (tool_name) are dropped."""
+    out, pending = [], []
+    for i, m in enumerate(messages):
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            conv, pending = [], []
+            for j, c in enumerate(m["tool_calls"]):
+                fn = c.get("function", {})
+                args = fn.get("arguments", {})
+                cid = c.get("id") or f"call_{i}_{j}"
+                conv.append({"id": cid, "type": "function",
+                             "function": {"name": fn.get("name", ""),
+                                          "arguments": args if isinstance(args, str) else json.dumps(args)}})
+                pending.append(cid)
+            out.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": conv})
+        elif role == "tool":
+            cid = m.get("tool_call_id") or (pending.pop(0) if pending else "call_0")
+            out.append({"role": "tool", "tool_call_id": cid, "content": str(m.get("content", ""))})
+        else:
+            out.append({"role": role, "content": m.get("content") or ""})
+    return out
+
+
+def cloud_chat(messages: list[dict], tools: list[dict], b: tuple, **options) -> dict:
+    """One OpenAI-compatible chat call; the reply comes back in Ollama's message shape (arguments as dicts)."""
+    name, url, key, model = b
+    body = {"model": model, "messages": openai_messages(messages), "temperature": options.get("temperature", 0.3)}
+    if tools:
+        body["tools"], body["tool_choice"] = tools, "auto"
+    if "num_predict" in options:  # cloud is fast and cheap: never cut a reply shorter than a few sentences
+        body["max_tokens"] = max(int(options["num_predict"]), 600)
+    if "gpt-oss" in model:
+        body["reasoning_effort"] = "low"  # quick answers; the loop handles tools step by step anyway
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        data = json.loads(r.read().decode())
+    msg = data["choices"][0]["message"]
+    out = {"role": "assistant", "content": msg.get("content") or ""}
+    calls = []
+    for c in msg.get("tool_calls") or []:
+        fn = c.get("function", {})
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args or "{}")
+            except json.JSONDecodeError:
+                args = {}
+        calls.append({"id": c.get("id", ""), "function": {"name": fn.get("name", ""), "arguments": args or {}}})
+    if calls:
+        out["tool_calls"] = calls
+    return out
+
+
+def _cloud_failed(b: tuple, e: Exception) -> None:
+    global _cloud_down_until
+    detail, wait = str(e)[:160], 60
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            detail = f"HTTP {e.code}: " + (e.read().decode(errors="ignore")[:200] or e.reason)
+        except Exception:
+            detail = f"HTTP {e.code}"
+        if e.code == 429:
+            wait = 600  # quota: stay local for 10 min
+            try:
+                wait = max(30, min(3600, int(e.headers.get("Retry-After", "600"))))
+            except (TypeError, ValueError):
+                pass
+    _cloud_down_until = time.time() + wait
+    print(f"brain: {b[0]} failed ({detail}) — local model for {wait // 60 or 1} min", flush=True)
+
+
+def chat(messages: list[dict], tools: list[dict], **options) -> dict:
+    """The model call every loop uses: the configured cloud brain, else (or on failure) the local Ollama model."""
+    b = brain()
+    if b and time.time() >= _cloud_down_until:
+        try:
+            return cloud_chat(messages, tools, b, **options)
+        except Exception as e:
+            _cloud_failed(b, e)
+    return ollama_chat(messages, tools, **options)
+
+
 def warm() -> bool:
-    """Load the model into RAM once (and keep it warm) so the first real reply is fast. Best effort."""
+    """Make the first real reply fast: probe the cloud brain (logs which one answers) and load the local model
+    into RAM (kept warm; it is the fallback). Best effort."""
+    ok = False
+    b = brain()
+    if b:
+        try:
+            cloud_chat([{"role": "user", "content": "hi"}], [], b, num_predict=8)
+            print(f"brain: {b[0]} / {b[3]} ready", flush=True)
+            ok = True
+        except Exception as e:
+            _cloud_failed(b, e)
     try:
-        chat([{"role": "user", "content": "hi"}], [], num_predict=1)
+        ollama_chat([{"role": "user", "content": "hi"}], [], num_predict=1)
         return True
     except Exception:
-        return False
+        return ok
 
 
 def fast_action(user_text: str) -> str | None:
@@ -228,7 +356,9 @@ def start_reminder_watcher(on_fire=None, every: int = 30) -> threading.Thread:
 
 
 def preflight() -> str | None:
-    """None when Ollama is up and MODEL is pulled; otherwise the exact fix to show."""
+    """None when the brain can answer: a configured cloud brain, or Ollama up with MODEL pulled; otherwise the fix."""
+    if brain() and time.time() >= _cloud_down_until:
+        return None  # the local model is only the fallback then
     try:
         with urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=3) as r:
             names = [m["name"] for m in json.loads(r.read().decode()).get("models", [])]
@@ -241,7 +371,92 @@ def preflight() -> str | None:
     return None
 
 
+def selftest() -> int:
+    """Brain plumbing without any network: provider pick from env, history conversion, a fake OpenAI endpoint
+    (tool call round trip), 429 -> local fallback with a cool-down, label text."""
+    global _cloud_down_until
+    import http.server
+    import socketserver
+    saved = {k: os.environ.pop(k) for k in list(os.environ) if k.endswith("_API_KEY") or k in ("DD_BRAIN", "DD_BRAIN_MODEL")}
+    try:
+        assert brain() is None and brain_label().startswith("local ollama")
+        os.environ["GEMINI_API_KEY"] = "k1"
+        assert brain()[0] == "gemini" and brain()[3] == "gemini-3.5-flash-lite"
+        os.environ["GROQ_API_KEY"] = "k2"
+        assert brain()[0] == "groq", "auto picks the first configured provider in CLOUD_BRAINS order"
+        os.environ["DD_BRAIN"] = "gemini"
+        os.environ["DD_BRAIN_MODEL"] = "gemini-3.8-flash"
+        assert brain()[0] == "gemini" and brain()[3] == "gemini-3.8-flash"
+        os.environ["DD_BRAIN"] = "ollama"
+        assert brain() is None
+        os.environ.pop("DD_BRAIN"), os.environ.pop("DD_BRAIN_MODEL")
+        # history conversion
+        hist = [{"role": "system", "content": "s"}, {"role": "user", "content": "open chrome"},
+                {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "mac_action", "arguments": {"action": "open", "target": "chrome"}}}]},
+                {"role": "tool", "content": "ok", "tool_name": "mac_action"},
+                {"role": "assistant", "content": "Done."}]
+        conv = openai_messages(hist)
+        assert conv[2]["tool_calls"][0]["type"] == "function" and json.loads(conv[2]["tool_calls"][0]["function"]["arguments"])["target"] == "chrome"
+        assert conv[3] == {"role": "tool", "tool_call_id": conv[2]["tool_calls"][0]["id"], "content": "ok"}
+        assert "tool_name" not in conv[3] and conv[4]["content"] == "Done."
+        # fake OpenAI-compatible server: first call -> tool call, second -> text, third -> 429
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                req = json.loads(self.rfile.read(n))
+                hits.append(req)
+                if len(hits) == 1:
+                    msg = {"role": "assistant", "content": None, "tool_calls": [{"id": "call_x", "type": "function", "function": {"name": "run_shell", "arguments": "{\"cmd\": \"date\"}"}}]}
+                elif len(hits) == 2:
+                    msg = {"role": "assistant", "content": "Mani 7."}
+                else:
+                    self.send_response(429)
+                    self.send_header("Retry-After", "120")
+                    self.end_headers()
+                    self.wfile.write(b'{"error": {"message": "quota"}}')
+                    return
+                body = json.dumps({"choices": [{"message": msg}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        b = ("fake", f"http://127.0.0.1:{srv.server_address[1]}/v1/chat/completions", "key", "gpt-oss-test")
+        tools = [{"type": "function", "function": {"name": "run_shell", "parameters": {"type": "object", "properties": {}}}}]
+        r1 = cloud_chat(hist[:2], tools, b, num_predict=220)
+        assert r1["tool_calls"][0]["function"] == {"name": "run_shell", "arguments": {"cmd": "date"}} and r1["tool_calls"][0]["id"] == "call_x", r1
+        assert hits[0]["max_tokens"] == 600 and hits[0]["reasoning_effort"] == "low" and hits[0]["tool_choice"] == "auto"
+        assert hits[0]["messages"][1] == {"role": "user", "content": "open chrome"} and "keep_alive" not in hits[0]
+        r2 = cloud_chat(hist[:2] + [r1, {"role": "tool", "content": "Tue 7:00", "tool_name": "run_shell"}], tools, b)
+        assert r2 == {"role": "assistant", "content": "Mani 7."} and hits[1]["messages"][3]["tool_call_id"] == "call_x"
+        _cloud_down_until = 0.0
+        try:
+            cloud_chat(hist[:2], [], b)
+            raise AssertionError("429 must raise")
+        except urllib.error.HTTPError as e:
+            _cloud_failed(b, e)
+        assert 100 < _cloud_down_until - time.time() <= 120, "Retry-After honoured"
+        srv.shutdown()
+        _cloud_down_until = 0.0
+    finally:
+        for k in ("GEMINI_API_KEY", "GROQ_API_KEY", "DD_BRAIN", "DD_BRAIN_MODEL"):
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+    print("dd_loop selftest ok (brain pick, history conversion, fake OpenAI round trip with tool call, 429 cool-down)")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if "--selftest" in argv:
+        return selftest()
     dry = "--dry-run" in argv
     if dry:
         os.environ["DD_HOME"] = os.environ.get("DD_HOME", "/tmp/dd-dry-run")
