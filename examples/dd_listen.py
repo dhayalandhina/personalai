@@ -313,8 +313,15 @@ def open_mic_settings() -> None:
 # ---------------- the listener ----------------
 class Listener:
     def __init__(self, source=None, stt_fn=None, speak=None, handle=None, on_state=None, on_heard=None,
-                 on_problem=None, followup_s: float | None = None, clock=time.monotonic, log=print):
+                 on_problem=None, followup_s: float | None = None, clock=time.monotonic, log=print,
+                 inline: bool = False):
         self.source = source or mic_source
+        # Utterances are transcribed/answered on a worker thread, so the mic keeps streaming while Whisper or the
+        # model is busy (a slow turn never backs up the audio pipe). inline=True runs them synchronously (tests).
+        self.inline = inline
+        self.queue: deque[bytes] = deque(maxlen=2)   # newest two wait; anything older is stale and dropped
+        self.work = threading.Event()
+        self.worker: threading.Thread | None = None
         self.stt, self.speak_fn = stt_fn or stt, speak or default_speak
         self.handle = handle  # built lazily (loads rules + skills) unless injected
         self.on_state = on_state or (lambda s: None)
@@ -463,7 +470,32 @@ class Listener:
             self.zero_run = 0
         utt = self.seg.feed(frame)
         if utt:
+            self.submit(utt)
+
+    def submit(self, utt: bytes) -> None:
+        if self.inline:
             self.process(utt)
+            return
+        if self.worker is None or not self.worker.is_alive():
+            self.worker = threading.Thread(target=self._worker, daemon=True, name="dd-brain")
+            self.worker.start()
+        if len(self.queue) == self.queue.maxlen:
+            self.log("  (busy — dropped an older utterance)")
+        self.queue.append(utt)
+        self.work.set()
+
+    def _worker(self) -> None:
+        while not self.stop.is_set():
+            if not self.queue:
+                self.work.wait(0.5)
+                self.work.clear()
+                continue
+            utt = self.queue.popleft()
+            try:
+                self.process(utt)
+            except Exception as e:  # a bad turn must not kill the brain thread
+                self.log(f"  turn failed: {type(e).__name__}: {e}")
+                self.set_state("listening")
 
     def run(self) -> None:
         """Blocking loop; restarts the mic stream after an error. Call stop.set() to end."""
@@ -630,7 +662,7 @@ def selftest() -> int:
 
     lis = Listener(source=lambda: iter([]), stt_fn=fake_stt, speak=fake_speak, handle=fake_handle,
                    on_state=states.append, on_heard=lambda t, s: heard_log.append(t) if t else None,
-                   on_problem=problems.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None)
+                   on_problem=problems.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None, inline=True)
     utterance = _tone(800) + _quiet(800)
 
     def speak_utt():
@@ -745,6 +777,33 @@ def selftest() -> int:
     assert choose_source()[0] == "ffmpeg"
     os.environ.pop("DD_MIC_BIN")
 
+    # 4c. worker mode: feed() returns at once; the brain thread transcribes and answers; the queue keeps the newest two
+    slow_calls = []
+
+    def slow_handle(cmd):
+        time.sleep(0.3)
+        slow_calls.append(cmd)
+        return "ok"
+    lw = Listener(source=lambda: iter([]), stt_fn=lambda b: "jarvis volume 30", speak=lambda t: None,
+                  handle=slow_handle, followup_s=0.0, log=lambda *_: None)
+    t0 = time.monotonic()
+    for f in utterance:
+        lw.feed(f)
+    assert time.monotonic() - t0 < 0.25, "feed must not block on the turn"
+    deadline = time.monotonic() + 5
+    while not slow_calls and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert slow_calls == ["volume 30"], slow_calls
+    for _ in range(4):  # four quick utterances while busy -> at most the newest two are kept
+        for f in utterance:
+            lw.feed(f)
+    deadline = time.monotonic() + 6
+    while lw.queue and time.monotonic() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.4)
+    assert 2 <= len(slow_calls) <= 4, slow_calls
+    lw.stop.set()
+
     # 5. run(): a dying mic stream is reported and retried; stop ends the loop
     calls = {"n": 0}
 
@@ -756,7 +815,7 @@ def selftest() -> int:
 
     probs2 = []
     lis2 = Listener(source=flaky_source, stt_fn=fake_stt, speak=fake_speak, handle=fake_handle,
-                    on_problem=probs2.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None)
+                    on_problem=probs2.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None, inline=True)
     lis2.stop.wait = lambda *_: None  # don't actually sleep in the test
     lis2.run()
     assert calls["n"] == 2 and probs2 and "mic error" in probs2[0] and lis2.state == "stopped", (calls, probs2)

@@ -204,7 +204,7 @@ def selftest() -> int:
     spawned: list[list[str]] = []
     # a listener fed by a fake mic that yields nothing and then ends the run (stop is set in the test)
     lis = dd_listen.Listener(source=lambda: iter([]), stt_fn=lambda b: "", speak=lambda t: None,
-                             handle=lambda c: "ok", followup_s=8, log=lambda *_: None)
+                             handle=lambda c: "ok", followup_s=8, log=lambda *_: None, inline=True)
     core = AppCore(listener=lis, spawn=lambda cmd: (spawned.append(cmd), FakeProc(cmd))[1])
 
     # icons follow listener state; pause toggles; labels

@@ -23,7 +23,7 @@ if [ -d "$REPO" ] && mkdir -p "$REPO/logs" 2>/dev/null; then   # mirror the log 
 else
   exec >>"$HOME/.dd/logs/app.log" 2>&1
 fi
-echo "== dd.app start $(date) repo=$REPO arch=$(uname -m) translated=$(sysctl -n sysctl.proc_translated 2>/dev/null)"
+echo "== dd.app start $(date) repo=$REPO arch=$(uname -m) translated=$(sysctl -n sysctl.proc_translated 2>/dev/null) code=$(git -C "$REPO" log --oneline -1 2>/dev/null | cut -c1-60)"
 if [ ! -f "$REPO/examples/dd_app.py" ]; then
   say_note "personalai folder kidaikkala — ~/personalai la irukkanum"
   exit 1
