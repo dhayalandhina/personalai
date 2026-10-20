@@ -13,6 +13,7 @@ irreversible actions still ask first. dd.app (install_app.sh) launches this; it 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -190,8 +191,55 @@ def run_menu_bar(core: AppCore) -> int:
     return 0
 
 
+def auto_update() -> bool:
+    """At launch: fast-forward the dd code (bounded). True when it changed (caller re-execs so the new code runs)."""
+    if os.environ.get("DD_NO_UPDATE") == "1" or not (dd.ROOT / ".git").is_dir():
+        return False
+    try:
+        git = ["git", "-C", str(dd.ROOT)]
+        before = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        subprocess.run(git + ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=10", "pull", "--ff-only", "-q"],
+                       capture_output=True, text=True, timeout=40)
+        after = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        print(f"code: {after[:7]}" + (" (updated)" if after != before else ""), flush=True)
+        return bool(before) and after != before
+    except Exception as e:
+        print(f"(update skipped: {e})", flush=True)
+        return False
+
+
+def mic_helper_build_cmd() -> tuple[list[str] | None, str]:
+    """swiftc command to (re)build the echo-cancelling mic helper, or (None, reason) when nothing to do."""
+    src, out = dd.ROOT / "macapp" / "dd-mic.swift", Path.home() / ".dd" / "bin" / "dd-mic"
+    if not src.is_file():
+        return None, "no dd-mic.swift"
+    if out.is_file() and out.stat().st_mtime >= src.stat().st_mtime:
+        return None, "up to date"
+    swiftc = shutil.which("swiftc")
+    if not swiftc:
+        return None, "swiftc missing (xcode-select --install) — using ffmpeg mic, no echo cancellation"
+    return [swiftc, "-O", "-suppress-warnings", "-o", str(out), str(src)], str(out)
+
+
+def ensure_mic_helper() -> None:
+    cmd, note = mic_helper_build_cmd()
+    if cmd is None:
+        print(f"mic helper: {note}", flush=True)
+        return
+    Path(note).parent.mkdir(parents=True, exist_ok=True)
+    print("building dd-mic (echo cancellation)...", flush=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    print(("dd-mic built: " + note) if r.returncode == 0 else f"dd-mic build failed: {r.stderr.strip()[-400:]}", flush=True)
+
+
 def run_app() -> int:
-    """Warm up, start the ears, then the menu bar (or plain terminal mode without rumps)."""
+    """Update, build the mic helper, warm up, start the ears, then the menu bar (terminal mode without rumps)."""
+    if auto_update():
+        os.execv(sys.executable, [sys.executable, __file__] + sys.argv[1:])  # run the new code right away
+    try:
+        ensure_mic_helper()
+    except Exception as e:
+        print(f"(mic helper skipped: {e})", flush=True)
     problem = dd.preflight()
     if problem:
         notify(f"Brain ready illa: {problem}")
@@ -279,6 +327,11 @@ def selftest() -> int:
     core.stop()
     core.thread.join(timeout=3)
     assert not core.thread.is_alive() and lis.state == "stopped"
+    cmd, note = mic_helper_build_cmd()  # no swiftc / no macOS here: a reason, never an exception
+    assert cmd is None or cmd[0].endswith("swiftc"), (cmd, note)
+    os.environ["DD_NO_UPDATE"] = "1"
+    assert auto_update() is False
+    os.environ.pop("DD_NO_UPDATE")
     assert "rumps" not in sys.modules, "rumps must only be imported inside run_menu_bar()"
     print("dd_app selftest ok (icons per state, pause toggle, heard label, chat spawn-once, problem notify, ears thread, no rumps at import)")
     return 0
