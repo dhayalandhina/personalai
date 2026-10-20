@@ -319,27 +319,61 @@ _whisper = None
 _whisper_lock = threading.Lock()
 
 
+def whisper_cached(name: str, hub: Path | None = None) -> bool:
+    """True when faster-whisper's files for `name` are already in the Hugging Face cache (no download needed)."""
+    if hub is None:
+        try:
+            from huggingface_hub.constants import HF_HUB_CACHE
+            hub = Path(HF_HUB_CACHE)
+        except Exception:
+            hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+    repo = hub / f"models--Systran--faster-whisper-{name}"
+    return any((repo / "snapshots").glob("*/model.bin")) if repo.is_dir() else False
+
+
+def _load(name: str):
+    from faster_whisper import WhisperModel  # pip install faster-whisper
+    return WhisperModel(name, device="auto", compute_type="int8")
+
+
 def load_whisper():
-    """The faster-whisper model, loaded once (the warm-up thread and the first command share one download).
-    DD_STT_MODEL (default small — clearly better for Thanglish); falls back to base when small cannot be fetched."""
+    """The faster-whisper model, loaded once (the warm-up thread and the first command share one load).
+    DD_STT_MODEL (default small — clearly better for Thanglish). First launch on a slow line: whatever is already
+    cached (base) answers right away while small downloads in the background, then dd switches to it."""
     global _whisper
     with _whisper_lock:
         if _whisper is not None:
             return _whisper
-        from faster_whisper import WhisperModel  # pip install faster-whisper
         name = os.environ.get("DD_STT_MODEL", "small")
+        if name != "base" and not whisper_cached(name) and whisper_cached("base"):
+            print(f"(whisper: using cached base now; '{name}' downloads in the background)", flush=True)
+            _whisper = _load("base")
+            threading.Thread(target=_upgrade_whisper, args=(name,), daemon=True, name="dd-whisper-dl").start()
+            return _whisper
         last = None
         for candidate in [name, name] + (["base"] if name != "base" else []):
             try:
-                _whisper = WhisperModel(candidate, device="auto", compute_type="int8")
+                _whisper = _load(candidate)
                 if candidate != name:
                     print(f"(whisper '{name}' unavailable: {str(last)[:80]} — using base)", flush=True)
                 return _whisper
-            except Exception as e:  # a flaky download: once more, then the small/base fallback
+            except Exception as e:  # a flaky download: once more, then the base fallback
                 last = e
                 print(f"(whisper '{candidate}' load failed: {str(e)[:100]})", flush=True)
                 time.sleep(2)
         raise RuntimeError(f"whisper unavailable: {last}")
+
+
+def _upgrade_whisper(name: str) -> None:
+    global _whisper
+    try:
+        better = _load(name)
+    except Exception as e:
+        print(f"(whisper '{name}' download failed: {str(e)[:100]} — staying on base)", flush=True)
+        return
+    with _whisper_lock:
+        _whisper = better
+    print(f"(whisper: switched to '{name}')", flush=True)
 
 
 def stt(pcm: bytes) -> str:
@@ -1041,10 +1075,17 @@ def selftest() -> int:
         lg.feed(f)
     assert lg.state == "listening" and len(gate_stt_calls) == 2
 
-    # 4b. mic helper plumbing: frames stream from the helper's stdout; a dead helper counts as a failure and,
-    #     after two, the ffmpeg path is chosen; DD_AEC=0 forces ffmpeg
+    # 4a. whisper cache probe: only a snapshot that holds model.bin counts as "already downloaded"
     import stat as _stat
     import tempfile as _tf
+    hub = Path(_tf.mkdtemp(prefix="dd-hf-"))
+    (hub / "models--Systran--faster-whisper-base" / "snapshots" / "abc").mkdir(parents=True)
+    (hub / "models--Systran--faster-whisper-base" / "snapshots" / "abc" / "model.bin").write_bytes(b"x")
+    (hub / "models--Systran--faster-whisper-small" / "snapshots" / "def").mkdir(parents=True)  # partial: no model.bin
+    assert whisper_cached("base", hub) and not whisper_cached("small", hub) and not whisper_cached("tiny", hub)
+
+    # 4b. mic helper plumbing: frames stream from the helper's stdout; a dead helper counts as a failure and,
+    #     after two, the ffmpeg path is chosen; DD_AEC=0 forces ffmpeg
     fake = Path(_tf.mkdtemp(prefix="dd-mic-")) / "dd-mic"
     fake.write_text("#!/bin/sh\nhead -c 12800 /dev/zero\necho 'dd-mic: 24000 Hz x1 -> 16000 Hz mono, voice processing ON' >&2\n")
     fake.chmod(fake.stat().st_mode | _stat.S_IEXEC)
