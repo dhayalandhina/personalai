@@ -62,18 +62,21 @@ def rms(frame: bytes) -> float:
 class Segmenter:
     """Energy-based voice activity: feed 20 ms frames; returns one utterance (PCM bytes) when the speaker stops."""
 
-    def __init__(self, min_start: float = 350, end_silence_ms: int = 700, min_speech_ms: int = 250,
+    def __init__(self, min_start: float | None = None, end_silence_ms: int = 700, min_speech_ms: int = 250,
                  max_ms: int = 12000, pre_roll_ms: int = 300):
-        self.min_start, self.end_silence_ms, self.min_speech_ms, self.max_ms = min_start, end_silence_ms, min_speech_ms, max_ms
-        self.noise = 150.0  # running noise floor; threshold adapts to the room
+        # DD_VAD_START: RMS level that counts as speech (lower = more sensitive; a false start only costs one Whisper call)
+        self.min_start = float(os.environ.get("DD_VAD_START", "200")) if min_start is None else min_start
+        self.end_silence_ms, self.min_speech_ms, self.max_ms = end_silence_ms, min_speech_ms, max_ms
+        self.noise = 100.0  # running noise floor; threshold adapts to the room
         self.pre: deque[bytes] = deque(maxlen=max(1, pre_roll_ms // FRAME_MS))
         self.reset()
 
     def reset(self) -> None:
         self.speaking, self.frames, self.silence, self.speech_frames, self.loud_run = False, [], 0, 0, 0
+        self.energy_sum = 0.0
 
     def threshold(self) -> float:
-        return max(self.min_start, self.noise * 3)
+        return max(self.min_start, self.noise * 2.0)
 
     def feed(self, frame: bytes) -> bytes | None:
         e = rms(frame)
@@ -89,13 +92,17 @@ class Segmenter:
                 self.speaking, self.frames, self.silence, self.speech_frames = True, list(self.pre), 0, self.loud_run
             return None
         self.frames.append(frame)
+        self.energy_sum += e
         if e >= thr * 0.6:
             self.silence, self.speech_frames = 0, self.speech_frames + 1
         else:
             self.silence += 1
-        if self.silence * FRAME_MS < self.end_silence_ms and len(self.frames) * FRAME_MS < self.max_ms:
+        forced = len(self.frames) * FRAME_MS >= self.max_ms
+        if self.silence * FRAME_MS < self.end_silence_ms and not forced:
             return None
         utt, spoken = b"".join(self.frames), self.speech_frames * FRAME_MS
+        if forced:  # steady noise (music, fan) kept it "speaking" for the whole window: treat that level as the new floor
+            self.noise = max(self.noise, self.energy_sum / max(1, len(self.frames)))
         self.reset()
         return utt if spoken >= self.min_speech_ms else None  # a click or cough is not an utterance
 
@@ -245,6 +252,29 @@ class Listener:
         self.zero_run = 0        # consecutive all-zero frames (mic blocked -> digital silence)
         self.problem_sent = False
         self.last_heard = ""
+        self.level = 0.0         # recent peak mic level (RMS), for the menu / log — "is the mic even hearing me?"
+        self._level_win: deque[float] = deque(maxlen=25)
+        self._frames = 0
+        self._last_activity = clock()
+        self.test: dict | None = None   # mic test in progress: {"frames": [...], "left": n, "done": callback}
+
+    def mic_test(self, seconds: float = 3.0, done=None) -> None:
+        """Capture the next N seconds from the live stream, then report level + what Whisper heard (via `done`)."""
+        self.test = {"frames": [], "left": int(seconds * 1000 / FRAME_MS), "done": done or (lambda r: None)}
+
+    def _finish_test(self) -> None:
+        t, self.test = self.test, None
+        pcm = b"".join(t["frames"])
+        peak = max((rms(f) for f in t["frames"]), default=0.0)
+        avg = sum(rms(f) for f in t["frames"]) / max(1, len(t["frames"]))
+        try:
+            text = self.stt(pcm).strip()
+        except Exception as e:
+            text = f"(stt error: {e})"
+        res = {"heard": text, "peak": round(peak), "avg": round(avg), "threshold": round(self.seg.threshold()),
+               "seconds": round(len(pcm) / (RATE * 2), 1)}
+        self.log(f"  mic test: {res}")
+        t["done"](res)
 
     def set_state(self, s: str) -> None:
         if s != self.state:
@@ -265,11 +295,16 @@ class Listener:
         t0 = self.clock()
         text = self.stt(utt).strip()
         secs = self.clock() - t0
+        audio = len(utt) / (RATE * 2)
+        self._last_activity = self.clock()
         if not text or blocked(text):
+            self.last_heard = f"(sound, no words — {audio:.1f}s)" if not text else f"(ignored: {text})"
+            self.on_heard("", secs)
+            self.log(f"  heard: {text!r} -> ignored  ({audio:.1f}s audio, stt {secs:.1f}s)")
             return
         self.last_heard = text
         self.on_heard(text, secs)
-        self.log(f"  heard: {text!r}  ({len(utt) / (RATE * 2):.1f}s audio, stt {secs:.1f}s)")
+        self.log(f"  heard: {text!r}  ({audio:.1f}s audio, stt {secs:.1f}s)")
         woke, cmd = parse_wake(text)
         followup = self.clock() < self.followup_until
         if not woke and not followup:
@@ -294,6 +329,19 @@ class Listener:
 
     def feed(self, frame: bytes) -> None:
         """One 20 ms frame from the mic."""
+        e = rms(frame)
+        self._level_win.append(e)
+        self.level = max(self._level_win)
+        self._frames += 1
+        if self.test is not None:  # mic test: just collect
+            self.test["frames"].append(frame)
+            self.test["left"] -= 1
+            if self.test["left"] <= 0:
+                self._finish_test()
+            return
+        if self._frames % 750 == 0 and self.clock() - self._last_activity > 15:  # idle: a level line every 15 s
+            self.log(f"  mic level: peak {self.level:.0f} (speech starts above {self.seg.threshold():.0f}, "
+                     f"noise floor {self.seg.noise:.0f}) — nothing heard yet")
         if self.paused:
             self.set_state("paused")
             return
@@ -357,6 +405,22 @@ def main(argv: list[str]) -> int:
     if not shutil.which("ffmpeg"):
         print("ffmpeg missing: brew install ffmpeg")
         return 1
+    if "--check" in argv:  # 3-second mic + Whisper check: prints the level and what it heard, and says it back
+        print("3 second pesu (e.g. 'jarvis chrome open pannu')...")
+        frames, src = [], ffmpeg_source()
+        try:
+            for f in src:
+                frames.append(f)
+                if len(frames) >= 3000 // FRAME_MS:
+                    break
+        finally:
+            src.close()
+        pcm = b"".join(frames)
+        peak = max((rms(f) for f in frames), default=0.0)
+        text = stt(pcm) if frames else ""
+        print(f"mic peak level {peak:.0f} (speech starts above {Segmenter().threshold():.0f}); heard: {text!r}")
+        default_speak(f"Naan kettadhu: {text}" if text else "Onnum kekkala. Mic permission paaru.")
+        return 0 if text else 1
     try:
         import faster_whisper  # noqa: F401
     except ImportError:
@@ -455,19 +519,25 @@ def selftest() -> int:
         return f"ok {cmd}"
 
     lis = Listener(source=lambda: iter([]), stt_fn=fake_stt, speak=fake_speak, handle=fake_handle,
-                   on_state=states.append, on_heard=lambda t, s: heard_log.append(t), on_problem=problems.append,
-                   followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None)
+                   on_state=states.append, on_heard=lambda t, s: heard_log.append(t) if t else None,
+                   on_problem=problems.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None)
     utterance = _tone(800) + _quiet(800)
 
     def speak_utt():
         for f in utterance:
             lis.feed(f)
 
+    for f in _tone(200):             # a 200 ms blip: level meter sees it, but it is too short to be an utterance
+        lis.feed(f)
+    assert lis.level > 1000, lis.level
+    for f in _quiet(800):
+        lis.feed(f)
+    assert handled == [] and lis.level < 200
     speak_utt()                      # "D.D. open chrome" -> command
     assert handled == ["open chrome"] and spoken[-1] == "ok open chrome", (handled, spoken)
     assert "thinking" in states and "speaking" in states and states[-1] == "listening", states
-    speak_utt()                      # "Thank you." -> hallucination, ignored
-    assert handled == ["open chrome"]
+    speak_utt()                      # "Thank you." -> hallucination, ignored but visible
+    assert handled == ["open chrome"] and lis.last_heard.startswith("(ignored: Thank you.)"), lis.last_heard
     speak_utt()                      # "jarvis" alone -> ack, waits for the command
     assert spoken[-1] == "Sollu." and lis.state == "recording"
     speak_utt()                      # "volume 30" inside the follow-up window -> command without wake word
@@ -491,6 +561,20 @@ def selftest() -> int:
     speak_utt()
     assert lis.state == "paused" and handled == ["open chrome", "volume 30"]
     lis.paused = False
+
+    # mic test: collects the next 3 s raw, reports level + transcript, normal listening resumes after
+    results = []
+    heard = iter(["jarvis chrome open pannu"])
+    lis.mic_test(3.0, done=results.append)
+    for f in _tone(1500) + _quiet(1600):
+        lis.feed(f)
+    assert results and results[0]["heard"] == "jarvis chrome open pannu" and results[0]["peak"] > 1000, results
+    assert results[0]["seconds"] == 3.0 and lis.test is None and handled == ["open chrome", "volume 30"]
+
+    # an utterance Whisper can't read is still visible as "(sound, no words)"
+    heard = iter([""])
+    speak_utt()
+    assert lis.last_heard.startswith("(sound, no words"), lis.last_heard
 
     # blocked mic: 8 s of digital silence -> one problem report
     for f in _zeros(8200):

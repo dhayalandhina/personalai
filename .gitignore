@@ -5,3 +5,4 @@ __pycache__/
 *.log
 /examples/*.db
 .DS_Store
+/logs/

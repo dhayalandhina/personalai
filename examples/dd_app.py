@@ -45,6 +45,7 @@ class AppCore:
         self.listener.on_problem, self.listener.on_heard = self.problem, self.heard
         self.last = ""
         self.last_at = 0.0
+        self.test_result: dict | None = None
         self.problems: list[str] = []
         self.thread: threading.Thread | None = None
 
@@ -81,12 +82,30 @@ class AppCore:
         return not self.listener.paused
 
     def last_label(self) -> str:
-        if not self.last:
-            return "Heard: (nothing yet)"
-        return f"Heard: {self.last[:40]}" + ("…" if len(self.last) > 40 else "")
+        lvl = f"mic {self.listener.level:.0f}"
+        last = self.listener.last_heard or self.last
+        if not last:
+            return f"Heard: (nothing yet) · {lvl}"
+        return f"Heard: {last[:40]}" + ("…" if len(last) > 40 else "") + f" · {lvl}"
+
+    def mic_test(self) -> None:
+        """Say something for 3 s; the result (level + transcript) pops up in the menu bar app."""
+        self.test_result = None
+        self.listener.say("Sollu, moonu second.")
+        self.listener.mic_test(3.0, done=lambda r: setattr(self, "test_result", r))
+
+    def test_text(self) -> str:
+        r = self.test_result or {}
+        heard = r.get("heard") or "(onnum kekkala)"
+        tip = ""
+        if r.get("peak", 0) < 60:
+            tip = "\nMic level romba low — Microphone permission / sariyaana mic ah paaru."
+        elif r.get("peak", 0) < r.get("threshold", 0):
+            tip = "\nUn voice threshold ku keezha — konjam pakkathula / sathamaa pesu."
+        return f"Heard: {heard}\nmic peak {r.get('peak')}, speech starts above {r.get('threshold')}{tip}"
 
     def menu_labels(self) -> list[str]:
-        return [self.listening_label(), self.last_label(), "Open chat", "Status", "Quit dd"]
+        return [self.listening_label(), self.last_label(), "Mic test (3 s)", "Open chat", "Status", "Quit dd"]
 
     def open_chat(self) -> list[str]:
         cmd = [sys.executable, str(CHAT)]
@@ -106,7 +125,7 @@ def run_menu_bar(core: AppCore) -> int:
     class DDBar(rumps.App):
         def __init__(self):
             super().__init__("dd", title=core.icon(), quit_button=None)
-            self.menu = ["Pause listening", "Heard: (nothing yet)", "Open chat", "Status", None, "Quit dd"]
+            self.menu = ["Pause listening", "Heard: (nothing yet)", "Mic test (3 s)", "Open chat", "Status", None, "Quit dd"]
             self.menu["Heard: (nothing yet)"].set_callback(None)
             self.timer = rumps.Timer(self.refresh, 0.4)
             self.timer.start()
@@ -115,6 +134,13 @@ def run_menu_bar(core: AppCore) -> int:
             self.title = core.icon()
             self.menu["Pause listening"].title = core.listening_label()
             self.menu["Heard: (nothing yet)"].title = core.last_label()
+            if core.test_result is not None:
+                text, core.test_result = core.test_text(), None
+                rumps.alert("dd mic test", text)
+
+        @rumps.clicked("Mic test (3 s)")
+        def mic_test(self, _):
+            core.mic_test()
 
         @rumps.clicked("Pause listening")
         def toggle(self, _):
@@ -191,7 +217,7 @@ def selftest() -> int:
         lis.state = st
         assert core.icon() == ic
     core.heard("dd open chrome please now this is long enough to be cut off yes", 0.3)
-    assert core.last_label().startswith("Heard: dd open chrome") and core.last_label().endswith("…")
+    assert core.last_label().startswith("Heard: dd open chrome") and "… · mic" in core.last_label(), core.last_label()
 
     # chat window spawns once while alive, re-opens after close
     core.open_chat()
@@ -204,6 +230,18 @@ def selftest() -> int:
     # problems are recorded (notification goes through mac-control dry run)
     core.problem("mic error: Input/output error — Microphone permission paaru")
     assert core.problems and "healthcheck" not in core.status_text() and "ears:" in core.status_text()
+
+    # mic test: ack, capture 3 s from the stream, result text for the alert
+    said = []
+    lis.speak_fn = said.append
+    lis.stt = lambda b: "jarvis mani enna"
+    core.mic_test()
+    assert said == ["Sollu, moonu second."] and lis.test is not None
+    for f in dd_listen._tone(1500) + dd_listen._quiet(1600):
+        lis.feed(f)
+    assert core.test_result and core.test_result["heard"] == "jarvis mani enna", core.test_result
+    assert "Heard: jarvis mani enna" in core.test_text() and "mic peak" in core.test_text()
+    assert "Mic test (3 s)" in core.menu_labels() and "mic " in core.last_label()
 
     # start/stop the ears thread
     lis.stop.wait = lambda *_: None

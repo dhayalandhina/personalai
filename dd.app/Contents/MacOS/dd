@@ -12,7 +12,11 @@ REPO="$(cd "$HERE/../../.." 2>/dev/null && pwd)"                       # dd.app 
 [ -f "$REPO/examples/dd_app.py" ] || REPO="$(cat "$HOME/.dd/repo_path" 2>/dev/null)"   # written by install_app.sh
 [ -f "$REPO/examples/dd_app.py" ] || REPO="$HOME/personalai"
 mkdir -p "$HOME/.dd/logs"
-exec >>"$HOME/.dd/logs/app.log" 2>&1
+if [ -d "$REPO" ] && mkdir -p "$REPO/logs" 2>/dev/null; then   # mirror the log next to the code too (easy to find/share)
+  exec > >(tee -a "$HOME/.dd/logs/app.log" >> "$REPO/logs/app.log") 2>&1
+else
+  exec >>"$HOME/.dd/logs/app.log" 2>&1
+fi
 echo "== dd.app start $(date) repo=$REPO"
 if [ ! -f "$REPO/examples/dd_app.py" ]; then
   say_note "personalai folder kidaikkala — ~/personalai la irukkanum"
