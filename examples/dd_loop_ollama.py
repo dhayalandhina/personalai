@@ -119,10 +119,11 @@ def ollama_chat(messages: list[dict], tools: list[dict], **options) -> dict:
 # ---- the brain: local Ollama by default; a free cloud tier (OpenAI-compatible) when its key is in ~/.dd/.env ----
 # Opt-in: your messages (and tool results) go to that provider. Falls back to the local model whenever the cloud
 # call fails or is rate-limited. DD_BRAIN=ollama forces local; DD_BRAIN=<name> picks one; DD_BRAIN_MODEL overrides.
-CLOUD_BRAINS = {  # name: (chat/completions URL, key env var, default model) — free tiers as of Oct 2026
-    "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY", "openai/gpt-oss-120b"),
+CLOUD_BRAINS = {  # name: (chat/completions URL, key env var, default model) — free tiers as of Oct 2026;
+    # auto picks the first one whose key is set, in this order (Gemini's free quota suits a chatty assistant best)
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "GEMINI_API_KEY",
                "gemini-3.5-flash-lite"),
+    "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY", "openai/gpt-oss-120b"),
     "cerebras": ("https://api.cerebras.ai/v1/chat/completions", "CEREBRAS_API_KEY", "gpt-oss-120b"),
     "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY", "openai/gpt-oss-120b:free"),
 }
@@ -432,7 +433,9 @@ def selftest() -> int:
         os.environ["GEMINI_API_KEY"] = "k1"
         assert brain()[0] == "gemini" and brain()[3] == "gemini-3.5-flash-lite"
         os.environ["GROQ_API_KEY"] = "k2"
-        assert brain()[0] == "groq", "auto picks the first configured provider in CLOUD_BRAINS order"
+        assert brain()[0] == "gemini", "auto picks the first configured provider in CLOUD_BRAINS order"
+        os.environ["DD_BRAIN"] = "groq"
+        assert brain()[0] == "groq" and brain()[3] == "openai/gpt-oss-120b"
         os.environ["DD_BRAIN"] = "gemini"
         os.environ["DD_BRAIN_MODEL"] = "gemini-3.8-flash"
         assert brain()[0] == "gemini" and brain()[3] == "gemini-3.8-flash"
