@@ -21,6 +21,7 @@ bash scripts/background.sh install [--with-7b] # one-time setup, detached + low 
 bash scripts/background.sh status | stop | start | uninstall   # background service (owner terminal only)
 bash scripts/cloud_setup.sh install [--model qwen2.5:3b]       # ON the free cloud server: Ollama + dd + Telegram bot, 24/7
 bash scripts/cloud_setup.sh status | update | token | pair     # server: health / git pull + restart / new token / re-link Telegram
+bash scripts/cloud_setup.sh cloud-init                          # no-SSH first-boot script for Oracle's "Initialization script" box
 ```
 
 ## Service cheat-sheet (local, free)
@@ -35,7 +36,7 @@ bash scripts/cloud_setup.sh status | update | token | pair     # server: health 
 `background.sh install` installs faster-whisper + the Whisper base model and a launchd agent (`com.dhina.dd`) that runs `examples/dd_daemon.py`: reminders → Mac notifications every 30 s. It never uses the mic, never controls the screen or apps, never loads the LLM, and runs at nice 10 with `ProcessType=Background`, so Dhina keeps full use of his Mac. `--with-7b` pulls qwen2.5:7b only when ≥ 12 GB is free. dd itself is refused from install/stop/uninstall.
 
 ## Cloud mode (free 24/7 server, Mac stays free)
-`cloud_setup.sh install` runs on an Oracle Always Free VM (Ubuntu, ARM `VM.Standard.A1.Flex`, 2 OCPU / 12 GB — the 2026 free limit). It installs Ollama (127.0.0.1 only, model kept loaded), qwen2.5:3b, a venv in `/opt/dd-venv`, dd data in `/var/lib/dd/.dd`, asks for the Telegram bot token (hidden input), pairs Dhina's Telegram account with a one-time `/pair CODE`, and starts the `dd-telegram` systemd service (`examples/dd_telegram.py`). The service runs as user `dd` with no sudo, `NoNewPrivileges`, read-only system dirs and no access to `/home`. Nothing listens on the internet — never open port 11434. On the server `DD_HOST=server`: mac-control is hidden from the model (only its time/weather/news/remind router stays), and reminders arrive as Telegram messages. dd itself is refused from every cloud_setup command.
+`cloud_setup.sh install` runs on an Oracle Always Free VM (Ubuntu, ARM `VM.Standard.A1.Flex`, 2 OCPU / 12 GB — the 2026 free limit). It installs Ollama (127.0.0.1 only, model kept loaded), qwen2.5:3b, a venv in `/opt/dd-venv`, dd data in `/var/lib/dd/.dd`, asks for the Telegram bot token (hidden input), pairs Dhina's Telegram account with a one-time `/pair CODE`, and starts the `dd-telegram` systemd service (`examples/dd_telegram.py`). Hands-free variant: `cloud-init` prints a first-boot script (token placeholder + random pairing secret) that runs the same install with no prompts; the bot then accepts `/pair <secret>` from Dhina's Telegram and wipes the secret. The service runs as user `dd` with no sudo, `NoNewPrivileges`, read-only system dirs and no access to `/home`. Nothing listens on the internet — never open port 11434. On the server `DD_HOST=server`: mac-control is hidden from the model (only its time/weather/news/remind router stays), and reminders arrive as Telegram messages. dd itself is refused from every cloud_setup command.
 
 ## Rules
 - `/status` reply = `healthcheck.py --brief` output, nothing else, unless something is red — then one line per red item with the fix command.

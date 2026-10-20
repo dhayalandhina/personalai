@@ -60,16 +60,15 @@ no mic, no screen/app control, no LLM, lowest CPU/IO priority. Talk to dd only w
 or `python3 examples/dd_jarvis.py`. Stop anytime: `background.sh stop` / `uninstall`.
 
 ## Cloud mode (free 24/7 server — the Mac does nothing)
-dd runs on an **Oracle Cloud Always Free** VM and you talk to it on Telegram (text or voice notes). Free limit in 2026: Ampere A1, 2 OCPU / 12 GB RAM, 200 GB disk.
-1. Oracle Cloud account (Visa/Mastercard credit card for verification; RuPay is declined). Create instance → image **Ubuntu 24.04**, shape **VM.Standard.A1.Flex**, **2 OCPU / 12 GB**, download the SSH key.
+dd runs on an **Oracle Cloud Always Free** VM and you talk to it on Telegram (text or voice notes). Free limit in 2026: Ampere A1, 2 OCPU / 12 GB RAM, 200 GB disk. No SSH or terminal needed:
+1. Oracle Cloud account (Visa/Mastercard credit card for verification; RuPay is declined).
 2. Telegram → @BotFather → `/newbot` → copy the token.
-3. From the Mac: `chmod 400 ~/Downloads/ssh-key-*.key && ssh -i ~/Downloads/ssh-key-*.key ubuntu@SERVER_IP`
-4. On the server:
-```bash
-sudo apt-get update -y && sudo apt-get install -y git && sudo git clone https://github.com/dhayalandhina/personalai /opt/dd && bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh install
-```
-It asks for the bot token (hidden), then shows `/pair CODE` — send that to your bot. Then message the bot: `hi`, `/help`, a voice note, `20 nimisham la tea kudikka remind pannu`.
-Server commands: `bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh status | update | token | pair`.
+3. Get your first-boot script: `bash skills/system-ops/scripts/cloud_setup.sh cloud-init` (prints it with a fresh pairing secret). Replace `PASTE_BOT_TOKEN_HERE` with your token.
+4. Oracle → Compute → Instances → Create instance: image **Canonical Ubuntu 24.04**, shape **VM.Standard.A1.Flex** with **2 OCPU / 12 GB**, SSH keys → "Generate a key pair for me" → save the private key (only for debugging later). Advanced options → Initialization script → **Paste cloud-init script** → paste the script → Create.
+5. Send `/pair <secret from the script>` to your bot right away. Setup takes ~15–30 min on first boot; then the bot answers "Paired ✅ … dd online".
+
+With SSH instead: `sudo apt-get update -y && sudo apt-get install -y git && sudo git clone https://github.com/dhayalandhina/personalai /opt/dd && bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh install` (asks for the token, then shows a `/pair CODE`).
+Server commands (over SSH): `bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh status | update | token | pair`; first-boot log: `sudo cat /var/log/dd-setup.log`.
 Safety: dd runs as user `dd` (no sudo, read-only system dirs), only your paired Telegram account gets answers, nothing listens on the internet — don't open port 11434. Replies are slower than on the Mac (2 CPU cores, no GPU).
 
 ## JARVIS mode (voice)

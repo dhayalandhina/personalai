@@ -429,15 +429,76 @@ def pair(tg: Telegram, env_file: Path, wait: int = 600, code: str | None = None)
     return 1
 
 
+class BadToken(Exception):
+    """Telegram rejected the bot token (revoked or mistyped)."""
+
+
+def wait_for_claim(tg: Telegram, env_file: Path, secret: str, stop: threading.Event) -> int | None:
+    """Hands-free pairing for a server set up by cloud-init: the first private chat that sends
+    `/pair <DD_PAIR_SECRET>` becomes the owner. Works even if it was sent before the server came up
+    (Telegram keeps undelivered messages for 24 h). The secret is wiped from .env once used."""
+    log("waiting for the owner: send /pair <secret> to this bot")
+    offset, warned = None, set()
+    while not stop.is_set():
+        try:
+            ups = tg.call("getUpdates", http_timeout=LONG_POLL + 15, offset=offset, timeout=LONG_POLL,
+                          allowed_updates=["message"])
+        except Exception as e:
+            if "Unauthorized" in str(e):
+                raise BadToken(str(e)) from None
+            log(f"poll error: {e}")
+            stop.wait(5)
+            continue
+        for u in ups:
+            offset = u["update_id"] + 1
+            m = u.get("message") or {}
+            chat, text = m.get("chat") or {}, (m.get("text") or "").strip()
+            if (chat.get("type") == "private" and text.startswith("/pair ")
+                    and secrets.compare_digest(text[6:].strip().encode(), secret.encode())):
+                uid = m["from"]["id"]
+                set_env(env_file, "TELEGRAM_OWNER_ID", str(uid))
+                set_env(env_file, "DD_PAIR_SECRET", "")
+                os.environ["TELEGRAM_OWNER_ID"] = str(uid)
+                os.environ.pop("DD_PAIR_SECRET", None)
+                try:
+                    tg.call("getUpdates", offset=offset, timeout=0)  # confirm, so /pair is never replayed
+                except Exception:
+                    pass
+                log(f"paired with Telegram user id {uid}")
+                return uid
+            cid = chat.get("id")
+            if cid is not None and cid not in warned:
+                warned.add(cid)
+                log(f"blocked message from chat {cid} while unpaired")
+                try:
+                    tg.call("sendMessage", chat_id=cid, text="Idhu oru private assistant. / This is a private assistant.")
+                except Exception:
+                    pass
+    return None
+
+
 def run_bot() -> int:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     owner = os.environ.get("TELEGRAM_OWNER_ID", "").strip()
     if not token:
         log("TELEGRAM_BOT_TOKEN missing in $DD_HOME/.env — run: bash skills/system-ops/scripts/cloud_setup.sh token")
         return 2
+    claimed = False
     if not owner.isdigit():
-        log("not paired yet — run: bash skills/system-ops/scripts/cloud_setup.sh pair")
-        return 2
+        secret = os.environ.get("DD_PAIR_SECRET", "").strip()
+        if not secret:
+            log("not paired yet — run: bash skills/system-ops/scripts/cloud_setup.sh pair")
+            return 2
+        stop = threading.Event()
+        signal.signal(signal.SIGTERM, lambda *_: (stop.set(), sys.exit(0)))
+        try:
+            uid = wait_for_claim(Telegram(token), dd_home() / ".env", secret, stop)
+        except BadToken:
+            log("Telegram says the bot token is invalid — run: bash skills/system-ops/scripts/cloud_setup.sh token")
+            return 2
+        if uid is None:
+            return 0
+        owner, claimed = str(uid), True
     bot = Bot(Telegram(token), int(owner))
     bot.boot()
 
@@ -452,7 +513,8 @@ def run_bot() -> int:
     threading.Thread(target=bot.worker, daemon=True, name="dd-llm").start()
     threading.Thread(target=bot.cmd_worker, daemon=True, name="dd-cmds").start()
     dd.start_reminder_watcher(on_fire=lambda text: bot.safe_send(bot.owner, "⏰ " + text))
-    bot.safe_send(bot.owner, f"dd online ✅ ({dd.MODEL})" + (f"\nBrain: {problem}" if problem else ""))
+    hello = "Paired ✅ — ini dd unakku mattum reply pannum. /help paaru.\n" if claimed else ""
+    bot.safe_send(bot.owner, hello + f"dd online ✅ ({dd.MODEL})" + (f"\nBrain: {problem}" if problem else ""))
     backoff = 5
     while not bot.stop.is_set():
         try:
@@ -610,14 +672,66 @@ def selftest() -> int:
     assert any("dd online" in t for t in texts(7)), texts(7)
     assert any("Brain ready illa" in t for t in texts(7)), texts(7)
 
-    # 11. broken rules -> one-line warning, no LLM call
+    # 11. hands-free pairing (cloud-init): strangers and wrong secrets are ignored, /pair SECRET claims the bot,
+    #     the secret is wiped, then the normal bot starts and greets the owner
+    set_env(env_file, "TELEGRAM_OWNER_ID", "")
+    set_env(env_file, "DD_PAIR_SECRET", "s3cret-Pair_42")
+    os.environ.pop("TELEGRAM_OWNER_ID", None)
+    os.environ["DD_PAIR_SECRET"] = "s3cret-Pair_42"
+    polls["n"] = 0
+    queue_in = [[msg(55, "hi"), msg(55, "/pair guess"), msg(8, "/pair s3cret-Pair_42", chat_type="group"),
+                 msg(8, "/pair s3cret-Pair_42")], [], [msg(8, "hello after pairing")]]
+
+    def transport3(method: str, data: dict):
+        if method == "getUpdates":
+            if data.get("timeout") == 0:
+                return []
+            if queue_in:
+                return queue_in.pop(0)
+            time.sleep(3)
+            raise SystemExit(0)
+        return transport(method, data)
+
+    globals()["Telegram"] = lambda token: real_tg(token, transport3)
+    sent.clear()
+    try:
+        run_bot()
+    except SystemExit:
+        pass
+    finally:
+        globals()["Telegram"] = real_tg
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    env_now = env_file.read_text()
+    assert "TELEGRAM_OWNER_ID=8" in env_now and "DD_PAIR_SECRET=\n" in env_now, env_now
+    assert texts(55) == ["Idhu oru private assistant. / This is a private assistant."], texts(55)
+    assert any("Paired" in t and "dd online" in t for t in texts(8)), texts(8)
+    assert any("Brain ready illa" in t for t in texts(8)), texts(8)  # the next message was answered as owner
+
+    # 12. a revoked / wrong token stops claim mode with exit 2 (systemd won't restart-loop on 2)
+    set_env(env_file, "TELEGRAM_OWNER_ID", "")
+    os.environ.pop("TELEGRAM_OWNER_ID", None)
+    os.environ["DD_PAIR_SECRET"] = "x"
+
+    def transport4(method: str, data: dict):
+        raise RuntimeError("Unauthorized")
+
+    globals()["Telegram"] = lambda token: real_tg(token, transport4)
+    try:
+        assert run_bot() == 2
+    finally:
+        globals()["Telegram"] = real_tg
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    os.environ.pop("DD_PAIR_SECRET", None)
+
+    # 13. broken rules -> one-line warning, no LLM call
     (home / "rules" / "RULES.md").write_text("tampered", encoding="utf-8")
     bot2 = Bot(tg, 7, model_fn=stub, warm=False)
     bot2.boot()
     sent.clear()
     bot2.process("text", "hi")
     assert bot2.rules_error and any("Rules file hash mismatch" in t for t in texts(7))
-    print("dd_telegram selftest ok (pairing, owner-only, text+voice turns, commands, reminders, chunking, trim, backup, rules lock)")
+    print("dd_telegram selftest ok (terminal + hands-free pairing, owner-only, text+voice turns, commands, reminders, chunking, trim, backup, bad token, rules lock)")
     return 0
 
 

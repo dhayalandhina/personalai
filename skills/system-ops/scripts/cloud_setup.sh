@@ -6,7 +6,10 @@
 #   bash cloud_setup.sh status                          services, loaded model, RAM, disk, last log lines
 #   bash cloud_setup.sh token                           re-enter the Telegram bot token
 #   bash cloud_setup.sh pair                            re-link your Telegram account
+#   bash cloud_setup.sh cloud-init                      print a no-SSH first-boot script for Oracle's "Initialization script" box
 #   bash cloud_setup.sh --selftest
+# Non-interactive (cloud-init): DD_TELEGRAM_TOKEN=... DD_PAIR_SECRET=... bash cloud_setup.sh install
+#   -> no prompts; the bot then waits for "/pair <secret>" from your Telegram (works even if sent earlier).
 # Safety: dd runs as its own user "dd" (no sudo, NoNewPrivileges, read-only system dirs, no access to /home).
 # Nothing listens on the internet: Telegram is polled outbound, Ollama stays on 127.0.0.1:11434.
 # Never open port 11434 in the Oracle security list — Ollama has no password.
@@ -176,9 +179,10 @@ install_all() {
   echo "== dd cloud setup — $(date) =="
 
   step 1 "system packages (git, python venv, ffmpeg, sqlite)"
-  run sudo apt-get update -y -q
-  run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -q git python3-venv python3-pip ffmpeg sqlite3 curl ca-certificates \
-    || die "apt install aagala"
+  # first boot: unattended-upgrades often holds the dpkg lock for a few minutes — wait instead of failing
+  run sudo apt-get -o DPkg::Lock::Timeout=900 update -y -q
+  run sudo env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=900 install -y -q \
+    git python3-venv python3-pip ffmpeg sqlite3 curl ca-certificates || die "apt install aagala"
 
   step 2 "timezone $TZ_NAME (reminders, 'mani enna')"
   run sudo timedatectl set-timezone "$TZ_NAME"
@@ -225,13 +229,42 @@ install_all() {
     || echo "  voice model download aagala — first voice note la thirumba try pannum"
 
   step 7 "Telegram (token + link your account)"
-  [ -n "$(env_get TELEGRAM_BOT_TOKEN)" ] || ask_token
-  [ -n "$(env_get TELEGRAM_OWNER_ID)" ] || do_pair
+  local waiting_pair=""
+  [ -n "${DD_TELEGRAM_TOKEN:-}" ] && env_set TELEGRAM_BOT_TOKEN "$DD_TELEGRAM_TOKEN"
+  [ -n "$(env_get TELEGRAM_BOT_TOKEN)" ] || [ -n "${DD_TELEGRAM_TOKEN:-}" ] || ask_token
+  if [ -z "$(env_get TELEGRAM_OWNER_ID)" ]; then
+    if [ -n "${DD_PAIR_SECRET:-}" ]; then
+      env_set DD_PAIR_SECRET "$DD_PAIR_SECRET"
+      waiting_pair=1
+      echo "  pairing: the bot accepts /pair <your secret> from your Telegram (no terminal needed)"
+    else
+      do_pair
+    fi
+  fi
 
   step 8 "dd service (auto-start on boot, restarts itself)"
   start_service
   echo
-  echo "== done — Telegram la un bot ku 'hi' anuppu. Status: bash $SELF status =="
+  if [ -n "$waiting_pair" ]; then
+    echo "== done — Telegram la un bot ku /pair <secret> anuppu. Status: bash $SELF status =="
+  else
+    echo "== done — Telegram la un bot ku 'hi' anuppu. Status: bash $SELF status =="
+  fi
+}
+
+cloud_init_text() {  # cloud_init_text SECRET -> first-boot script (runs once as root; log /var/log/dd-setup.log)
+  cat <<EOF
+#!/bin/bash
+TOKEN='PASTE_BOT_TOKEN_HERE'
+PAIR_SECRET='$1'
+export HOME=/root
+exec >>/var/log/dd-setup.log 2>&1
+chmod 600 /var/log/dd-setup.log
+apt-get -o DPkg::Lock::Timeout=900 update -y
+apt-get -o DPkg::Lock::Timeout=900 install -y git
+[ -d /opt/dd/.git ] || git clone https://github.com/dhayalandhina/personalai /opt/dd
+DD_TELEGRAM_TOKEN="\$TOKEN" DD_PAIR_SECRET="\$PAIR_SECRET" bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh install
+EOF
 }
 
 status() {
@@ -277,14 +310,29 @@ selftest() {
   out=$(env -u DD_AGENT DD_FAKE_UNAME=Darwin bash "$SELF" install 2>&1)
   echo "$out" | grep -q "background.sh" || { echo "Mac not refused: $out"; return 1; }
   out=$(env -u DD_AGENT DD_SETUP_DRY=1 DD_UNIT_DIR="$t/units" bash "$SELF" install --model qwen2.5:7b 2>&1)
-  for want in "DRY: sudo apt-get update" "DRY: sudo timedatectl set-timezone Asia/Kolkata" \
+  for want in "DRY: sudo apt-get -o DPkg::Lock::Timeout=900 update" "DRY: sudo timedatectl set-timezone Asia/Kolkata" \
               "DRY: curl -fsSL https://ollama.com/install.sh | sh" "DRY: write $t/units/ollama.service.d/dd.conf" \
               "DRY: ollama pull qwen2.5:7b" "DRY: sudo useradd --system" "DRY: set DD_HOST in" "DRY: set DD_MODEL in" \
               "DRY: pair your Telegram account" "DRY: sudo systemctl enable --now dd-telegram" "== done"; do
     echo "$out" | grep -qF "$want" || { echo "dry install missing: $want"; echo "$out" | tail -20; return 1; }
   done
+
+  # hands-free (cloud-init): token + pair secret from env -> no prompts, no terminal pairing
+  out=$(env -u DD_AGENT DD_SETUP_DRY=1 DD_UNIT_DIR="$t/units" DD_TELEGRAM_TOKEN=x DD_PAIR_SECRET=y bash "$SELF" install 2>&1)
+  for want in "DRY: set TELEGRAM_BOT_TOKEN in" "DRY: set DD_PAIR_SECRET in" "/pair <secret>"; do
+    echo "$out" | grep -qF "$want" || { echo "hands-free install missing: $want"; return 1; }
+  done
+  echo "$out" | grep -qE "ask for the Telegram bot token|pair your Telegram account" && { echo "hands-free install prompted"; return 1; }
+  out=$(bash "$SELF" cloud-init)
+  echo "$out" | bash -n || { echo "cloud-init script has a syntax error"; return 1; }
+  for want in "TOKEN='PASTE_BOT_TOKEN_HERE'" "git clone https://github.com/dhayalandhina/personalai /opt/dd" \
+              'DD_TELEGRAM_TOKEN="$TOKEN" DD_PAIR_SECRET="$PAIR_SECRET" bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh install'; do
+    echo "$out" | grep -qF "$want" || { echo "cloud-init missing: $want"; return 1; }
+  done
+  [ "$(echo "$out" | sed -n "s/^PAIR_SECRET='\(.*\)'$/\1/p" | tr -d '\n' | wc -c)" -ge 16 ] || { echo "pair secret too short"; return 1; }
+  [ "$(bash "$SELF" cloud-init | grep '^PAIR_SECRET=')" != "$(echo "$out" | grep '^PAIR_SECRET=')" ] || { echo "secret not random"; return 1; }
   rm -rf "$t"
-  echo "cloud_setup selftest ok (hardened unit, Ollama local-only, .env edit 600, owner-only, Mac refused, dry install)"
+  echo "cloud_setup selftest ok (hardened unit, Ollama local-only, .env edit 600, owner-only, Mac refused, dry + hands-free install, cloud-init)"
 }
 
 case "${1:-}" in
@@ -293,6 +341,7 @@ case "${1:-}" in
   status) status ;;
   token) guard; ask_token; sudo systemctl restart dd-telegram 2>/dev/null || true ;;
   pair) guard; do_pair; start_service ;;
+  cloud-init) cloud_init_text "$(python3 -c 'import secrets; print(secrets.token_urlsafe(12))')" ;;
   --selftest) selftest ;;
   *) sed -n '2,12p' "$SELF"; exit 2 ;;
 esac
