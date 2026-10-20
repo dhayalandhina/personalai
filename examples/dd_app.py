@@ -58,7 +58,7 @@ class AppCore:
         self.thread.start()
 
     def stop(self) -> None:
-        self.listener.stop.set()
+        self.listener.shutdown()  # stops the ears and releases the mic (ffmpeg / dd-mic)
         if self.chat_proc is not None and self.chat_proc.poll() is None:
             self.chat_proc.terminate()
 
@@ -180,11 +180,13 @@ def run_menu_bar(core: AppCore) -> int:
             if changed:
                 core.relaunch()
                 core.stop()
+                threading.Timer(2.0, lambda: os._exit(0)).start()
                 rumps.quit_application()
 
         @rumps.clicked("Quit dd")
         def quit(self, _):
             core.stop()
+            threading.Timer(2.0, lambda: os._exit(0)).start()  # never leave a zombie dd behind
             rumps.quit_application()
 
     DDBar().run()

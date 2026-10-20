@@ -194,6 +194,18 @@ def list_devices() -> str:
     return r.stderr + r.stdout
 
 
+_children: list = []  # mic processes (ffmpeg / dd-mic) — killed on stop/quit so the mic is released
+
+
+def kill_children() -> None:
+    for p in list(_children):
+        try:
+            p.kill()
+        except Exception:
+            pass
+    _children.clear()
+
+
 def ffmpeg_source():
     """Yields 20 ms PCM frames from the microphone until ffmpeg stops (then raises with its last error)."""
     if MAC:
@@ -202,6 +214,7 @@ def ffmpeg_source():
         inp = ["-f", "pulse", "-i", "default"] if shutil.which("pactl") else ["-f", "alsa", "-i", "default"]
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *inp, "-ac", "1", "-ar", str(RATE), "-f", "s16le", "-"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    _children.append(p)
     try:
         while True:
             frame = p.stdout.read(FRAME_BYTES)
@@ -234,6 +247,7 @@ def helper_source(binary: str):
     global _helper_failures
     started = time.monotonic()
     p = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    _children.append(p)
     got = 0
     try:
         while True:
@@ -285,6 +299,18 @@ def stt(pcm: bytes) -> str:
                                   beam_size=1, vad_filter=False, condition_on_previous_text=False,
                                   initial_prompt=HINT, no_speech_threshold=0.6)
     return " ".join(s.text.strip() for s in segs).strip()
+
+
+def spoken_form(reply: str, limit: int = 300) -> str:
+    """What gets read aloud: the first 1-2 sentences, never a transcript-like ramble or a code dump."""
+    text = re.sub(r"```[\s\S]*?```", " code screen la irukku. ", reply)
+    text = re.sub(r"(?im)(^|\s)(user|dd|assistant|system)\s*:[^\n]*", " ", text)  # hallucinated dialogue lines
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "))
+    return (cut[:end + 1] if end > 40 else cut).strip()
 
 
 def default_speak(text: str) -> None:
@@ -423,6 +449,11 @@ class Listener:
         self.log(f"  mic test: {res}")
         t["done"](res)
 
+    def shutdown(self) -> None:
+        """Stop listening and release the microphone (kills ffmpeg / dd-mic)."""
+        self.stop.set()
+        kill_children()
+
     def set_state(self, s: str) -> None:
         if s != self.state:
             self.state = s
@@ -504,7 +535,7 @@ class Listener:
         except Exception as e:
             reply = f"Mudiyala: {type(e).__name__}: {str(e)[:120]}"
         self.log(f"  you> {command}\n  dd> {reply}  ({self.clock() - t1:.1f}s)")
-        self.say(reply)
+        self.say(spoken_form(reply))
         self.followup_until = self.clock() + self.followup_s
 
     def feed(self, frame: bytes) -> None:
@@ -940,6 +971,11 @@ def selftest() -> int:
     time.sleep(0.4)
     assert 2 <= len(slow_calls) <= 4, slow_calls
     lw.stop.set()
+
+    # 4d. spoken form: short, no dialogue hallucinations, no code
+    sp = spoken_form("Chrome open panniten. User: \"hi\"\ndd: \"hello\"\n```bash\nls\n```" + " x" * 300)
+    assert "User" not in sp and "```" not in sp and len(sp) <= 310 and sp.startswith("Chrome open panniten."), sp
+    assert spoken_form("Ok.") == "Ok."
 
     # 5. run(): a dying mic stream is reported and retried; stop ends the loop
     calls = {"n": 0}
