@@ -573,8 +573,9 @@ DD_HEAD_FILE = os.environ.get("DD_WAKE_DD_MODEL") or str(dd.ROOT / "skills" / "v
 class DDHead:
     """'dee dee' wake word: a tiny classifier (one hidden layer, numpy) on the same openWakeWord embeddings the
     hey-jarvis model reads — trained from thousands of synthetic voices by skills/voice/scripts/wakeword_train.py.
-    Fires only when two consecutive 80 ms chunks agree; a wake that is never followed by a command raises its
-    own threshold a little (false-wake learning), so a noisy room cannot keep triggering it."""
+    Fires only when two consecutive 80 ms chunks agree, and the listener then confirms the candidate with Whisper
+    on the last 2 s of audio (a two-stage wake, like Siri's) — so this head can be recall-oriented. Candidates
+    Whisper rejects, and wakes never followed by a command, raise its threshold by themselves."""
 
     def __init__(self, path: str = DD_HEAD_FILE, threshold: float | None = None):
         import numpy as np
@@ -582,11 +583,12 @@ class DDHead:
         self.mu, self.sd = z["mu"], z["sd"]
         self.w1, self.b1, self.w2, self.b2 = z["w1"], z["b1"], z["w2"], z["b2"]
         self.T = int(z["T"])
-        self.threshold = float(os.environ.get("DD_WAKE_DD_THRESHOLD", "0.9")) if threshold is None else threshold
+        self.threshold = float(os.environ.get("DD_WAKE_DD_THRESHOLD", "0.75")) if threshold is None else threshold
         self.base_threshold = self.threshold
         self.streak = 0
         self.last_score = 0.0
         self.false_wakes: deque[float] = deque(maxlen=20)
+        self.rejects: deque[float] = deque(maxlen=40)
 
     def score(self, feats) -> float:
         import numpy as np
@@ -616,6 +618,14 @@ class DDHead:
     def good_wake(self) -> None:
         """A wake followed by a real command: relax halfway back towards the base threshold."""
         self.threshold = max(self.base_threshold, self.threshold - 0.01)
+
+    def rejected(self, now: float) -> None:
+        """Whisper heard something else: eight such candidates within 10 min raise the threshold a notch."""
+        self.rejects.append(now)
+        recent = [t for t in self.rejects if now - t < 600]
+        if len(recent) >= 8 and self.threshold < 0.985:
+            self.threshold = min(0.985, self.threshold + 0.05)
+            self.rejects.clear()
 
 
 class WakeDetector:
@@ -697,7 +707,7 @@ class Listener:
         # Utterances are transcribed/answered on a worker thread, so the mic keeps streaming while Whisper or the
         # model is busy (a slow turn never backs up the audio pipe). inline=True runs them synchronously (tests).
         self.inline = inline
-        self.queue: deque[bytes] = deque(maxlen=2)   # newest two wait; anything older is stale and dropped
+        self.queue: deque = deque(maxlen=2)   # utterances (and 'verify' jobs); older ones are stale and dropped
         self.work = threading.Event()
         self.worker: threading.Thread | None = None
         self.stt, self.speak_fn = stt_fn or stt, speak or default_speak
@@ -716,6 +726,9 @@ class Listener:
         self.speaking = False
         self.pending_wake = False  # a wake heard while dd spoke (barge-in): armed as soon as it is quiet
         self.wake_answered = True  # False between a wake and its command (false-wake learning for the dd head)
+        self.recent: deque[bytes] = deque(maxlen=100)   # last 2 s of mic audio (Whisper confirms "dd" candidates)
+        self.tentative_until = 0.0  # a "dd" candidate is being confirmed: keep capturing the command meanwhile
+        self.verify = os.environ.get("DD_WAKE_VERIFY", "1") != "0"
         self.stop_speak_fn = stop_speak or default_stop_speaking
         self.zero_run = 0        # consecutive all-zero frames (mic blocked -> digital silence)
         self.problem_sent = False
@@ -786,8 +799,10 @@ class Listener:
         self.wake_answered = False
         self.on_heard(word, 0.0)
         self.ack(sound_only=True)
-        self.seg.reset()
-        self.seg.pre.clear()
+        if self.clock() >= self.tentative_until:  # (a confirmed candidate keeps what it captured meanwhile)
+            self.seg.reset()
+            self.seg.pre.clear()
+        self.tentative_until = 0.0
         self.armed_until = self.clock() + self.followup_s
         self.set_state("recording")
 
@@ -902,12 +917,17 @@ class Listener:
                                 "Microphone la dd/Terminal ku ON pannu.")
         else:
             self.zero_run = 0
+        self.recent.append(frame)
         if self.wake is not None:
             score = self.wake.feed(frame)
             if score:
-                self.on_wake(score)
+                if getattr(self.wake, "last_word", "") == "dd" and self.verify:
+                    self.confirm_wake(score)  # stage two: Whisper decides, on the worker thread
+                else:
+                    self.on_wake(score)
                 return
-            if self.clock() >= self.armed_until and self.clock() >= self.followup_until:
+            if self.clock() >= self.armed_until and self.clock() >= self.followup_until \
+                    and self.clock() >= self.tentative_until:
                 if self.state == "recording":
                     self.set_state("listening")
                 if self.woke_at and not self.wake_answered:  # armed, but no command came: a false wake
@@ -924,6 +944,43 @@ class Listener:
         utt = self.seg.feed(frame)
         if utt:
             self.submit(utt)
+
+    def confirm_wake(self, score: float) -> None:
+        """A 'dd' candidate from the head: hand the last 2 s to Whisper (worker thread); meanwhile the segmenter keeps
+        running so a command said in the same breath is not lost. on_wake() runs only if Whisper agrees."""
+        pcm = b"".join(self.recent)
+        self.tentative_until = self.clock() + 2.5
+        self.log(f"  wake? dd candidate ({score:.2f}) — confirming")
+        job = ("verify", pcm, score)
+        if self.inline:
+            self._verify(pcm, score)
+            return
+        if self.worker is None or not self.worker.is_alive():
+            self.worker = threading.Thread(target=self._worker, daemon=True, name="dd-brain")
+            self.worker.start()
+        self.queue.append(job)
+        self.work.set()
+
+    def _verify(self, pcm: bytes, score: float) -> None:
+        t0 = self.clock()
+        try:
+            text = self.stt(pcm).strip()
+        except Exception as e:
+            text = ""
+            self.log(f"  (wake confirmation failed: {e})")
+        woke, _cmd = parse_wake(text) if text else (False, "")
+        head = getattr(self.wake, "dd", None)
+        if woke:
+            self.log(f"  wake: dd confirmed by whisper ({text!r}, {self.clock() - t0:.1f}s)")
+            self.on_wake(score)
+        else:
+            self.tentative_until = 0.0
+            self.seg.reset()
+            self.seg.pre.clear()
+            if head is not None:
+                head.rejected(self.clock())
+            self.log(f"  wake: dd candidate rejected ({text!r}, {self.clock() - t0:.1f}s; threshold "
+                     f"{head.threshold:.2f})" if head is not None else f"  wake: dd candidate rejected ({text!r})")
 
     def _idle_state(self) -> str:
         """'recording' while a wake/follow-up window is open (the next words are a command), else 'listening'."""
@@ -951,7 +1008,10 @@ class Listener:
                 continue
             utt = self.queue.popleft()
             try:
-                self.process(utt)
+                if isinstance(utt, tuple) and utt[0] == "verify":
+                    self._verify(utt[1], utt[2])
+                else:
+                    self.process(utt)
             except Exception as e:  # a bad turn must not kill the brain thread
                 self.log(f"  turn failed: {type(e).__name__}: {e}")
                 self.set_state("listening")
@@ -1289,7 +1349,26 @@ def selftest() -> int:
         def __init__(self): self.calls = []
         def false_wake(self, t): self.calls.append(("false", t))
         def good_wake(self): self.calls.append(("good",))
+        def rejected(self, t): self.calls.append(("rejected", t))
     fw.dd, fw.last_word = FakeHead(), "dd"
+    # stage two: a dd candidate is confirmed by Whisper on the last 2 s — rejected when it heard something else
+    real_stt = lg.stt
+    lg.stt = lambda b: "the weather is nice"
+    fw.fire_in = 1
+    lg.feed(_quiet(20)[0])
+    assert lg.state == "listening" and fw.dd.calls[-1][0] == "rejected" and lg.tentative_until == 0.0, (lg.state, fw.dd.calls)
+    lg.stt = lambda b: "D.D."
+    fw.dd.calls.clear()
+    fw.fire_in = 1
+    lg.feed(_quiet(20)[0])
+    assert lg.state == "recording" and lg.last_heard == "dd ✓" and lg.wake_answered is False and lg.tentative_until == 0.0
+    lg.stt = real_stt
+    lg.verify = False  # the rest of this block exercises the head's bookkeeping without the Whisper stage
+    now["t"] += 30
+    for f in _quiet(2000):
+        lg.feed(f)
+    assert fw.dd.calls and fw.dd.calls[-1][0] == "false", fw.dd.calls  # confirmed wake, then silence: a false wake
+    fw.dd.calls.clear()
     fw.fire_in = 1
     lg.feed(_quiet(20)[0])
     assert lg.state == "recording" and lg.last_heard == "dd ✓" and lg.wake_answered is False
@@ -1307,6 +1386,11 @@ def selftest() -> int:
         lg.feed(f)
     assert fw.dd.calls[-1][0] == "false" and lg.wake_answered, fw.dd.calls
     fw.dd, fw.last_word = None, "hey jarvis"
+    lg.verify = True
+    # DDHead.rejected: eight rejections in ten minutes raise the threshold by 0.05
+    for t in range(8):
+        head.rejected(1000.0 + t)
+    assert abs(head.threshold - 0.95) < 1e-9, head.threshold
 
     # barge-in: "hey jarvis" while dd is talking cuts the sentence, then arms as soon as it is quiet
     stops = []

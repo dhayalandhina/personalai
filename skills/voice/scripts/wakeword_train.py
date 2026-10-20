@@ -47,7 +47,7 @@ HARD_NEG = ["daddy", "teddy", "ready", "steady", "TV", "CD", "DVD", "deep", "ind
             "jarvis", "hey jarvis", "hey siri", "alexa", "ok google", "hey", "hey you", "the", "deed", "seedy", "did it",
             "dude", "dad", "did", "deal", "dear", "dean", "a d", "idea", "video", "media", "pdf", "d day", "db",
             "chrome open pannu", "volume thirty", "innaiku weather enna", "screenshot edu", "sollu", "enna", "pannu",
-            "didi", "dee", "tee tee", "bee bee", "pee pee", "key key", "gee gee", "we we", "me me", "see see", "knee knee"]
+            "dee", "tee tee", "bee bee", "pee pee", "key key", "gee gee", "we we", "me me", "see see", "knee knee"]
 VOCAB = ("the of and to in is you that it he was for on are as with his they I at be this have from or one had by word "
          "but not what all were we when your can said there use an each which she do how their if will up other about "
          "out many then them these so some her would make like him into time has look two more write go see number no "
@@ -112,6 +112,42 @@ def place(a, end_offset_s: float = 0.0, win: int = WIN):
         a, start = a[-start:], 0
     out[start:end] = a[: end - start]
     return out
+
+
+def speed_perturb(a, lo: float = 0.85, hi: float = 1.15):
+    """Resample by a random factor: faster/slower and higher/lower pitched at once (speaker variety)."""
+    np = _np()
+    from scipy.signal import resample_poly
+    f = rng.uniform(lo, hi)
+    up, down = int(round(100 / f)), 100
+    y = resample_poly(a, up, down).astype(np.float32)
+    return y
+
+
+def espeak_synth(text: str):
+    """espeak-ng (formant synthesis) — a second, very different 'speaker family' when it is installed."""
+    import shutil
+    import subprocess
+    np = _np()
+    if not shutil.which("espeak-ng") or not shutil.which("ffmpeg"):
+        return None
+    voice = rng.choice(["en-us", "en-gb", "en-in", "en-us+f3", "en-gb+m4", "en-in+f2", "en-us+m7", "en+f5"])
+    try:
+        wav = subprocess.run(["espeak-ng", "-v", voice, "-p", str(rng.randint(25, 75)), "-s", str(rng.randint(120, 200)),
+                              "--stdout", text], check=True, capture_output=True, timeout=20).stdout
+        pcm = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+                             input=wav, check=True, capture_output=True, timeout=20).stdout
+    except Exception:
+        return None
+    a = np.frombuffer(pcm, dtype=np.float32).copy()
+    if len(a) < 1600:
+        return None
+    a = a / (np.max(np.abs(a)) + 1e-6) * 0.7
+    e = np.abs(a) > 0.01
+    if e.any():
+        i, j = int(np.argmax(e)), len(a) - int(np.argmax(e[::-1]))
+        a = a[max(0, i - 400): j + 400]
+    return a
 
 
 def augment(x, strong: bool = True):
@@ -191,35 +227,46 @@ def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500,
 
     pos, posmeta, neg, negmeta = [], [], [], []
     t0 = time.time()
-    for i in range(n_pos):
+    use_espeak = espeak_synth("test") is not None
+
+    def say(text):
+        """A clip from Piper (85%) or espeak-ng (15%, when installed): two very different voice families."""
+        if use_espeak and rng.random() < 0.15:
+            a = espeak_synth(text)
+            if a is not None:
+                return "espeak", None, a
         name, v, spk = pick()
+        return name, spk, synth(v, text, spk)
+
+    for i in range(n_pos):
         text = rng.choice(POS_TEXTS)
-        a = synth(v, text, spk)
+        name, spk, a = say(text)
         for k in range(3):
-            x = place(a, rng.uniform(0.0, 0.35))
+            b = a if k == 0 else speed_perturb(a)
+            x = place(b, rng.uniform(0.0, 0.35))
             pos.append(x if k == 0 else augment(x))
             posmeta.append({"voice": name, "spk": spk, "text": text, "aug": k})
         if i % 300 == 0:
             print(f"pos {i}/{n_pos} {time.time() - t0:.0f}s", flush=True)
     for i in range(n_neg):
-        name, v, spk = pick()
         text = sentence()
-        a = synth(v, text, spk)
+        name, spk, a = say(text)
         for k in range(2):
-            x = place(a, rng.uniform(0.0, 0.6))
-            if len(a) > WIN:
-                s = rng.randrange(0, len(a) - WIN + 1)
-                x = a[s: s + WIN].copy()
+            b = a if k == 0 else speed_perturb(a)
+            x = place(b, rng.uniform(0.0, 0.6))
+            if len(b) > WIN:
+                s = rng.randrange(0, len(b) - WIN + 1)
+                x = b[s: s + WIN].copy()
             neg.append(x if k == 0 else augment(x))
             negmeta.append({"voice": name, "spk": spk, "text": text, "aug": k})
         if i % 300 == 0:
             print(f"neg {i}/{n_neg} {time.time() - t0:.0f}s", flush=True)
     for i in range(n_hard):
-        name, v, spk = pick()
         text = rng.choice(HARD_NEG)
-        a = synth(v, text, spk)
-        for k in range(3):
-            x = place(a, rng.uniform(0.0, 0.35))
+        name, spk, a = say(text)
+        for k in range(4):  # confusables get one more augmented copy: they are what the head must learn to refuse
+            b = a if k == 0 else speed_perturb(a)
+            x = place(b, rng.uniform(0.0, 0.35))
             neg.append(x if k == 0 else augment(x))
             negmeta.append({"voice": name, "spk": spk, "text": text, "aug": k, "hard": True})
     for i in range(n_noise):
@@ -330,6 +377,10 @@ def selftest() -> int:
     aug = augment(w)
     assert aug.shape == (WIN,) and float(np.max(np.abs(aug))) <= 1.0 and not np.array_equal(aug, w)
     assert noise(1000, "pink").shape == (1000,) and reverb(w).shape == (WIN,)
+    sp = speed_perturb(a)
+    assert abs(len(sp) / len(a) - 1.0) < 0.2 and sp.dtype == np.float32
+    es = espeak_synth("dee dee")
+    assert es is None or (es.ndim == 1 and len(es) > 1600 and float(np.max(np.abs(es))) <= 0.71)
     assert 2 <= len(sentence().split()) <= 7
     # a toy embedding problem: positives have a bump in feature 0 of the last frames
     g = np.random.default_rng(0)
