@@ -77,6 +77,7 @@ class Segmenter:
     def reset(self) -> None:
         self.speaking, self.frames, self.silence, self.speech_frames, self.loud_run = False, [], 0, 0, 0
         self.energy_sum = 0.0
+        self.last_forced = False  # True when the last utterance hit max_ms (continuous audio: a video, music, a chat)
 
     @property
     def noise(self) -> float:
@@ -123,6 +124,7 @@ class Segmenter:
             for _ in range(40):
                 self._idle_level(avg)
         self.reset()
+        self.last_forced = forced
         return utt if spoken >= self.min_speech_ms else None  # a click or cough is not an utterance
 
 
@@ -338,10 +340,17 @@ class Listener:
             self.say("Sollu.")
 
     def process(self, utt: bytes) -> None:
+        audio = len(utt) / (RATE * 2)
+        if self.seg.last_forced and self.clock() >= self.followup_until:
+            # non-stop audio with no pause (a video, music, people talking) — a command is 1-4 s with a pause after it.
+            # Transcribing media would just burn CPU and never contains a wake word, so skip it while idle.
+            self._last_activity = self.clock()
+            self.last_heard = f"(continuous audio {audio:.0f}s — video/music? skipped)"
+            self.log(f"  skipped: {audio:.0f}s of continuous audio (media?) — pause dd or use earphones while a video plays")
+            return
         t0 = self.clock()
         text = self.stt(utt).strip()
         secs = self.clock() - t0
-        audio = len(utt) / (RATE * 2)
         self._last_activity = self.clock()
         if not text or blocked(text):
             self.last_heard = f"(sound, no words — {audio:.1f}s)" if not text else f"(ignored: {text})"
@@ -625,6 +634,26 @@ def selftest() -> int:
         lis.feed(f)
     assert results and results[0]["heard"] == "jarvis chrome open pannu" and results[0]["peak"] > 1000, results
     assert results[0]["seconds"] == 3.0 and lis.test is None and handled == ["open chrome", "volume 30"]
+
+    # continuous audio (a video) while idle is skipped without calling Whisper; in a follow-up window it is read
+    calls = {"n": 0}
+
+    def counting_stt(pcm):
+        calls["n"] += 1
+        return "dictated long message"
+    lis.stt = counting_stt
+    for f in _tone(9000):
+        lis.feed(f)
+    assert calls["n"] == 0 and "continuous audio" in lis.last_heard, (calls, lis.last_heard)
+    for f in _quiet(2500):  # the room goes quiet again -> the floor relaxes
+        lis.feed(f)
+    assert lis.seg.threshold() < 1000, lis.seg.threshold()
+    lis.followup_until = now["t"] + 8
+    for f in _tone(9000):
+        lis.feed(f)
+    assert calls["n"] == 1 and handled[-1] == "dictated long message", (calls, handled)
+    lis.followup_until = 0
+    lis.stt = fake_stt
 
     # an utterance Whisper can't read is still visible as "(sound, no words)"
     heard = iter([""])
