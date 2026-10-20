@@ -1,11 +1,11 @@
 # dd-skills — skill library for dd (personal AI assistant)
 
-26 drop-in skills in the open **Agent Skills** format (`skills/<name>/SKILL.md` + `scripts/` + `references/` + `assets/`), a progressive-disclosure loader, a validator that runs every script's `--selftest`, and an example zero-key agent loop on Ollama. Everything is free / open-source / self-hosted. No paid APIs anywhere.
+27 drop-in skills in the open **Agent Skills** format (`skills/<name>/SKILL.md` + `scripts/` + `references/` + `assets/`), a progressive-disclosure loader, a validator that runs every script's `--selftest`, and an example zero-key agent loop on Ollama. Everything is free / open-source / self-hosted. No paid APIs anywhere.
 
 ```
 dd-skills/
 ├── skill_loader.py        # index → load → run (3 levels), Ollama/OpenAI tool schemas, keyword routing
-├── test_skills.py         # validates all 26 skills + runs 36 selftests (run after every change)
+├── test_skills.py         # validates all 27 skills + runs 37 selftests (run after every change)
 ├── examples/dd_loop_ollama.py   # minimal agent loop: rules check → memory recall → tool calls → log
 ├── examples/dd_telegram.py      # Telegram bot runner (text + voice notes, reminders) — the cloud server mode
 ├── install_app.sh + macapp/     # builds the Mac app (native applet): menu bar, always listening (dd_app.py + dd_listen.py)
@@ -38,6 +38,7 @@ dd-skills/
     ├── n8n-automation       self-hosted n8n REST: workflows, executions, webhooks, scaffolds
     ├── system-ops           healthcheck (/status), backup/restore of ~/.dd
     ├── mac-control          JARVIS actions: apps, websites, volume, music, screenshot, lock + instant router
+    ├── employees            500 named specialists (50 roles x 10); every task auto-assigned to the best one + checklist
     └── skill-creator        dd scaffolds + validates its own new skills
 ```
 
@@ -45,7 +46,7 @@ dd-skills/
 ```bash
 git clone https://github.com/dhayalandhina/personalai && cd personalai
 bash install.sh                        # deps, ~/.dd, locks the default rules, briefing config
-python3 test_skills.py                 # must print "ALL GOOD: 26 skills valid"
+python3 test_skills.py                 # must print "ALL GOOD: 27 skills valid"
 cp .env.example ~/.dd/.env && chmod 600 ~/.dd/.env   # fill TELEGRAM_BOT_TOKEN etc. (optional per skill)
 ollama pull qwen2.5-coder:7b-instruct-q4_K_M        # or run: python3 skills/local-models/scripts/models.py recommend
 python3 examples/dd_loop_ollama.py     # chat
@@ -82,6 +83,9 @@ python3 examples/dd_jarvis.py --text        # type, dd speaks back
 ```
 Mic via ffmpeg, speech-to-text via faster-whisper (local), brain = same dd agent loop + skills, voice via macOS `say` (Piper/espeak elsewhere). First run asks macOS for microphone permission for your terminal app.
 
+## The team (500 specialists)
+Every message is routed to the best-fitting employee from `skills/employees` (50 roles × 10 specialisations: engineering, data, design, content & marketing, business & ops, personal, hospitality). dd then works as that specialist — their skills, a "done when" bar and a verify checklist are prepended to the task. Same local brain underneath; the profile adds focus and a checklist, not IQ. `python3 skills/employees/scripts/employees.py find "task"` shows who would take it; on Telegram `/team task`. Small talk gets no employee; `DD_EMPLOYEES=0` turns it off.
+
 ## Mac app (menu bar, always listening)
 One command builds **dd.app** natively on your Mac (AppleScript applet via `osacompile` — so it runs natively on Apple silicon and macOS asks Microphone permission for "dd"), installs the deps, and starts it at login:
 ```bash
@@ -102,4 +106,4 @@ Engine: `examples/dd_listen.py` — continuous mic stream + voice-activity segme
 - Nothing here edits the locked rules. Learned preferences lose to rules on conflict.
 
 ## Status
-Validated on 20 Oct 2026: 26 skills, 36 scripts, all selftests passing (`test_skills.py`), plus `examples/*.py --selftest` (agent loop, JARVIS, listener engine, daemon, Telegram bot, chat window, menu-bar app, icon, app installer) and a full hardened `cloud_setup.sh install` emulated on Ubuntu 24.04 (root-owned secrets, separate pairing user, metadata firewall; systemd/Ollama stubbed). Live ComfyUI / Ollama / Telegram / IMAP paths need those services on your machine; their scripts fail gracefully with the install line when absent.
+Validated on 20 Oct 2026: 27 skills, 37 scripts, all selftests passing (`test_skills.py`), plus `examples/*.py --selftest` (agent loop, JARVIS, listener engine, daemon, Telegram bot, chat window, menu-bar app, icon, app installer) and a full hardened `cloud_setup.sh install` emulated on Ubuntu 24.04 (root-owned secrets, separate pairing user, metadata firewall; systemd/Ollama stubbed). Live ComfyUI / Ollama / Telegram / IMAP paths need those services on your machine; their scripts fail gracefully with the install line when absent.

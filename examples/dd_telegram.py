@@ -60,6 +60,7 @@ HELP = ("dd — un personal AI, cloud server la 24/7 odudhu.\n"
         "/remember TEXT — nyabagam vechukko\n"
         "/forget KEY — marandhudu\n"
         "/plan — open tasks\n"
+        "/team [task] — yaaru pannuvaa (500 specialists)\n"
         "/reminders — reminders list\n"
         "/status — server health\n"
         "/rules — locked rules\n"
@@ -436,6 +437,17 @@ class Bot:
             return f"Nyabagam vechukitten ✅ (key: {key}). Marakka: /forget {key}"
         if cmd == "/forget":
             return self.script("memory", "memory.py", ["forget", "--key", arg]) if arg else "Usage: /forget <key>"
+        if cmd == "/team":
+            if not arg:
+                return self.script("employees", "employees.py", ["depts"])
+            r = dd.LIB.run("employees", "employees.py", ["find", arg, "--top", "3"])
+            try:
+                hits = json.loads(r["stdout"] or "[]")
+            except json.JSONDecodeError:
+                hits = []
+            if not hits or hits[0].get("score", 0) < 4:
+                return "Idhukku specific specialist illa — Personal Assistant handle pannuvaa."
+            return "\n".join(f"{h['name']} — {h['level']} {h['role']} ({h['spec']})" for h in hits)
         if cmd == "/plan":
             return self.script("task-planner", "plan.py", ["list", "--open"])
         if cmd == "/reminders":
@@ -747,6 +759,8 @@ def selftest() -> int:
     assert "tea at 4pm" not in dd.run_script("memory", "memory.py", ["recall", "tea-at-4pm-daily"])["stdout"]
     assert "Mudiyala" not in bot.command("/reminders")
     assert "/brief" in bot.command("/help") and "Theriyaadha" in bot.command("/xyz")
+    assert "Engineering" in bot.command("/team") and "Frontend Engineer" in bot.command("/team next.js landing page")
+    assert "Personal Assistant" in bot.command("/team hi")
     bot.command("/new")
     bot.run_turn("fresh start")
     assert len([m for m in bot.messages if m["role"] == "user"]) == 1
