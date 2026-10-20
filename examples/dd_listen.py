@@ -541,11 +541,21 @@ def ensure_oww_models(folder: str, log=print) -> None:
     for i, name in enumerate(missing, 1):
         log(f"  wake model: downloading {name} ({i}/{len(missing)}, one-time)...")
         part = os.path.join(folder, name + ".part")
-        with urllib.request.urlopen(OWW_RELEASE + name, timeout=60) as r, open(part, "wb") as out:
-            shutil.copyfileobj(r, out)
-        if os.path.getsize(part) < 10_000:
-            os.remove(part)
-            raise RuntimeError(f"{name}: download came back empty")
+        last: Exception | None = None
+        for attempt in range(3):  # a flaky line must not cost the always-on wake word
+            try:
+                with urllib.request.urlopen(OWW_RELEASE + name, timeout=60) as r, open(part, "wb") as out:
+                    shutil.copyfileobj(r, out)
+                if os.path.getsize(part) < 10_000:
+                    raise RuntimeError("download came back empty")
+                break
+            except Exception as e:
+                last = e
+                time.sleep(3 * (attempt + 1))
+        else:
+            if os.path.exists(part):
+                os.remove(part)
+            raise RuntimeError(f"{name}: {last}")
         os.replace(part, os.path.join(folder, name))
 
 
