@@ -330,10 +330,18 @@ def run_app() -> int:
     problem = dd.preflight()
     if problem:
         notify(f"Brain ready illa: {problem}")
+    print(dd_listen.machine_info(), flush=True)
     core = AppCore()
     print("wake: " + ("'hey jarvis' model (openwakeword) — Whisper runs only after the wake" if core.listener.wake
                       else "Whisper text wake (install openwakeword for the always-on model)"), flush=True)
-    threading.Thread(target=lambda: (dd_listen.warm_stt(), dd.warm()), daemon=True).start()
+    print(f"brain: {dd.brain_label()}", flush=True)
+
+    def warm_all():
+        dd_listen.warm_stt()
+        dd.warm()
+        if dd_listen.mlx_wanted():
+            dd_listen.setup_mlx()
+    threading.Thread(target=warm_all, daemon=True, name="dd-warm").start()
     dd.start_reminder_watcher(lambda text: core.listener.say(text))
     core.start()
     threading.Timer(1.5, lambda: core.listener.say("Vanakkam Dhina. dd ready.")).start()
@@ -446,10 +454,41 @@ def selftest() -> int:
     return 0
 
 
+def crash_guard(log_dir: Path | None = None, now: float | None = None, window: float = 600, limit: int = 3) -> bool:
+    """Record a crash; True when dd may come back by itself (fewer than `limit` crashes in `window` seconds),
+    False when it is crash-looping and should stay down for a human to look at the log."""
+    log_dir = log_dir or Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "logs"
+    now = time.time() if now is None else now
+    f = log_dir / "crashes"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamps = [float(x) for x in f.read_text().split()] if f.is_file() else []
+        stamps = [t for t in stamps if now - t < window] + [now]
+        f.write_text("\n".join(f"{t:.0f}" for t in stamps[-20:]) + "\n")
+    except Exception:
+        return True
+    return len(stamps) < limit
+
+
 def main(argv: list[str]) -> int:
     if "--selftest" in argv:
         return selftest()
-    return run_app()
+    try:
+        return run_app()
+    except KeyboardInterrupt:
+        return 0
+    except Exception as e:  # never die quietly: log it, and when dd.app launched us come back in a few seconds
+        import traceback
+        traceback.print_exc()
+        print(f"dd crashed: {type(e).__name__}: {e}", flush=True)
+        if os.environ.get("DD_APP") == "1" and sys.platform == "darwin":
+            if crash_guard():
+                subprocess.Popen(["/bin/sh", "-c", "sleep 5; open -a dd || open -a /Applications/dd.app || true"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                print("restarting dd in 5 s", flush=True)
+            else:
+                notify(f"dd repeatedly crashed ({type(e).__name__}) — ~/.dd/logs/app.log paaru")
+        return 1
 
 
 if __name__ == "__main__":

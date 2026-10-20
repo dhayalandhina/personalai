@@ -376,14 +376,92 @@ def _upgrade_whisper(name: str) -> None:
     print(f"(whisper: switched to '{name}')", flush=True)
 
 
+# ---- Apple-silicon upgrade: mlx-whisper runs Whisper large-v3-turbo on the Mac's GPU (a 3 s command in <1 s,
+# clearly better Thanglish than small). Set up in the background on a 16 GB+ Apple-silicon Mac (DD_STT=mlx forces,
+# DD_STT=faster disables); faster-whisper keeps answering until it is ready.
+MLX_MODEL = os.environ.get("DD_STT_MLX_MODEL", "mlx-community/whisper-large-v3-turbo")
+_mlx_ready = False
+
+
+def ram_gb() -> float:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2 ** 30
+    except (ValueError, OSError, AttributeError):
+        return 0.0
+
+
+def machine_info() -> str:
+    chip = platform.machine()
+    if MAC:
+        try:
+            chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True,
+                                  timeout=5).stdout.strip() or chip
+        except Exception:
+            pass
+    return f"machine: {chip}, {ram_gb():.0f} GB RAM, {platform.system()} {platform.mac_ver()[0] or platform.release()}, python {platform.python_version()}"
+
+
+def mlx_wanted() -> bool:
+    v = os.environ.get("DD_STT", "auto").lower()
+    if v == "mlx":
+        return True
+    if v != "auto":
+        return False
+    return MAC and platform.machine() == "arm64" and ram_gb() >= 16
+
+
+def setup_mlx(log=print) -> bool:
+    """Install mlx-whisper if needed and fetch the model (one-time, minutes); then stt() switches to it."""
+    global _mlx_ready
+    try:
+        try:
+            import mlx_whisper  # noqa: F401
+        except ImportError:
+            log("  stt: installing mlx-whisper (one-time, background)...")
+            for extra in ([], ["--break-system-packages"], ["--user"]):
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", *extra, "mlx-whisper"],
+                                   capture_output=True, text=True, timeout=1800)
+                if r.returncode == 0:
+                    break
+            else:
+                log(f"  stt: mlx-whisper install failed: {(r.stderr or '')[-200:]} — staying on faster-whisper")
+                return False
+            import mlx_whisper  # noqa: F401
+        import numpy as np
+        log(f"  stt: fetching {MLX_MODEL} (one-time)...")
+        _mlx_transcribe(np.zeros(RATE // 2, dtype=np.float32))  # downloads + warms the model
+        _mlx_ready = True
+        log(f"  stt: mlx-whisper {MLX_MODEL.split('/')[-1]} ready (Apple GPU) — switching from faster-whisper")
+        return True
+    except Exception as e:
+        log(f"  stt: mlx-whisper unavailable ({type(e).__name__}: {str(e)[:120]}) — staying on faster-whisper")
+        return False
+
+
+def _mlx_transcribe(audio) -> str:
+    import mlx_whisper
+    lang = os.environ.get("DD_STT_LANG", "en")
+    r = mlx_whisper.transcribe(audio, path_or_hf_repo=MLX_MODEL, language=None if lang == "auto" else lang,
+                               temperature=0.0, condition_on_previous_text=False, initial_prompt=HINT,
+                               no_speech_threshold=0.6, verbose=None)
+    return (r.get("text") or "").strip()
+
+
 def stt(pcm: bytes) -> str:
-    """16 kHz mono PCM -> text (faster-whisper, int8). Short utterances are padded so Whisper hears them whole."""
+    """16 kHz mono PCM -> text (mlx-whisper when ready, else faster-whisper int8). Short utterances are padded so
+    Whisper hears them whole."""
     import numpy as np
-    model = load_whisper()
     a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     pad = np.zeros(int(0.3 * RATE), dtype=np.float32)
+    audio = np.concatenate([pad, a, pad])
+    if _mlx_ready:
+        try:
+            return _mlx_transcribe(audio)
+        except Exception as e:
+            print(f"(mlx stt failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
+    model = load_whisper()
     lang = os.environ.get("DD_STT_LANG", "en")  # English decoding reads romanised Tamil best; "auto" wanders
-    segs, _ = model.transcribe(np.concatenate([pad, a, pad]), language=None if lang == "auto" else lang,
+    segs, _ = model.transcribe(audio, language=None if lang == "auto" else lang,
                                beam_size=1, vad_filter=False, condition_on_previous_text=False,
                                initial_prompt=HINT, no_speech_threshold=0.6)
     return " ".join(s.text.strip() for s in segs).strip()
