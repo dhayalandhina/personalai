@@ -148,6 +148,24 @@ def _is_wake(cand: str, forms: set[str], loose: bool = False) -> bool:
     return r >= 0.75 or (loose and len(c) <= 8 and r >= 0.6)
 
 
+_DD_PAIRS = {"dg", "gd", "dt", "td", "bd", "db", "pd", "dp", "vd", "dv", "zd", "dz"}
+
+
+def spelled_dd(text: str) -> bool:
+    """Only after the wake head already fired: Whisper often writes a spoken 'dee dee' as two letter names
+    ('HDD', 'D.G.', 'D.T.', 'E-D D') — accept those spellings, but never real words (add, CD, ed)."""
+    toks = [re.sub(r"[^a-z]", "", raw) for raw in re.split(r"\s+", text.lower())]
+    toks = [t for t in toks if t]
+    for i, t in enumerate(toks):
+        if t == "add":
+            continue
+        if (t.count("d") >= 2 and len(t) <= 4) or t in _DD_PAIRS:
+            return True
+        if t == "d" and i + 1 < len(toks) and toks[i + 1] == "d":  # "D D"
+            return True
+    return False
+
+
 def parse_wake(text: str) -> tuple[bool, str]:
     """('D.D. open chrome') -> (True, 'open chrome'); ('enna rvis, open chrome') -> (True, 'open chrome');
     ('address check') -> (False, 'address check'). The wake word may sit anywhere in the first four words."""
@@ -985,6 +1003,8 @@ class Listener:
             text = ""
             self.log(f"  (wake confirmation failed: {e})")
         woke, _cmd = parse_wake(text) if text else (False, "")
+        if not woke and text and spelled_dd(text):
+            woke = True
         head = getattr(self.wake, "dd", None)
         if woke:
             self.log(f"  wake: dd confirmed by whisper ({text!r}, {self.clock() - t0:.1f}s)")
@@ -1171,6 +1191,10 @@ def selftest() -> int:
     os.environ["DD_WAKE"] = "computer"
     assert parse_wake("Computer, lights")[0] is True
     os.environ.pop("DD_WAKE")
+    for t in ("Can. HDD.", "Oil there. D.G.", "Builder. D.T.", "Hey, D D. Chrome.", "Code. EDD."):
+        assert spelled_dd(t), t
+    for t in ("Code. ADD.", "the CD player", "Ed is here", "Thanks. GG.", "4. Hittiti.", "Andry or. TG."):
+        assert not spelled_dd(t), t
 
     # 3. hallucination filter + mic picker
     assert blocked("Thank you.") and blocked("...") and blocked("you") and not blocked("chrome open pannu")

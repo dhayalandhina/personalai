@@ -103,14 +103,15 @@ def reverb(a):
 
 
 def place(a, end_offset_s: float = 0.0, win: int = WIN):
-    """Clip `a` inside a window so that it ENDS end_offset_s before the window end (how the detector sees it)."""
+    """Clip `a` inside a window so that it ENDS end_offset_s before the window end (how the detector sees it).
+    A negative offset lets the clip run past the window end (its tail is cut); a long clip loses its head."""
     np = _np()
     out = np.zeros(win, dtype=np.float32)
     end = win - int(end_offset_s * SR)
     start = end - len(a)
-    if start < 0:
-        a, start = a[-start:], 0
-    out[start:end] = a[: end - start]
+    a0, a1 = max(0, -start), len(a) - max(0, end - win)
+    start, end = max(0, start), min(end, win)
+    out[start:end] = a[a0:a1]
     return out
 
 
@@ -214,7 +215,7 @@ def synth(voice, text: str, spk=None):
 
 
 # ---------------- stages ----------------
-def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500, n_noise=600) -> None:
+def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500, n_noise=600, pos_only: bool = False) -> None:
     np = _np()
     voices = load_voices(voices_dir)
     names = list(voices)
@@ -241,13 +242,28 @@ def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500,
     for i in range(n_pos):
         text = rng.choice(POS_TEXTS)
         name, spk, a = say(text)
+        tail = None
+        if i % 3 == 2:  # one in three: the command follows in the same breath ("dee dee chrome open pannu")
+            _n, _s, tail = say(sentence())
         for k in range(3):
             b = a if k == 0 else speed_perturb(a)
-            x = place(b, rng.uniform(0.0, 0.35))
+            if tail is not None:
+                gap = np.zeros(int(SR * rng.uniform(0.03, 0.2)), np.float32)
+                extra = np.concatenate([gap, tail[: int(SR * 0.9)]])
+                # dee dee ends 0-0.5 s before the window end and the next words run on past it
+                x = place(np.concatenate([b, extra]), rng.uniform(0.0, 0.5) - len(extra) / SR)
+            else:
+                x = place(b, rng.uniform(0.0, 0.35))
             pos.append(x if k == 0 else augment(x))
-            posmeta.append({"voice": name, "spk": spk, "text": text, "aug": k})
+            posmeta.append({"voice": name, "spk": spk, "text": text, "aug": k, "tail": tail is not None})
         if i % 300 == 0:
             print(f"pos {i}/{n_pos} {time.time() - t0:.0f}s", flush=True)
+    if pos_only and (work / "neg.npy").is_file() and (work / "meta.json").is_file():
+        old_meta = json.loads((work / "meta.json").read_text())
+        (work / "meta.json").write_text(json.dumps({"pos": posmeta, "neg": old_meta["neg"]}))
+        np.save(work / "pos.npy", np.stack(pos))
+        print(f"gen done (positives only): pos {len(pos)}, negatives kept ({len(old_meta['neg'])}) in {time.time() - t0:.0f}s", flush=True)
+        return
     for i in range(n_neg):
         text = sentence()
         name, spk, a = say(text)
@@ -381,6 +397,8 @@ def selftest() -> int:
     a = np.sin(2 * np.pi * 440 * np.arange(SR // 2) / SR).astype(np.float32) * 0.5
     w = place(a, 0.1)
     assert w.shape == (WIN,) and w[-int(0.1 * SR) - 10] != 0 and w[-1] == 0 and w[0] == 0
+    over = place(a, -0.2)  # runs 0.2 s past the end: the last sample is still signal, nothing crashes
+    assert over.shape == (WIN,) and over[-1] != 0 and over[-int(0.5 * SR) - 10] == 0
     aug = augment(w)
     assert aug.shape == (WIN,) and float(np.max(np.abs(aug))) <= 1.0 and not np.array_equal(aug, w)
     assert noise(1000, "pink").shape == (1000,) and reverb(w).shape == (WIN,)
@@ -434,6 +452,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out", default=str(SKILL / "assets" / "wake_dd.npz"))
     ap.add_argument("--pos", type=int, default=2400)
     ap.add_argument("--neg", type=int, default=3000)
+    ap.add_argument("--pos-only", action="store_true", help="regenerate positives only, keep the work dir's negatives")
     a = ap.parse_args(argv)
     work, voices, out = Path(a.work), Path(a.voices), Path(a.out)
     if a.stage == "voices":
@@ -442,7 +461,7 @@ def main(argv: list[str]) -> int:
     if a.stage in ("gen", "all"):
         if not glob.glob(str(voices / "*.onnx")):
             download_voices(voices)
-        stage_gen(work, voices, n_pos=a.pos, n_neg=a.neg)
+        stage_gen(work, voices, n_pos=a.pos, n_neg=a.neg, pos_only=a.pos_only)
     if a.stage in ("feats", "all"):
         stage_feats(work)
     if a.stage in ("train", "all"):
