@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""dd_listen.py — dd's always-on ears. Streams the mic continuously (no fixed chunks, no gaps), detects when
+you start and stop speaking, transcribes that utterance, and acts when it begins with "dd" / "jarvis".
+
+  "dd, chrome open pannu"      -> one utterance, done at once (common Mac actions never touch the LLM)
+  "dd"  ...  "volume 30"       -> "Sollu." then the next thing you say is the command
+  after any reply, 8 s follow-up window: speak again without the wake word
+
+Robust to how Whisper hears "dd" (D.D., didi, dee dee…), ignores its own voice while speaking, drops Whisper's
+noise hallucinations ("Thank you."), shows what it heard and how long each step took, and tells you (and opens
+System Settings) if the mic is silent or blocked. The menu-bar app (dd_app.py) runs this in a thread.
+
+  python3 examples/dd_listen.py            run in the terminal (prints what it hears)
+  python3 examples/dd_listen.py --devices  list microphones
+  python3 examples/dd_listen.py --selftest
+Env: DD_MIC (avfoundation index/name; auto-picks the built-in mic), DD_STT_MODEL (base), DD_STT_LANG (auto),
+     DD_WAKE (comma list), DD_FOLLOWUP (8 s), DD_VOICE / DD_SAY_RATE (speech), DD_MUTE=1.
+"""
+from __future__ import annotations
+
+import array
+import difflib
+import math
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import dd_loop_ollama as dd  # noqa: E402  (loads ~/.dd/.env, skills, rules, agent loop)
+
+RATE = 16000
+FRAME_MS = 20
+FRAME_BYTES = RATE * 2 * FRAME_MS // 1000  # 640 bytes = 20 ms of 16-bit mono
+MAC = platform.system() == "Darwin"
+HINT = "Dhina speaking Thanglish: dd, jarvis, enna pannura, sollu, paaru, innaiku, chrome open pannu, volume, screenshot."
+VOICE_SUFFIX = ("\n\nVOICE MODE: your reply is spoken aloud. 1-2 short sentences, no tables, no lists; "
+                "put code only when asked (it is shown, not read).")
+# How Whisper tends to write a spoken "dd" / "jarvis". Compared after lower-casing and dropping punctuation/spaces.
+WAKE_FORMS = {"dd", "ddd", "d", "didi", "deedee", "dede", "dedi", "didee", "teedee", "jarvis", "jarviz", "jarvi",
+              "jarvice", "jarvies", "jervis", "jarves", "javis"}
+LEAD_SKIP = {"hey", "ok", "okay", "hi", "hello", "so", "yo", "the", "a", "ey", "hey,"}
+# Things Whisper invents from silence / noise — never treat as a command.
+HALLUCINATIONS = {"thank you", "thanks for watching", "thank you for watching", "you", "bye", "subtitles by",
+                  "the end", "so", "okay", "oh", "hmm", "uh", "um", "i", "a"}
+
+
+def rms(frame: bytes) -> float:
+    if len(frame) < 2:
+        return 0.0
+    a = array.array("h", frame[: len(frame) // 2 * 2])
+    return math.sqrt(sum(x * x for x in a) / len(a)) if a else 0.0
+
+
+class Segmenter:
+    """Energy-based voice activity: feed 20 ms frames; returns one utterance (PCM bytes) when the speaker stops."""
+
+    def __init__(self, min_start: float = 350, end_silence_ms: int = 700, min_speech_ms: int = 250,
+                 max_ms: int = 12000, pre_roll_ms: int = 300):
+        self.min_start, self.end_silence_ms, self.min_speech_ms, self.max_ms = min_start, end_silence_ms, min_speech_ms, max_ms
+        self.noise = 150.0  # running noise floor; threshold adapts to the room
+        self.pre: deque[bytes] = deque(maxlen=max(1, pre_roll_ms // FRAME_MS))
+        self.reset()
+
+    def reset(self) -> None:
+        self.speaking, self.frames, self.silence, self.speech_frames, self.loud_run = False, [], 0, 0, 0
+
+    def threshold(self) -> float:
+        return max(self.min_start, self.noise * 3)
+
+    def feed(self, frame: bytes) -> bytes | None:
+        e = rms(frame)
+        thr = self.threshold()
+        if not self.speaking:
+            if e < thr:
+                self.noise = 0.95 * self.noise + 0.05 * e
+                self.loud_run = 0
+            else:
+                self.loud_run += 1
+            self.pre.append(frame)
+            if self.loud_run >= 3:  # 60 ms of sound = speech started; keep the pre-roll so the first syllable survives
+                self.speaking, self.frames, self.silence, self.speech_frames = True, list(self.pre), 0, self.loud_run
+            return None
+        self.frames.append(frame)
+        if e >= thr * 0.6:
+            self.silence, self.speech_frames = 0, self.speech_frames + 1
+        else:
+            self.silence += 1
+        if self.silence * FRAME_MS < self.end_silence_ms and len(self.frames) * FRAME_MS < self.max_ms:
+            return None
+        utt, spoken = b"".join(self.frames), self.speech_frames * FRAME_MS
+        self.reset()
+        return utt if spoken >= self.min_speech_ms else None  # a click or cough is not an utterance
+
+
+def wake_words() -> set[str]:
+    extra = {re.sub(r"[^a-z0-9]", "", w.lower()) for w in os.environ.get("DD_WAKE", "").split(",") if w.strip()}
+    return WAKE_FORMS | extra
+
+
+def parse_wake(text: str) -> tuple[bool, str]:
+    """('D.D. open chrome') -> (True, 'open chrome'); ('address check') -> (False, 'address check')."""
+    words = re.findall(r"[\w']+", text.lower())
+    i = 0
+    while i < len(words) and words[i] in LEAD_SKIP:
+        i += 1
+    forms = wake_words()
+    for n in (3, 2, 1):  # longest first: "D.D." is the two words "d d" -> "dd", not a lone "d"
+        cand = re.sub(r"[^a-z0-9]", "", "".join(words[i:i + n]))
+        if not cand:
+            continue
+        fuzzy = len(cand) >= 5 and difflib.SequenceMatcher(None, cand, "jarvis").ratio() >= 0.8
+        if cand in forms or fuzzy:
+            return True, " ".join(words[i + n:]).strip()
+    return False, text.strip()
+
+
+def blocked(text: str) -> bool:
+    t = re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+    return not re.search(r"[a-z]", t) or t in HALLUCINATIONS
+
+
+def pick_mic(listing: str) -> str:
+    """Choose the built-in microphone from `ffmpeg -f avfoundation -list_devices true -i ""` output."""
+    if os.environ.get("DD_MIC"):
+        return os.environ["DD_MIC"]
+    audio, seen_audio = [], False
+    for line in listing.splitlines():
+        if "audio devices" in line.lower():
+            seen_audio = True
+            continue
+        m = re.search(r"\[(\d+)\]\s+(.+?)\s*$", line)
+        if seen_audio and m:
+            audio.append((m.group(1), m.group(2)))
+    for idx, name in audio:
+        if re.search(r"macbook|built-?in|internal", name, re.I) and re.search(r"mic", name, re.I):
+            return idx
+    for idx, name in audio:
+        if re.search(r"mic", name, re.I):
+            return idx
+    return audio[0][0] if audio else "0"
+
+
+def list_devices() -> str:
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                       capture_output=True, text=True)
+    return r.stderr + r.stdout
+
+
+def ffmpeg_source():
+    """Yields 20 ms PCM frames from the microphone until ffmpeg stops (then raises with its last error)."""
+    if MAC:
+        inp = ["-f", "avfoundation", "-i", f":{pick_mic(list_devices())}"]
+    else:
+        inp = ["-f", "pulse", "-i", "default"] if shutil.which("pactl") else ["-f", "alsa", "-i", "default"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *inp, "-ac", "1", "-ar", str(RATE), "-f", "s16le", "-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    try:
+        while True:
+            frame = p.stdout.read(FRAME_BYTES)
+            if len(frame) < FRAME_BYTES:
+                break
+            yield frame
+    finally:
+        p.kill()
+    err = (p.stderr.read() or b"").decode(errors="ignore").strip()
+    raise RuntimeError(err[-300:] or "mic stream ended")
+
+
+# ---------------- speech to text ----------------
+_whisper = None
+
+
+def stt(pcm: bytes) -> str:
+    """16 kHz mono PCM -> text (faster-whisper, int8). Short utterances are padded so Whisper hears them whole."""
+    global _whisper
+    import numpy as np
+    if _whisper is None:
+        from faster_whisper import WhisperModel  # pip install faster-whisper
+        _whisper = WhisperModel(os.environ.get("DD_STT_MODEL", "base"), device="auto", compute_type="int8")
+    a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    pad = np.zeros(int(0.3 * RATE), dtype=np.float32)
+    lang = os.environ.get("DD_STT_LANG", "auto")
+    segs, _ = _whisper.transcribe(np.concatenate([pad, a, pad]), language=None if lang == "auto" else lang,
+                                  beam_size=1, vad_filter=False, condition_on_previous_text=False,
+                                  initial_prompt=HINT, no_speech_threshold=0.6)
+    return " ".join(s.text.strip() for s in segs).strip()
+
+
+def default_speak(text: str) -> None:
+    if os.environ.get("DD_MUTE") == "1":
+        return
+    import dd_jarvis
+    dd_jarvis.speak(text, mute=False)
+
+
+def make_handle():
+    """The brain: same dd agent loop + skills; short answers for speech (num_predict cap keeps it quick)."""
+    try:
+        messages = [{"role": "system", "content": dd.boot_system_prompt() + VOICE_SUFFIX}]
+    except SystemExit:
+        return lambda _text: "Rules file hash mismatch — terminal la rules_guard.py reinit run pannu."
+
+    def model(m, t):
+        return dd.chat(m, t, num_predict=int(os.environ.get("DD_VOICE_TOKENS", "220")))
+
+    def handle(text: str) -> str:
+        reply = dd.turn(messages, text, model)
+        messages[:] = [messages[0]] + messages[-20:]
+        return reply
+    return handle
+
+
+def open_mic_settings() -> None:
+    if MAC:
+        subprocess.run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"], check=False)
+
+
+# ---------------- the listener ----------------
+class Listener:
+    def __init__(self, source=None, stt_fn=None, speak=None, handle=None, on_state=None, on_heard=None,
+                 on_problem=None, followup_s: float | None = None, clock=time.monotonic, log=print):
+        self.source = source or ffmpeg_source
+        self.stt, self.speak_fn = stt_fn or stt, speak or default_speak
+        self.handle = handle  # built lazily (loads rules + skills) unless injected
+        self.on_state = on_state or (lambda s: None)
+        self.on_heard = on_heard or (lambda text, secs: None)
+        self.on_problem = on_problem or (lambda msg: None)
+        self.followup_s = float(os.environ.get("DD_FOLLOWUP", "8")) if followup_s is None else followup_s
+        self.clock, self.log = clock, log
+        self.seg = Segmenter()
+        self.stop = threading.Event()
+        self.paused = False
+        self.state = "starting"
+        self.followup_until = 0.0
+        self.tail = 0            # frames still to drop after dd finished speaking (its own echo)
+        self.speaking = False
+        self.zero_run = 0        # consecutive all-zero frames (mic blocked -> digital silence)
+        self.problem_sent = False
+        self.last_heard = ""
+
+    def set_state(self, s: str) -> None:
+        if s != self.state:
+            self.state = s
+            self.on_state(s)
+
+    def say(self, text: str) -> None:
+        self.set_state("speaking")
+        self.speaking = True
+        try:
+            self.speak_fn(text)
+        finally:
+            self.speaking = False
+            self.tail = 20  # 400 ms: let the room go quiet before listening again
+        self.set_state("listening")
+
+    def process(self, utt: bytes) -> None:
+        t0 = self.clock()
+        text = self.stt(utt).strip()
+        secs = self.clock() - t0
+        if not text or blocked(text):
+            return
+        self.last_heard = text
+        self.on_heard(text, secs)
+        self.log(f"  heard: {text!r}  ({len(utt) / (RATE * 2):.1f}s audio, stt {secs:.1f}s)")
+        woke, cmd = parse_wake(text)
+        followup = self.clock() < self.followup_until
+        if not woke and not followup:
+            return
+        if woke and not cmd:  # just the wake word
+            self.say("Sollu.")
+            self.followup_until = self.clock() + self.followup_s
+            self.set_state("recording")
+            return
+        command = cmd if woke else text
+        self.set_state("thinking")
+        t1 = self.clock()
+        if self.handle is None:
+            self.handle = make_handle()
+        try:
+            reply = self.handle(command) or "Done."
+        except Exception as e:
+            reply = f"Mudiyala: {type(e).__name__}: {str(e)[:120]}"
+        self.log(f"  you> {command}\n  dd> {reply}  ({self.clock() - t1:.1f}s)")
+        self.say(reply)
+        self.followup_until = self.clock() + self.followup_s
+
+    def feed(self, frame: bytes) -> None:
+        """One 20 ms frame from the mic."""
+        if self.paused:
+            self.set_state("paused")
+            return
+        if self.speaking or self.tail > 0:
+            self.tail = max(0, self.tail - (0 if self.speaking else 1))
+            return
+        if self.state in ("paused", "starting"):
+            self.set_state("listening")
+        if self.state == "recording" and self.clock() >= self.followup_until:
+            self.set_state("listening")
+        if frame.count(b"\x00") == len(frame):
+            self.zero_run += 1
+            if self.zero_run * FRAME_MS >= 8000 and not self.problem_sent:
+                self.problem_sent = True
+                self.on_problem("Mic la onnum varala (digital silence). System Settings → Privacy & Security → "
+                                "Microphone la dd/Terminal ku ON pannu.")
+        else:
+            self.zero_run = 0
+        utt = self.seg.feed(frame)
+        if utt:
+            self.process(utt)
+
+    def run(self) -> None:
+        """Blocking loop; restarts the mic stream after an error. Call stop.set() to end."""
+        backoff = 3
+        while not self.stop.is_set():
+            try:
+                for frame in self.source():
+                    if self.stop.is_set():
+                        break
+                    self.feed(frame)
+                    backoff = 3
+                if self.stop.is_set():
+                    break
+                raise RuntimeError("mic stream ended")
+            except Exception as e:
+                self.set_state("error")
+                msg = f"mic error: {e}"
+                self.log(msg)
+                if not self.problem_sent:
+                    self.problem_sent = True
+                    self.on_problem(msg + " — Microphone permission / device paaru (python3 examples/dd_listen.py --devices)")
+                self.stop.wait(backoff)
+                backoff = min(backoff * 2, 30)
+        self.set_state("stopped")
+
+
+def warm_stt() -> None:
+    try:
+        stt(b"\x00\x00" * (RATE // 2))  # loads the Whisper model so the first command isn't slow
+    except Exception as e:
+        print(f"(whisper not ready: {e})")
+
+
+def main(argv: list[str]) -> int:
+    if "--selftest" in argv:
+        return selftest()
+    if "--devices" in argv:
+        print(list_devices())
+        return 0
+    if not shutil.which("ffmpeg"):
+        print("ffmpeg missing: brew install ffmpeg")
+        return 1
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError:
+        print("pip3 install faster-whisper   (first run downloads the base model, ~150 MB)")
+        return 1
+    print(f"dd listening — brain {dd.MODEL}, whisper-{os.environ.get('DD_STT_MODEL', 'base')}. "
+          f"Sollu: 'dd, chrome open pannu' / 'jarvis'. Ctrl-C to stop.")
+    print("  loading model + voice (one-time)...")
+    warm_stt()
+    dd.warm()
+    handle = make_handle()
+    lis = Listener(handle=handle, on_problem=lambda m: (print("!!", m), open_mic_settings()))
+    dd.start_reminder_watcher(lambda text: lis.say(text))
+    lis.say("Vanakkam Dhina. dd ready.")
+    try:
+        lis.run()
+    except KeyboardInterrupt:
+        print("\nbye")
+    return 0
+
+
+# ---------------- selftest (no mic, no Whisper, no Ollama) ----------------
+def _tone(ms: int, amp: int = 3000) -> list[bytes]:
+    n = RATE * ms // 1000
+    a = array.array("h", [amp if (i // 20) % 2 else -amp for i in range(n)])
+    raw = a.tobytes()
+    return [raw[i:i + FRAME_BYTES] for i in range(0, len(raw) - FRAME_BYTES + 1, FRAME_BYTES)]
+
+
+def _quiet(ms: int, amp: int = 40) -> list[bytes]:
+    import random
+    rnd = random.Random(7)
+    n = RATE * ms // 1000
+    raw = array.array("h", [rnd.randint(-amp, amp) for _ in range(n)]).tobytes()
+    return [raw[i:i + FRAME_BYTES] for i in range(0, len(raw) - FRAME_BYTES + 1, FRAME_BYTES)]
+
+
+def _zeros(ms: int) -> list[bytes]:
+    return [b"\x00" * FRAME_BYTES] * (ms // FRAME_MS)
+
+
+def selftest() -> int:
+    # 1. segmenter: quiet -> nothing; 1 s of sound then 0.8 s quiet -> one utterance with pre-roll; a click is dropped
+    seg = Segmenter()
+    assert all(seg.feed(f) is None for f in _quiet(1000))
+    got = [seg.feed(f) for f in _tone(1000) + _quiet(800)]
+    utts = [u for u in got if u]
+    assert len(utts) == 1, len(utts)
+    dur = len(utts[0]) / (RATE * 2)
+    assert 1.5 <= dur <= 2.3, dur  # ~0.3 pre-roll + 1.0 speech + 0.7 tail
+    assert not any(seg.feed(f) for f in _tone(100) + _quiet(900)), "a 100 ms click must not be an utterance"
+    long_utt = [u for u in (seg.feed(f) for f in _tone(13000)) if u]
+    assert long_utt and len(long_utt[0]) / (RATE * 2) <= 12.5, "max utterance length"
+
+    # 2. wake word parsing — the ways Whisper writes "dd"/"jarvis", and words that must NOT wake
+    cases = {
+        "D.D. open chrome": (True, "open chrome"), "Didi, volume 30.": (True, "volume 30"),
+        "Dee dee screenshot edu": (True, "screenshot edu"), "dd": (True, ""), "DD.": (True, ""),
+        "Hey Jarvis, what's the time?": (True, "what's the time"), "Jervis open safari": (True, "open safari"),
+        "the dd mani enna": (True, "mani enna"), "okay dd news sollu": (True, "news sollu"),
+        "address check pannu": (False, "address check pannu"), "add this file": (False, "add this file"),
+        "I'd like tea": (False, "I'd like tea"), "deadline is tomorrow": (False, "deadline is tomorrow"),
+        "": (False, ""),
+    }
+    for text, want in cases.items():
+        assert parse_wake(text) == want, (text, parse_wake(text), want)
+    os.environ["DD_WAKE"] = "computer"
+    assert parse_wake("Computer, lights")[0] is True
+    os.environ.pop("DD_WAKE")
+
+    # 3. hallucination filter + mic picker
+    assert blocked("Thank you.") and blocked("...") and blocked("you") and not blocked("chrome open pannu")
+    listing = ("[AVFoundation indev @ 0x1] AVFoundation video devices:\n[AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n"
+               "[AVFoundation indev @ 0x1] AVFoundation audio devices:\n[AVFoundation indev @ 0x1] [0] AirPods Pro\n"
+               "[AVFoundation indev @ 0x1] [1] MacBook Air Microphone\n")
+    assert pick_mic(listing) == "1", pick_mic(listing)
+    assert pick_mic("garbage") == "0"
+    os.environ["DD_MIC"] = "3"
+    assert pick_mic(listing) == "3"
+    os.environ.pop("DD_MIC")
+
+    # 4. end-to-end with a fake mic / STT / voice / brain and a controllable clock
+    now = {"t": 1000.0}
+    heard = iter(["D.D. open chrome", "Thank you.", "jarvis", "volume 30", "random talk later", "dd"])
+    spoken, handled, states, heard_log, problems = [], [], [], [], []
+
+    def fake_stt(pcm):
+        return next(heard, "")
+
+    def fake_speak(text):
+        spoken.append(text)
+        now["t"] += 1.0  # speaking takes a second
+
+    def fake_handle(cmd):
+        handled.append(cmd)
+        return f"ok {cmd}"
+
+    lis = Listener(source=lambda: iter([]), stt_fn=fake_stt, speak=fake_speak, handle=fake_handle,
+                   on_state=states.append, on_heard=lambda t, s: heard_log.append(t), on_problem=problems.append,
+                   followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None)
+    utterance = _tone(800) + _quiet(800)
+
+    def speak_utt():
+        for f in utterance:
+            lis.feed(f)
+
+    speak_utt()                      # "D.D. open chrome" -> command
+    assert handled == ["open chrome"] and spoken[-1] == "ok open chrome", (handled, spoken)
+    assert "thinking" in states and "speaking" in states and states[-1] == "listening", states
+    speak_utt()                      # "Thank you." -> hallucination, ignored
+    assert handled == ["open chrome"]
+    speak_utt()                      # "jarvis" alone -> ack, waits for the command
+    assert spoken[-1] == "Sollu." and lis.state == "recording"
+    speak_utt()                      # "volume 30" inside the follow-up window -> command without wake word
+    assert handled == ["open chrome", "volume 30"], handled
+    now["t"] += 30                   # window expired
+    speak_utt()                      # "random talk later" -> ignored
+    assert handled == ["open chrome", "volume 30"], handled
+    assert heard_log == ["D.D. open chrome", "jarvis", "volume 30", "random talk later"], heard_log
+
+    # own voice: frames arriving while dd speaks (and 400 ms after) are dropped
+    lis.speaking = True
+    for f in _tone(500):
+        lis.feed(f)
+    lis.speaking, lis.tail = False, 20
+    for f in _tone(400):
+        lis.feed(f)
+    assert lis.tail == 0 and not lis.seg.speaking, "echo of dd's own voice must not start an utterance"
+
+    # paused: nothing is processed, state says so
+    lis.paused = True
+    speak_utt()
+    assert lis.state == "paused" and handled == ["open chrome", "volume 30"]
+    lis.paused = False
+
+    # blocked mic: 8 s of digital silence -> one problem report
+    for f in _zeros(8200):
+        lis.feed(f)
+    assert len(problems) == 1 and "Microphone" in problems[0], problems
+    for f in _zeros(9000):
+        lis.feed(f)
+    assert len(problems) == 1, "reported once"
+
+    # 5. run(): a dying mic stream is reported and retried; stop ends the loop
+    calls = {"n": 0}
+
+    def flaky_source():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            lis2.stop.set()
+        raise RuntimeError("Input/output error")
+
+    probs2 = []
+    lis2 = Listener(source=flaky_source, stt_fn=fake_stt, speak=fake_speak, handle=fake_handle,
+                    on_problem=probs2.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None)
+    lis2.stop.wait = lambda *_: None  # don't actually sleep in the test
+    lis2.run()
+    assert calls["n"] == 2 and probs2 and "mic error" in probs2[0] and lis2.state == "stopped", (calls, probs2)
+    print("dd_listen selftest ok (segmenter, wake parsing, hallucination filter, mic pick, end-to-end turns, "
+          "follow-up window, own-voice guard, pause, blocked-mic report, stream retry)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

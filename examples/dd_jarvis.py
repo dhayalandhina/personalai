@@ -3,7 +3,7 @@
 All local, zero cost: ffmpeg mic capture -> faster-whisper STT -> dd agent loop -> macOS `say` (or Piper) TTS.
 
   python3 examples/dd_jarvis.py                push-to-talk: Enter = start, Enter = stop
-  python3 examples/dd_jarvis.py --hands-free   always listening; start with "Jarvis ..." or "dd ..."
+  python3 examples/dd_jarvis.py --hands-free   always listening (= dd_listen.py): "dd, chrome open pannu"
   python3 examples/dd_jarvis.py --text         type instead of the mic, dd still speaks
   python3 examples/dd_jarvis.py --mute         mic in, text out (no speech)
   python3 examples/dd_jarvis.py --devices      list microphones (macOS)
@@ -152,26 +152,6 @@ def handle(messages: list[dict], heard: str, mute: bool) -> None:
     messages[:] = [messages[0]] + messages[-20:]
 
 
-CHUNK = float(os.environ.get("DD_WAKE_CHUNK", "3"))   # how often it samples the mic for the wake word
-CMD_SECS = float(os.environ.get("DD_CMD_SECS", "6"))  # how long it records the command after waking
-
-
-def hands_free(messages: list[dict], mute: bool) -> None:
-    print(f"Hands-free: '{WAKE[0].title()} ...' nu sollunga (eppovum kekkudhu). Ctrl-C to stop.")
-    while True:
-        heard = transcribe(record_seconds(TMP / "chunk.wav", CHUNK))
-        if not heard:
-            continue
-        woke, cmd = split_wake(heard)
-        if not woke:
-            continue
-        if not cmd:  # just the wake word -> short beep-ack, then listen for the command
-            speak("Sollu.", mute)
-            cmd = transcribe(record_seconds(TMP / "cmd.wav", CMD_SECS))
-        if cmd:
-            handle(messages, cmd, mute)
-
-
 def push_to_talk(messages: list[dict], mute: bool, typed: bool) -> None:
     print("Push-to-talk mode. Ctrl-C to stop." if not typed else "Text mode (dd speaks back). Ctrl-C to stop.")
     while True:
@@ -243,6 +223,11 @@ def main(argv: list[str]) -> int:
         subprocess.run(["ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
         return 0
     typed, mute = "--text" in argv, "--mute" in argv
+    if "--hands-free" in argv:  # always-on listening lives in dd_listen (streaming VAD, same engine as the app)
+        if mute:
+            os.environ["DD_MUTE"] = "1"
+        import dd_listen
+        return dd_listen.main([])
     problem = check_deps(typed)
     if problem:
         print(problem)
@@ -258,7 +243,7 @@ def main(argv: list[str]) -> int:
     dd.start_reminder_watcher(lambda text: speak(text, mute))
     speak("Vanakkam Dhina. dd ready.", mute)
     try:
-        hands_free(messages, mute) if "--hands-free" in argv else push_to_talk(messages, mute, typed)
+        push_to_talk(messages, mute, typed)
     except (KeyboardInterrupt, EOFError):
         print("\nbye")
     finally:

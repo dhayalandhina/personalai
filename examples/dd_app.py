@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""dd_app.py — dd in the Mac menu bar. A small 🤖 icon up top; click it to chat, talk, or check status.
+"""dd_app.py — dd in the Mac menu bar, always listening.
 
-It opens the chat window (dd_chat.py), toggles JARVIS voice, and keeps firing reminders as Mac
-notifications while it sits in the bar. It is only a launcher around the same dd loop + mac-control the
-CLI already uses — no new power over the Mac, and irreversible actions still ask first.
+A 🤖 sits in the menu bar and shows what dd is doing: 🤖 listening · 🎙 waiting for your command ·
+💭 thinking · 🔊 speaking · 💤 paused · ⚠️ mic problem. Say "dd, chrome open pannu" or "jarvis" from anywhere.
+Menu: pause/resume listening, what it last heard, open the chat window, status, quit.
+It is only a front-end around the same dd loop + mac-control the CLI uses — no new power over the Mac, and
+irreversible actions still ask first. dd.app (install_app.sh) launches this; it also runs from a terminal.
 
-  python3 examples/dd_app.py            run the menu-bar app   (needs: pip install rumps)
+  python3 examples/dd_app.py            menu-bar app (needs: pip install rumps) — falls back to terminal listening
   python3 examples/dd_app.py --selftest
-Env (or ~/.dd/.env): DD_MODEL, OLLAMA_URL, DD_VOICE / DD_SAY_RATE, DD_CHAT_SPEAK.
 """
 from __future__ import annotations
 
@@ -15,112 +16,147 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import dd_loop_ollama as dd  # noqa: E402  (loads ~/.dd/.env, skills, rules, agent loop)
+import dd_listen  # noqa: E402
 
 CHAT = HERE / "dd_chat.py"
-JARVIS = HERE / "dd_jarvis.py"
+ICONS = {"starting": "⏳", "listening": "🤖", "recording": "🎙", "thinking": "💭", "speaking": "🔊",
+         "paused": "💤", "error": "⚠️", "stopped": "⏹"}
+
+
+def notify(text: str, title: str = "dd") -> None:
+    """macOS notification via mac-control (osascript); silent elsewhere."""
+    dd.run_script("mac-control", "mac.py", ["notify", f"{text}"[:200]])
 
 
 class AppCore:
-    """Menu actions as plain functions, testable without rumps or a Mac."""
+    """Everything the menu does, with no AppKit in sight — so it tests headless."""
 
-    def __init__(self, spawn=None):
-        self.spawn = spawn or (lambda cmd: subprocess.Popen(cmd))  # overridden in tests
+    def __init__(self, listener: dd_listen.Listener | None = None, spawn=None):
+        self.spawn = spawn or (lambda cmd: subprocess.Popen(cmd))
         self.chat_proc = None
-        self.voice_proc = None
+        self.listener = listener or dd_listen.Listener(on_problem=self.problem, on_state=lambda s: None,
+                                                       on_heard=self.heard)
+        self.listener.on_problem, self.listener.on_heard = self.problem, self.heard
+        self.last = ""
+        self.last_at = 0.0
+        self.problems: list[str] = []
+        self.thread: threading.Thread | None = None
+
+    # ----- listener wiring -----
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self.listener.run, daemon=True, name="dd-ears")
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.listener.stop.set()
+        if self.chat_proc is not None and self.chat_proc.poll() is None:
+            self.chat_proc.terminate()
+
+    def heard(self, text: str, secs: float) -> None:
+        self.last, self.last_at = text, time.time()
+
+    def problem(self, msg: str) -> None:
+        self.problems.append(msg)
+        notify(msg)
+        if "Microphone" in msg or "mic" in msg.lower():
+            dd_listen.open_mic_settings()
+
+    # ----- menu -----
+    def icon(self) -> str:
+        return ICONS.get(self.listener.state, "🤖")
+
+    def listening_label(self) -> str:
+        return "Pause listening" if not self.listener.paused else "Resume listening"
+
+    def toggle_listening(self) -> bool:
+        self.listener.paused = not self.listener.paused
+        return not self.listener.paused
+
+    def last_label(self) -> str:
+        if not self.last:
+            return "Heard: (nothing yet)"
+        return f"Heard: {self.last[:40]}" + ("…" if len(self.last) > 40 else "")
 
     def menu_labels(self) -> list[str]:
-        return ["Open chat", "Voice: " + ("on" if self.voice_on() else "off"), "Status", "New conversation", "Quit dd"]
-
-    def chat_proc_alive(self) -> bool:
-        return self.chat_proc is not None and self.chat_proc.poll() is None
-
-    def voice_on(self) -> bool:
-        return self.voice_proc is not None and self.voice_proc.poll() is None
+        return [self.listening_label(), self.last_label(), "Open chat", "Status", "Quit dd"]
 
     def open_chat(self) -> list[str]:
         cmd = [sys.executable, str(CHAT)]
-        if not self.chat_proc_alive():
+        if self.chat_proc is None or self.chat_proc.poll() is not None:
             self.chat_proc = self.spawn(cmd)
         return cmd
 
-    def toggle_voice(self) -> bool:
-        if self.voice_on():
-            self.voice_proc.terminate()
-            self.voice_proc = None
-            return False
-        self.voice_proc = self.spawn([sys.executable, str(JARVIS), "--hands-free"])
-        return True
-
     def status_text(self) -> str:
         r = dd.LIB.run("system-ops", "healthcheck.py", ["--brief"], timeout=60)
-        return (r["stdout"] or r["stderr"]).strip()[:250] or "status kidaikkala"
-
-    def new_conversation(self) -> None:
-        """The chat window owns its own history; reopening a closed window starts fresh."""
-        if not self.chat_proc_alive():
-            self.open_chat()
-
-    def shutdown(self) -> None:
-        for p in (self.chat_proc, self.voice_proc):
-            if p is not None and p.poll() is None:
-                p.terminate()
+        brief = (r["stdout"] or r["stderr"]).strip()[:250] or "status kidaikkala"
+        return f"ears: {self.listener.state}\nlast heard: {self.last or '-'}\n{brief}"
 
 
-def notify(title: str, text: str) -> None:
-    """Prefer a rumps notification; fall back to mac-control (osascript)."""
-    try:
-        import rumps
-        rumps.notification(title, "", text)
-    except Exception:
-        dd.run_script("mac-control", "mac.py", ["notify", f"{title}: {text}"[:200]])
-
-
-def run_app() -> int:
+def run_menu_bar(core: AppCore) -> int:
     import rumps
-
-    core = AppCore()
 
     class DDBar(rumps.App):
         def __init__(self):
-            super().__init__("dd", title="🤖", quit_button=None)
-            self.menu = ["Open chat", "Voice", "Status", "New conversation", None, "Quit dd"]
-            self.menu["Voice"].state = False
+            super().__init__("dd", title=core.icon(), quit_button=None)
+            self.menu = ["Pause listening", "Heard: (nothing yet)", "Open chat", "Status", None, "Quit dd"]
+            self.menu["Heard: (nothing yet)"].set_callback(None)
+            self.timer = rumps.Timer(self.refresh, 0.4)
+            self.timer.start()
+
+        def refresh(self, _):  # AppKit must be touched from the main thread: poll state from a timer
+            self.title = core.icon()
+            self.menu["Pause listening"].title = core.listening_label()
+            self.menu["Heard: (nothing yet)"].title = core.last_label()
+
+        @rumps.clicked("Pause listening")
+        def toggle(self, _):
+            core.toggle_listening()
 
         @rumps.clicked("Open chat")
         def open_chat(self, _):
             core.open_chat()
 
-        @rumps.clicked("Voice")
-        def voice(self, sender):
-            sender.state = core.toggle_voice()
-
         @rumps.clicked("Status")
         def status(self, _):
-            rumps.alert("dd status", core.status_text())
-
-        @rumps.clicked("New conversation")
-        def new_conv(self, _):
-            core.new_conversation()
+            rumps.alert("dd", core.status_text())
 
         @rumps.clicked("Quit dd")
         def quit(self, _):
-            core.shutdown()
+            core.stop()
             rumps.quit_application()
 
-    try:  # preflight is advisory — quick Mac actions work even if the brain is down
-        problem = dd.preflight()
-    except Exception:
-        problem = None
-    dd.start_reminder_watcher(on_fire=lambda t: notify("dd", t))
-    if problem:
-        threading.Timer(2, lambda: notify("dd", f"Brain ready illa: {problem}")).start()
     DDBar().run()
     return 0
+
+
+def run_app() -> int:
+    """Warm up, start the ears, then the menu bar (or plain terminal mode without rumps)."""
+    problem = dd.preflight()
+    if problem:
+        notify(f"Brain ready illa: {problem}")
+    core = AppCore()
+    threading.Thread(target=lambda: (dd_listen.warm_stt(), dd.warm()), daemon=True).start()
+    dd.start_reminder_watcher(lambda text: core.listener.say(text))
+    core.start()
+    threading.Timer(1.5, lambda: core.listener.say("Vanakkam Dhina. dd ready.")).start()
+    try:
+        return run_menu_bar(core)
+    except ImportError:
+        print("menu bar ku rumps illa (pip3 install rumps) — terminal la listen pannudhu. Ctrl-C to stop.")
+        try:
+            while core.thread and core.thread.is_alive():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            core.stop()
+        return 0
 
 
 def selftest() -> int:
@@ -132,60 +168,59 @@ def selftest() -> int:
     class FakeProc:
         def __init__(self, cmd):
             self.cmd, self._alive = cmd, True
+
         def poll(self):
             return None if self._alive else 0
+
         def terminate(self):
             self._alive = False
 
     spawned: list[list[str]] = []
+    # a listener fed by a fake mic that yields nothing and then ends the run (stop is set in the test)
+    lis = dd_listen.Listener(source=lambda: iter([]), stt_fn=lambda b: "", speak=lambda t: None,
+                             handle=lambda c: "ok", followup_s=8, log=lambda *_: None)
+    core = AppCore(listener=lis, spawn=lambda cmd: (spawned.append(cmd), FakeProc(cmd))[1])
 
-    def spawn(cmd):
-        spawned.append(cmd)
-        return FakeProc(cmd)
+    # icons follow listener state; pause toggles; labels
+    assert core.icon() == "⏳"
+    lis.state = "listening"
+    assert core.icon() == "🤖" and core.menu_labels()[0] == "Pause listening"
+    assert core.toggle_listening() is False and lis.paused and core.listening_label() == "Resume listening"
+    assert core.toggle_listening() is True and not lis.paused
+    for st, ic in (("recording", "🎙"), ("thinking", "💭"), ("speaking", "🔊"), ("error", "⚠️")):
+        lis.state = st
+        assert core.icon() == ic
+    core.heard("dd open chrome please now this is long enough to be cut off yes", 0.3)
+    assert core.last_label().startswith("Heard: dd open chrome") and core.last_label().endswith("…")
 
-    core = AppCore(spawn=spawn)
-
-    # open chat spawns dd_chat.py once; a second click with the window still open does not re-spawn
-    cmd = core.open_chat()
-    assert cmd[1].endswith("examples/dd_chat.py") and len(spawned) == 1, (cmd, spawned)
+    # chat window spawns once while alive, re-opens after close
     core.open_chat()
-    assert len(spawned) == 1, "re-spawned while window alive"
-    core.chat_proc.terminate()  # window closed
     core.open_chat()
-    assert len(spawned) == 2, "did not re-open after close"
+    assert len(spawned) == 1 and spawned[0][1].endswith("examples/dd_chat.py")
+    core.chat_proc.terminate()
+    core.open_chat()
+    assert len(spawned) == 2
 
-    # voice toggles a hands-free JARVIS process on and off
-    assert core.voice_on() is False
-    assert core.toggle_voice() is True and core.voice_on()
-    assert spawned[-1][1].endswith("examples/dd_jarvis.py") and "--hands-free" in spawned[-1]
-    assert core.toggle_voice() is False and core.voice_on() is False
+    # problems are recorded (notification goes through mac-control dry run)
+    core.problem("mic error: Input/output error — Microphone permission paaru")
+    assert core.problems and "healthcheck" not in core.status_text() and "ears:" in core.status_text()
 
-    # menu labels reflect voice state; status comes from healthcheck
-    assert core.menu_labels()[0] == "Open chat" and core.menu_labels()[-1] == "Quit dd"
-    core.toggle_voice()
-    assert "Voice: on" in core.menu_labels()
-    st = core.status_text()
-    assert st and "status kidaikkala" not in st, st
-
-    # shutdown stops child processes
-    core.shutdown()
-    assert not core.voice_on() and not core.chat_proc_alive()
-
-    # app module must not import rumps at load (cloud has no rumps); it's imported only in run_app()
-    assert "rumps" not in sys.modules, "rumps imported at module load"
-    print("dd_app selftest ok (spawn-once chat, voice toggle, labels, status, shutdown, no rumps at import)")
+    # start/stop the ears thread
+    lis.stop.wait = lambda *_: None
+    core.start()
+    time.sleep(0.2)
+    core.stop()
+    core.thread.join(timeout=3)
+    assert not core.thread.is_alive() and lis.state == "stopped"
+    assert "rumps" not in sys.modules, "rumps must only be imported inside run_menu_bar()"
+    print("dd_app selftest ok (icons per state, pause toggle, heard label, chat spawn-once, problem notify, ears thread, no rumps at import)")
     return 0
 
 
 def main(argv: list[str]) -> int:
     if "--selftest" in argv:
         return selftest()
-    try:
-        return run_app()
-    except ImportError:
-        print("menu-bar app ku rumps venum:  pip3 install rumps")
-        print("Window mattum venumna:  python3 examples/dd_chat.py")
-        return 1
+    return run_app()
 
 
 if __name__ == "__main__":
