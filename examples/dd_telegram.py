@@ -3,11 +3,16 @@
 
   python3 examples/dd_telegram.py            run the bot (systemd runs this on the server)
   python3 examples/dd_telegram.py --pair     one-time, owner terminal only: link your Telegram account to dd
+  python3 examples/dd_telegram.py --claim    hands-free pairing (systemd dd-pair.service): waits for "/pair <DD_PAIR_SECRET>"
   python3 examples/dd_telegram.py --selftest
-Env ($DD_HOME/.env): TELEGRAM_BOT_TOKEN (from @BotFather), TELEGRAM_OWNER_ID (written by --pair),
-                     DD_MODEL, DD_HOST=server, DD_STT_MODEL (default base)
+Env: TELEGRAM_BOT_TOKEN (from @BotFather), TELEGRAM_OWNER_ID (written by pairing), DD_PAIR_SECRET (claim mode),
+     DD_SECRETS_FILE (where pairing writes the owner id; default $DD_HOME/.env — on the server a root-owned file
+     that systemd loads), DD_MODEL, DD_HOST=server, DD_STT_MODEL (default base)
 Only the paired owner gets answers; anyone else gets one "private assistant" line and is logged.
 Nothing listens on a port: the bot polls Telegram (outbound only). Reminders arrive as Telegram messages.
+The token never reaches a tool: it is dropped from the environment of every script dd runs, and the bot
+process is made non-dumpable so other processes of the same user cannot read its memory or environment.
+Files whose full path appears in a reply are attached automatically (allow-listed types, size limits).
 Commands: /help /brief /remember TEXT /forget KEY /plan /reminders /status /rules /learn /backup /new
 """
 from __future__ import annotations
@@ -41,6 +46,13 @@ LONG_POLL = 25                     # seconds Telegram holds getUpdates open
 HISTORY_HIGH, HISTORY_LOW = 16, 6  # trim rarely, in one big step, so Ollama's prompt cache stays warm
 SLOW_NOTICE = 20                   # seconds before the single "Panren…" message
 MAX_DOWNLOAD = 20 * 1024 * 1024    # Telegram bots can download files up to 20 MB
+MAX_UPLOAD = 50 * 1024 * 1024      # sendDocument / sendVideo limit for bots
+MAX_PHOTO = 10 * 1024 * 1024       # sendPhoto limit
+MAX_ATTACH = 3                     # files auto-attached per reply
+ATTACH_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".docx", ".xlsx", ".csv", ".txt", ".md", ".json",
+              ".html", ".py", ".sh", ".js", ".ts", ".sql", ".log", ".zip", ".mp4", ".mp3", ".ogg", ".oga", ".wav"}
+PHOTO_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+PATH_RE = re.compile(r"(?<![\w/])(~?/[\w./+@%-]+?\.[A-Za-z0-9]{1,5})(?=$|[\s)\]}>'\"`,;:!?]|\.(?:\s|$))")
 BACKUP_SKIP = {".env", "tmp", "video", "logs", "inbox", "browser-profile", "venv"}
 HELP = ("dd — un personal AI, cloud server la 24/7 odudhu.\n"
         "Message illa voice note anuppu. Commands:\n"
@@ -63,6 +75,62 @@ def log(msg: str) -> None:
 
 def dd_home() -> Path:
     return Path(os.environ.get("DD_HOME", Path.home() / ".dd"))
+
+
+def secrets_file() -> Path:
+    """Where pairing writes TELEGRAM_OWNER_ID: a root-owned file on the server (DD_SECRETS_FILE), else $DD_HOME/.env."""
+    return Path(os.environ.get("DD_SECRETS_FILE") or dd_home() / ".env")
+
+
+def read_secret(key: str) -> str:
+    """Environment first, then the secrets file (so `--pair` never needs the token on a command line)."""
+    v = os.environ.get(key, "").strip()
+    if v:
+        return v
+    try:
+        for line in secrets_file().read_text(encoding="utf-8").splitlines():
+            k, sep, val = line.strip().partition("=")
+            if sep and k.strip() == key:
+                return val.strip().strip('"\'')
+    except OSError:
+        pass
+    return ""
+
+
+def harden_process() -> None:
+    """Called once the token is in memory: drop secrets from our environment (children never inherit them) and
+    make the process non-dumpable, so other processes of the same user cannot read /proc/<pid>/environ or mem."""
+    for k in ("TELEGRAM_BOT_TOKEN", "DD_PAIR_SECRET"):
+        os.environ.pop(k, None)
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE = 4
+        except Exception as e:  # best effort; never block the bot
+            log(f"could not set non-dumpable: {e}")
+
+
+def attachable_files(reply: str) -> list[Path]:
+    """Existing files named by full path in the reply, allow-listed type, inside dd's own dirs, deduplicated."""
+    roots = [dd_home(), Path(tempfile.gettempdir()), Path.home(), Path.cwd()]
+    rules_dir = Path(os.environ.get("DD_RULES_DIR") or dd_home() / "rules")
+    out: list[Path] = []
+    for raw in PATH_RE.findall(reply):
+        p = Path(raw).expanduser()
+        try:
+            p = p.resolve(strict=True)
+            if not p.is_file() or p.suffix.lower() not in ATTACH_EXT or p in out:
+                continue
+            if p.name.startswith(".env") or p.is_relative_to(rules_dir) or p.stat().st_size > MAX_UPLOAD:
+                continue
+            if not any(p.is_relative_to(r.resolve()) for r in roots):
+                continue
+        except (OSError, RuntimeError, ValueError):
+            continue
+        out.append(p)
+        if len(out) == MAX_ATTACH:
+            break
+    return out
 
 
 def set_env(env_file: Path, key: str, value: str) -> None:
@@ -125,19 +193,24 @@ class Telegram:
             f.write(r.read())
         return out
 
-    def send_document(self, chat_id: int, path: Path, caption: str = ""):
+    def send_file(self, chat_id: int, path: Path, caption: str = "", kind: str = "document"):
+        """kind: document (default) or photo. Multipart upload with the stdlib only."""
+        method, field = ("sendPhoto", "photo") if kind == "photo" else ("sendDocument", "document")
         if self._transport:
-            return self._transport("sendDocument", {"chat_id": chat_id, "path": str(path), "caption": caption})
+            return self._transport(method, {"chat_id": chat_id, "path": str(path), "caption": caption})
         boundary = secrets.token_hex(16)
         body = b""
         for k, v in (("chat_id", str(chat_id)), ("caption", caption[:1024])):
             body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
-        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{path.name}\"\r\n"
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{path.name}\"\r\n"
                  f"Content-Type: application/octet-stream\r\n\r\n").encode() + path.read_bytes() + b"\r\n"
         body += f"--{boundary}--\r\n".encode()
-        req = urllib.request.Request(f"{API}/bot{self.token}/sendDocument", data=body,
+        req = urllib.request.Request(f"{API}/bot{self.token}/{method}", data=body,
                                      headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
         return self._result(self._open(req, 300))
+
+    def send_document(self, chat_id: int, path: Path, caption: str = ""):
+        return self.send_file(chat_id, path, caption, "document")
 
 
 # ---------------- helpers ----------------
@@ -294,7 +367,19 @@ class Bot:
             quick = dd.fast_action(text)
             self.safe_send(self.owner, prefix + (quick or f"Brain ready illa: {problem}"))
             return
-        self.safe_send(self.owner, prefix + self.run_turn(text))
+        reply = self.run_turn(text)
+        self.safe_send(self.owner, prefix + reply)
+        self.attach(reply)
+
+    def attach(self, reply: str) -> None:
+        """Send every file the reply names by full path (dd's own output dirs only)."""
+        for p in attachable_files(reply):
+            try:
+                kind = "photo" if p.suffix.lower() in PHOTO_EXT and p.stat().st_size <= MAX_PHOTO else "document"
+                self.tg.send_file(self.owner, p, p.name, kind)
+            except Exception as e:
+                log(f"attach failed for {p.name}: {e}")
+                self.safe_send(self.owner, f"({p.name} attach aagala: {str(e)[:120]})")
 
     def save_file(self, m: dict) -> Path | None:
         if m.get("document"):
@@ -370,11 +455,14 @@ class Bot:
     def backup(self) -> str | None:
         home = dd_home()
         out = Path(tempfile.mkdtemp(prefix="dd-bk-")) / f"dd-backup-{time.strftime('%Y%m%d-%H%M')}.tar.gz"
+        rules_dir = os.environ.get("DD_RULES_DIR")
         with tarfile.open(out, "w:gz") as tar:
             for p in sorted(home.iterdir()):
                 if p.name in BACKUP_SKIP or p.name.startswith(".env"):
                     continue
                 tar.add(p, arcname=f".dd/{p.name}")
+            if rules_dir and Path(rules_dir).is_dir():  # server: rules live outside DD_HOME (root-owned)
+                tar.add(rules_dir, arcname=".dd/rules")
         if out.stat().st_size > 45 * 1024 * 1024:
             return "Backup 45 MB mela — server la: bash skills/system-ops/scripts/backup.sh"
         self.tg.send_document(self.owner, out, "dd backup (.env/passwords illa). Restore: backup.sh restore FILE, apram .env thirumba podu.")
@@ -433,10 +521,10 @@ class BadToken(Exception):
     """Telegram rejected the bot token (revoked or mistyped)."""
 
 
-def wait_for_claim(tg: Telegram, env_file: Path, secret: str, stop: threading.Event) -> int | None:
+def wait_for_claim(tg: Telegram, env_file: Path, secret: str, stop: threading.Event, greet: bool = False) -> int | None:
     """Hands-free pairing for a server set up by cloud-init: the first private chat that sends
     `/pair <DD_PAIR_SECRET>` becomes the owner. Works even if it was sent before the server came up
-    (Telegram keeps undelivered messages for 24 h). The secret is wiped from .env once used."""
+    (Telegram keeps undelivered messages for 24 h). The secret is wiped from the secrets file once used."""
     log("waiting for the owner: send /pair <secret> to this bot")
     offset, warned = None, set()
     while not stop.is_set():
@@ -462,6 +550,8 @@ def wait_for_claim(tg: Telegram, env_file: Path, secret: str, stop: threading.Ev
                 os.environ.pop("DD_PAIR_SECRET", None)
                 try:
                     tg.call("getUpdates", offset=offset, timeout=0)  # confirm, so /pair is never replayed
+                    if greet:
+                        tg.call("sendMessage", chat_id=uid, text="Paired ✅ — ini dd unakku mattum reply pannum. dd start aagudhu…")
                 except Exception:
                     pass
                 log(f"paired with Telegram user id {uid}")
@@ -477,28 +567,50 @@ def wait_for_claim(tg: Telegram, env_file: Path, secret: str, stop: threading.Ev
     return None
 
 
+def claim() -> int:
+    """systemd dd-pair.service (its own user, can write only the secrets file): wait for /pair <secret>, record the
+    owner, exit. The dd-telegram.path unit then starts the bot. Already paired -> exit 0 at once."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    secret = os.environ.get("DD_PAIR_SECRET", "").strip()
+    if os.environ.get("TELEGRAM_OWNER_ID", "").strip().isdigit():
+        log("already paired — nothing to do")
+        return 0
+    if not token or not secret:
+        log("claim needs TELEGRAM_BOT_TOKEN and DD_PAIR_SECRET — run: bash skills/system-ops/scripts/cloud_setup.sh pair")
+        return 2
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: (stop.set(), sys.exit(0)))
+    try:
+        uid = wait_for_claim(Telegram(token), secrets_file(), secret, stop, greet=True)
+    except BadToken:
+        log("Telegram says the bot token is invalid — run: bash skills/system-ops/scripts/cloud_setup.sh token")
+        return 2
+    return 0 if uid else 1
+
+
 def run_bot() -> int:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     owner = os.environ.get("TELEGRAM_OWNER_ID", "").strip()
     if not token:
-        log("TELEGRAM_BOT_TOKEN missing in $DD_HOME/.env — run: bash skills/system-ops/scripts/cloud_setup.sh token")
+        log("TELEGRAM_BOT_TOKEN missing — run: bash skills/system-ops/scripts/cloud_setup.sh token")
         return 2
     claimed = False
     if not owner.isdigit():
         secret = os.environ.get("DD_PAIR_SECRET", "").strip()
-        if not secret:
-            log("not paired yet — run: bash skills/system-ops/scripts/cloud_setup.sh pair")
+        if not secret or os.environ.get("DD_SECRETS_FILE"):  # on the server dd-pair.service does the pairing
+            log("not paired yet — send /pair <secret> to the bot, or run: bash skills/system-ops/scripts/cloud_setup.sh pair")
             return 2
         stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: (stop.set(), sys.exit(0)))
         try:
-            uid = wait_for_claim(Telegram(token), dd_home() / ".env", secret, stop)
+            uid = wait_for_claim(Telegram(token), secrets_file(), secret, stop)
         except BadToken:
             log("Telegram says the bot token is invalid — run: bash skills/system-ops/scripts/cloud_setup.sh token")
             return 2
         if uid is None:
             return 0
         owner, claimed = str(uid), True
+    harden_process()  # token now lives only inside this process
     bot = Bot(Telegram(token), int(owner))
     bot.boot()
 
@@ -554,7 +666,7 @@ def selftest() -> int:
             return Path(data["out"])
         if method == "sendMessage" and fail_md["on"] and data.get("parse_mode"):
             raise RuntimeError("Bad Request: can't parse entities")
-        if method == "sendDocument":
+        if method == "sendDocument" and data["path"].endswith(".tar.gz"):
             with tarfile.open(data["path"]) as tar:
                 data["names"] = tar.getnames()
         sent.append((method, data))
@@ -597,6 +709,29 @@ def selftest() -> int:
     bot.handle_update(msg(7, "hello dd"))
     bot.process(*bot.jobs.get_nowait())
     assert any("stub reply" in t and "hello dd" in t for t in texts(7)), texts(7)
+
+    # 3b. files named by full path in a reply are attached (allow-listed types, dd dirs only); secrets never
+    chart, note = home / "chart.png", home / "notes.md"
+    chart.write_bytes(b"\x89PNG fake"); note.write_text("hi", encoding="utf-8")
+    (home / ".env.backup").write_text("TELEGRAM_BOT_TOKEN=x\n", encoding="utf-8")
+    reply = (f"Chart ready: {chart} and notes at {note}. Config: {home}/.env.backup, rules: {home}/rules/RULES.md, "
+             f"system: /etc/passwd, missing: {home}/nope.pdf")
+    got = attachable_files(reply)
+    assert got == [chart, note], got
+    sent.clear()
+    bot.attach(reply)
+    kinds = [(mth, Path(d["path"]).name) for mth, d in sent if mth in ("sendPhoto", "sendDocument")]
+    assert kinds == [("sendPhoto", "chart.png"), ("sendDocument", "notes.md")], kinds
+
+    # 3c. scripts dd runs never see the token; the bot process can be made non-dumpable
+    os.environ["TELEGRAM_BOT_TOKEN"] = "1:TEST"
+    r = dd.run_script("shell-and-files", "safe_exec.py", ["env"])
+    assert "TELEGRAM_BOT_TOKEN" not in r["stdout"] and "DD_HOME" in r["stdout"], r["stdout"][-300:]
+    harden_process()
+    assert "TELEGRAM_BOT_TOKEN" not in os.environ
+    if sys.platform.startswith("linux"):
+        import ctypes
+        assert ctypes.CDLL(None).prctl(3, 0, 0, 0, 0) == 0  # PR_GET_DUMPABLE == 0
 
     # 4. voice note -> download -> transcript -> reply with the transcript shown
     sent.clear()
@@ -678,6 +813,7 @@ def selftest() -> int:
     set_env(env_file, "DD_PAIR_SECRET", "s3cret-Pair_42")
     os.environ.pop("TELEGRAM_OWNER_ID", None)
     os.environ["DD_PAIR_SECRET"] = "s3cret-Pair_42"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "1:TEST"  # run_bot drops it from the environment each time
     polls["n"] = 0
     queue_in = [[msg(55, "hi"), msg(55, "/pair guess"), msg(8, "/pair s3cret-Pair_42", chat_type="group"),
                  msg(8, "/pair s3cret-Pair_42")], [], [msg(8, "hello after pairing")]]
@@ -712,6 +848,7 @@ def selftest() -> int:
     set_env(env_file, "TELEGRAM_OWNER_ID", "")
     os.environ.pop("TELEGRAM_OWNER_ID", None)
     os.environ["DD_PAIR_SECRET"] = "x"
+    os.environ["TELEGRAM_BOT_TOKEN"] = "1:TEST"
 
     def transport4(method: str, data: dict):
         raise RuntimeError("Unauthorized")
@@ -723,6 +860,42 @@ def selftest() -> int:
         globals()["Telegram"] = real_tg
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
     os.environ.pop("DD_PAIR_SECRET", None)
+
+    # 12b. server layout: pairing is a separate service (--claim) writing a root-owned secrets file;
+    #      the bot itself refuses to pair there and exits 2 until the owner id appears
+    sec = home / "secrets.env"
+    sec.write_text("TELEGRAM_BOT_TOKEN=1:TEST\nTELEGRAM_OWNER_ID=\nDD_PAIR_SECRET=srv-Secret-9\n", encoding="utf-8")
+    os.environ.update({"DD_SECRETS_FILE": str(sec), "TELEGRAM_BOT_TOKEN": "1:TEST", "DD_PAIR_SECRET": "srv-Secret-9"})
+    os.environ.pop("TELEGRAM_OWNER_ID", None)
+    globals()["Telegram"] = lambda token: real_tg(token, transport4)
+    try:
+        assert run_bot() == 2  # no in-process claim on the server
+    finally:
+        globals()["Telegram"] = real_tg
+    queue_in[:] = [[msg(66, "/pair wrong"), msg(9, "/pair srv-Secret-9")]]
+    env_before = env_file.read_text()
+
+    def transport5(method: str, data: dict):
+        if method == "getUpdates":
+            return [] if data.get("timeout") == 0 else (queue_in.pop(0) if queue_in else [])
+        return transport(method, data)
+
+    globals()["Telegram"] = lambda token: real_tg(token, transport5)
+    sent.clear()
+    try:
+        assert claim() == 0
+    finally:
+        globals()["Telegram"] = real_tg
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    sec_now = sec.read_text()
+    assert "TELEGRAM_OWNER_ID=9" in sec_now and "DD_PAIR_SECRET=\n" in sec_now and "TELEGRAM_BOT_TOKEN=1:TEST" in sec_now, sec_now
+    assert any("Paired" in t for t in texts(9)), texts(9)
+    assert texts(66) == ["Idhu oru private assistant. / This is a private assistant."], texts(66)
+    assert env_file.read_text() == env_before  # dd's own .env untouched by server pairing
+    os.environ["TELEGRAM_OWNER_ID"] = "9"
+    assert claim() == 0  # already paired -> immediate exit, no polling
+    for k in ("DD_SECRETS_FILE", "DD_PAIR_SECRET", "TELEGRAM_OWNER_ID"):
+        os.environ.pop(k, None)
 
     # 13. broken rules -> one-line warning, no LLM call
     (home / "rules" / "RULES.md").write_text("tampered", encoding="utf-8")
@@ -738,16 +911,18 @@ def selftest() -> int:
 def main(argv: list[str]) -> int:
     if "--selftest" in argv:
         return selftest()
+    if "--claim" in argv:
+        return claim()
     if "--pair" in argv:
         if os.environ.get("DD_AGENT") or not sys.stdin.isatty():
             print("REFUSED: pairing is owner-only — run it yourself in the server terminal.")
             return 1
-        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        token = read_secret("TELEGRAM_BOT_TOKEN")
         if not token:
             print("TELEGRAM_BOT_TOKEN missing — run: bash skills/system-ops/scripts/cloud_setup.sh token")
             return 2
         try:
-            return pair(Telegram(token), dd_home() / ".env")
+            return pair(Telegram(token), secrets_file())
         except RuntimeError as e:
             print(f"Telegram error: {e} — token sariya? bash skills/system-ops/scripts/cloud_setup.sh token")
             return 2

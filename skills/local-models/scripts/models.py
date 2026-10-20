@@ -142,7 +142,7 @@ def bench(name: str, prompt: str = "Explain in two lines what a hash map is.", t
 
 
 def modelfile(base: str, out: str, ctx: int = 8192, temp: float = 0.3) -> dict:
-    rules_p = Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "rules" / "RULES.md"
+    rules_p = Path(os.environ.get("DD_RULES_DIR") or Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "rules") / "RULES.md"
     rules = rules_p.read_text(encoding="utf-8") if rules_p.exists() else "(RULES.md not initialised — run rules_guard.py init)"
     system = ("You are dd, Dhina's personal AI assistant. Reply in Thanglish (Tamil in English script, never Tamil script). "
               "Max 2-3 lines of explanation, answer first, paste-ready code, no clarifying questions mid-task "

@@ -69,7 +69,7 @@ dd runs on an **Oracle Cloud Always Free** VM and you talk to it on Telegram (te
 
 With SSH instead: `sudo apt-get update -y && sudo apt-get install -y git && sudo git clone https://github.com/dhayalandhina/personalai /opt/dd && bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh install` (asks for the token, then shows a `/pair CODE`).
 Server commands (over SSH): `bash /opt/dd/skills/system-ops/scripts/cloud_setup.sh status | update | token | pair`; first-boot log: `sudo cat /var/log/dd-setup.log`.
-Safety: dd runs as user `dd` (no sudo, read-only system dirs), only your paired Telegram account gets answers, nothing listens on the internet — don't open port 11434. Replies are slower than on the Mac (2 CPU cores, no GPU).
+Safety: dd runs as user `dd` with no sudo; its rules, settings and bot token live in root-owned `/etc/dd/` that dd can't rewrite or read (a separate `dd-pair` user does the pairing); the token never reaches a tool or another process; the cloud metadata IP is firewalled off; only your paired Telegram account gets answers; nothing listens on the internet — don't open port 11434. Reply files (charts, pdfs) are attached automatically when their path appears in dd's reply. Replies are slower than on the Mac (2 CPU cores, no GPU).
 
 ## JARVIS mode (voice)
 ```bash

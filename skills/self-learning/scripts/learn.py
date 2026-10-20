@@ -122,7 +122,7 @@ def apply_prefs(props: list[dict]) -> int:
 
 
 def rules_text() -> str:
-    p = Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "rules" / "RULES.md"
+    p = Path(os.environ.get("DD_RULES_DIR") or Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "rules") / "RULES.md"
     return p.read_text(encoding="utf-8") if p.exists() else "You are dd, Dhina's personal assistant. Reply in Thanglish."
 
 

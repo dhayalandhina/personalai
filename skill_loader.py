@@ -39,6 +39,8 @@ from typing import Any
 MAX_NAME = 64
 MAX_DESC = 1024
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+# Never handed to a script the agent launches: the bot keeps these in its own memory only.
+SECRET_ENV = ("TELEGRAM_BOT_TOKEN", "DD_PAIR_SECRET")
 
 
 @dataclass
@@ -207,7 +209,8 @@ class SkillLibrary:
         cmd = [sys.executable, str(p)] if p.suffix == ".py" else ["bash", str(p)]
         cmd += [str(a) for a in (args or [])]
         # DD_AGENT=1 + stdin=DEVNULL: scripts run by the agent can never pass an owner-only TTY gate
-        full_env = {**os.environ, "DD_SKILL_DIR": str(s.path), "DD_AGENT": "1", **(env or {})}
+        full_env = {k: v for k, v in os.environ.items() if k not in SECRET_ENV}
+        full_env.update({"DD_SKILL_DIR": str(s.path), "DD_AGENT": "1", **(env or {})})
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=full_env,
                                stdin=subprocess.DEVNULL)
@@ -308,6 +311,9 @@ class SkillLibrary:
                 name, script = self._resolve_script(str(args.get("name", "")), str(args.get("script", "")))
                 if name in self.hidden:
                     return f"error: skill '{name}' is not available on this machine"
+                if script == "tg_send.py" and os.environ.get("DD_HOST") == "server":
+                    return ("error: on the server dd does not hold the Telegram token. To give Dhina a file, "
+                            "write its full path in your reply — it is attached automatically.")
                 raw = args.get("args") or []
                 if script == "safe_exec.py":  # the whole command is ONE argument
                     argv = [raw if isinstance(raw, str) else " ".join(str(a) for a in raw)]

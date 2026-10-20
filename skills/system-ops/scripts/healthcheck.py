@@ -105,7 +105,7 @@ def check() -> dict:
             "ram": ram(), "load1": load1, "cpu_count": os.cpu_count(), "gpu": gpu(), "internet": internet, "services": services,
             "dd_data_mb": {"memory": dir_size(h / "memory.db") if (h / "memory.db").is_file() else round((h / "memory.db").stat().st_size / 1e6, 2) if (h / "memory.db").exists() else 0,
                            "learning": dir_size(h / "learning"), "video": dir_size(h / "video"), "plans": dir_size(h / "plans"),
-                           "rules_locked": (h / "rules" / "RULES.lock").exists()}}
+                           "rules_locked": (Path(os.environ.get("DD_RULES_DIR") or h / "rules") / "RULES.lock").exists()}}
 
 
 def brief(c: dict) -> str:

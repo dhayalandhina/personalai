@@ -25,13 +25,16 @@ sys.path.insert(0, str(ROOT))
 from skill_loader import SkillLibrary  # noqa: E402
 
 def _load_env() -> None:
-    """~/.dd/.env values apply unless the shell already set them."""
+    """~/.dd/.env values apply unless the shell already set them (unreadable/missing file = nothing)."""
     p = Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / ".env"
-    if p.exists():
-        for line in p.read_text(encoding="utf-8").splitlines():
-            k, sep, v = line.strip().partition("=")
-            if sep and not k.startswith("#") and v.strip():
-                os.environ.setdefault(k.strip(), v.strip().strip('"\''))
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        k, sep, v = line.strip().partition("=")
+        if sep and not k.startswith("#") and v.strip():
+            os.environ.setdefault(k.strip(), v.strip().strip('"\''))
 
 
 _load_env()
@@ -59,7 +62,8 @@ def boot_system_prompt() -> str:
     if SERVER:
         where = "You are dd, Dhina's personal AI assistant, running 24/7 on his own cloud server and talking to him on Telegram."
         workflow = ("\n\nWorkflow: you run on the cloud server, not on his Mac — you cannot open apps or control the Mac; "
-                    "say so in one line if asked. To run or check anything on this server call run_shell. ")
+                    "say so in one line if asked. To run or check anything on this server call run_shell. "
+                    "To give Dhina a file (chart, pdf, docx, csv...), write its full path in your reply — it is attached automatically. ")
     else:
         where = "You are dd, Dhina's personal AI assistant running fully local."
         workflow = ("\n\nWorkflow: to control the Mac (apps, websites, volume, music, screenshot, lock) call mac_action; "

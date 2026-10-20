@@ -10,7 +10,7 @@ metadata:
 
 # rules-guard
 
-Dhina's rules live in `$DD_HOME/rules/RULES.md` (default `~/.dd/rules/RULES.md`) and are locked by a SHA-256 hash in `RULES.lock`. **dd can read them; dd can never write them.**
+Dhina's rules live in `$DD_HOME/rules/RULES.md` (default `~/.dd/rules/RULES.md`; on the cloud server `$DD_RULES_DIR` = root-owned `/etc/dd/rules`, so not even a hijacked dd can touch them) and are locked by a SHA-256 hash in `RULES.lock`. **dd can read them; dd can never write them.**
 
 ## Boot sequence (every start)
 ```bash

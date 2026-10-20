@@ -28,8 +28,13 @@ def dd_home() -> Path:
     return Path(os.environ.get("DD_HOME", Path.home() / ".dd"))
 
 
+def rules_dir() -> Path:
+    """$DD_RULES_DIR (e.g. root-owned /etc/dd/rules on the cloud server) or $DD_HOME/rules."""
+    return Path(os.environ.get("DD_RULES_DIR") or dd_home() / "rules")
+
+
 def paths() -> tuple[Path, Path]:
-    d = dd_home() / "rules"
+    d = rules_dir()
     return d / "RULES.md", d / "RULES.lock"
 
 
