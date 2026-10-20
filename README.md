@@ -30,14 +30,14 @@ dd-skills/
     ├── data-analysis        pandas group/trend/sql + matplotlib charts
     ├── video-generation     idea → storyboard → Wan 2.2 / LTX clips (ComfyUI) → ffmpeg stitch + narration
     ├── image-generation     FLUX.1-schnell / SDXL via ComfyUI or diffusers, mock backend, text overlay
-    ├── voice                faster-whisper / whisper.cpp STT, Piper TTS, opus voice notes
+    ├── voice                faster-whisper / whisper.cpp STT, Piper TTS, opus voice notes, train dd's own wake word
     ├── telegram-interface   chunking, MarkdownV2, send text/file/photo/video/voice, commands
     ├── scheduler-reminders  "remind me tomorrow 9am", cron jobs, due-queue for the loop
     ├── email-imap           IMAP/SMTP via app password; send only with explicit confirm
     ├── local-models         Ollama manage, hardware advisor, bench, dd Modelfile builder
     ├── n8n-automation       self-hosted n8n REST: workflows, executions, webhooks, scaffolds
     ├── system-ops           healthcheck (/status), backup/restore of ~/.dd
-    ├── mac-control          JARVIS actions: apps, websites, volume, music, screenshot, lock + instant router
+    ├── mac-control          JARVIS actions: apps, websites, volume, music, screenshot, read screen, type, keys, lock + instant router
     ├── employees            500 named specialists (50 roles x 10); every task auto-assigned to the best one + checklist
     └── skill-creator        dd scaffolds + validates its own new skills
 ```
@@ -109,4 +109,4 @@ Engine: `examples/dd_listen.py` — mic through `macapp/dd-mic.swift` (Apple voi
 - Nothing here edits the locked rules. Learned preferences lose to rules on conflict.
 
 ## Status
-Validated on 20 Oct 2026: 27 skills, 37 scripts, all selftests passing (`test_skills.py`), plus `examples/*.py --selftest` (agent loop, JARVIS, listener engine, daemon, Telegram bot, chat window, menu-bar app, icon, app installer) and a full hardened `cloud_setup.sh install` emulated on Ubuntu 24.04 (root-owned secrets, separate pairing user, metadata firewall; systemd/Ollama stubbed). Live ComfyUI / Ollama / Telegram / IMAP paths need those services on your machine; their scripts fail gracefully with the install line when absent.
+Validated on 20 Oct 2026: 27 skills, 38 scripts, all selftests passing (`test_skills.py`), plus `examples/*.py --selftest` (agent loop incl. the cloud-brain plumbing, JARVIS, listener engine with the two-stage wake, voice panel model, daemon, Telegram bot, chat window, menu-bar app, icon, app installer) and a full hardened `cloud_setup.sh install` emulated on Ubuntu 24.04 (root-owned secrets, separate pairing user, metadata firewall; systemd/Ollama stubbed). Live ComfyUI / Ollama / Telegram / IMAP paths need those services on your machine; their scripts fail gracefully with the install line when absent.
