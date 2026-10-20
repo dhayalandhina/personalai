@@ -54,5 +54,21 @@ if [ -n "$need" ]; then
 fi
 command -v ffmpeg >/dev/null 2>&1 || say_note "ffmpeg illa — Terminal la: brew install ffmpeg"
 
+# mic helper with echo cancellation (hears you while a video/music plays on this Mac). Built once with swiftc.
+MIC_BIN="$HOME/.dd/bin/dd-mic"; MIC_SRC="$REPO/macapp/dd-mic.swift"
+if [ -f "$MIC_SRC" ] && { [ ! -x "$MIC_BIN" ] || [ "$MIC_SRC" -nt "$MIC_BIN" ]; }; then
+  if command -v swiftc >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$MIC_BIN")"
+    echo "building dd-mic (echo cancellation)..."
+    if swiftc -O -suppress-warnings -o "$MIC_BIN.tmp" "$MIC_SRC" 2>>"$HOME/.dd/logs/app.log"; then
+      mv -f "$MIC_BIN.tmp" "$MIC_BIN"; echo "dd-mic built: $MIC_BIN"
+    else
+      rm -f "$MIC_BIN.tmp"; echo "dd-mic build failed — using ffmpeg (no echo cancellation)"
+    fi
+  else
+    echo "swiftc illa (xcode-select --install) — using ffmpeg mic (no echo cancellation)"
+  fi
+fi
+
 cd "$REPO" || exit 1
 exec "$PY" examples/dd_app.py

@@ -208,6 +208,52 @@ def ffmpeg_source():
     raise RuntimeError(err[-300:] or "mic stream ended")
 
 
+def helper_binary() -> str:
+    return os.environ.get("DD_MIC_BIN") or str(Path.home() / ".dd" / "bin" / "dd-mic")
+
+
+_helper_failures = 0
+
+
+def choose_source() -> tuple[str, str | None]:
+    """('helper', path) when the echo-cancelling dd-mic helper is built and allowed, else ('ffmpeg', None)."""
+    b = helper_binary()
+    if os.environ.get("DD_AEC", "1") != "0" and _helper_failures < 2 and os.access(b, os.X_OK):
+        return "helper", b
+    return "ffmpeg", None
+
+
+def helper_source(binary: str):
+    """Frames from dd-mic (AVAudioEngine voice processing: cancels the Mac's own playback). Same pipe protocol."""
+    global _helper_failures
+    started = time.monotonic()
+    p = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    got = 0
+    try:
+        while True:
+            frame = p.stdout.read(FRAME_BYTES)
+            if len(frame) < FRAME_BYTES:
+                break
+            got += 1
+            yield frame
+    finally:
+        p.kill()
+    err = (p.stderr.read() or b"").decode(errors="ignore").strip()
+    if time.monotonic() - started < 3 or got == 0:  # died at once: count it; after two, fall back to ffmpeg
+        _helper_failures += 1
+    raise RuntimeError(f"dd-mic ended: {err[-300:] or 'no output'}")
+
+
+def mic_source():
+    kind, path = choose_source()
+    if kind == "helper":
+        print(f"  mic: dd-mic helper (echo cancellation) {path}", flush=True)
+        yield from helper_source(path)
+    else:
+        print("  mic: ffmpeg avfoundation (no echo cancellation — build dd-mic for playback-proof listening)", flush=True)
+        yield from ffmpeg_source()
+
+
 # ---------------- speech to text ----------------
 _whisper = None
 
@@ -268,7 +314,7 @@ def open_mic_settings() -> None:
 class Listener:
     def __init__(self, source=None, stt_fn=None, speak=None, handle=None, on_state=None, on_heard=None,
                  on_problem=None, followup_s: float | None = None, clock=time.monotonic, log=print):
-        self.source = source or ffmpeg_source
+        self.source = source or mic_source
         self.stt, self.speak_fn = stt_fn or stt, speak or default_speak
         self.handle = handle  # built lazily (loads rules + skills) unless injected
         self.on_state = on_state or (lambda s: None)
@@ -462,7 +508,7 @@ def main(argv: list[str]) -> int:
         return 1
     if "--check" in argv:  # 3-second mic + Whisper check: prints the level and what it heard, and says it back
         print("3 second pesu (e.g. 'jarvis chrome open pannu')...")
-        frames, src = [], ffmpeg_source()
+        frames, src = [], mic_source()
         try:
             for f in src:
                 frames.append(f)
@@ -669,6 +715,35 @@ def selftest() -> int:
     for f in _zeros(9000):
         lis.feed(f)
     assert len(problems) == 1, "reported once"
+
+    # 4b. mic helper plumbing: frames stream from the helper's stdout; a dead helper counts as a failure and,
+    #     after two, the ffmpeg path is chosen; DD_AEC=0 forces ffmpeg
+    import stat as _stat
+    import tempfile as _tf
+    fake = Path(_tf.mkdtemp(prefix="dd-mic-")) / "dd-mic"
+    fake.write_text("#!/bin/sh\nhead -c 12800 /dev/zero\necho 'dd-mic: 24000 Hz x1 -> 16000 Hz mono, voice processing ON' >&2\n")
+    fake.chmod(fake.stat().st_mode | _stat.S_IEXEC)
+    os.environ["DD_MIC_BIN"] = str(fake)
+    global _helper_failures
+    _helper_failures = 0
+    assert choose_source()[0] == "helper"
+    frames_got, ended = 0, ""
+    try:
+        for _f in helper_source(str(fake)):
+            frames_got += 1
+    except RuntimeError as e:
+        ended = str(e)
+    assert frames_got == 20 and "voice processing ON" in ended, (frames_got, ended)
+    assert _helper_failures == 1  # it exited within 3 s
+    _helper_failures = 2
+    assert choose_source()[0] == "ffmpeg", "two early deaths must fall back to ffmpeg"
+    _helper_failures = 0
+    os.environ["DD_AEC"] = "0"
+    assert choose_source()[0] == "ffmpeg"
+    os.environ.pop("DD_AEC")
+    os.environ["DD_MIC_BIN"] = "/nonexistent/dd-mic"
+    assert choose_source()[0] == "ffmpeg"
+    os.environ.pop("DD_MIC_BIN")
 
     # 5. run(): a dying mic stream is reported and retried; stop ends the loop
     calls = {"n": 0}

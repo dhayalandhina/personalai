@@ -23,7 +23,7 @@ die() { echo "ERROR: $*"; exit 1; }
 guard() {
   [ -n "${DD_AGENT:-}" ] && { echo "REFUSED: installing the app is owner-only — run it yourself in Terminal."; exit 1; }
   [ "${DD_FAKE_UNAME:-$(uname -s)}" = "Darwin" ] || [ -n "$DRY" ] || [ -n "$FAKE_APPLET" ] || die "idhu Mac ku mattum (dd.app)"
-  for f in dd.applescript launcher.sh dd.icns; do [ -f "$SRC/$f" ] || die "macapp/$f missing (git pull pannu)"; done
+  for f in dd.applescript launcher.sh dd.icns dd-mic.swift; do [ -f "$SRC/$f" ] || die "macapp/$f missing (git pull pannu)"; done
 }
 
 pick_python() {  # the python3 your terminal uses, preferring one that already has faster-whisper + numpy
@@ -110,6 +110,15 @@ install() {
     "$py" -c 'import rumps' >/dev/null 2>&1 || pip_install "$py" rumps || echo "  rumps install aagala (menu bar venumna: pip3 install rumps)"
   fi
   command -v ffmpeg >/dev/null 2>&1 || echo "  ffmpeg illa: brew install ffmpeg   (mic ku venum)"
+  echo "[2b] mic helper with echo cancellation (swiftc, one-time) — hears you while a video plays"
+  if [ -n "$DRY" ]; then echo "DRY: swiftc -O -o $DD_HOME/bin/dd-mic $SRC/dd-mic.swift"
+  elif command -v swiftc >/dev/null 2>&1; then
+    mkdir -p "$DD_HOME/bin"
+    swiftc -O -suppress-warnings -o "$DD_HOME/bin/dd-mic" "$SRC/dd-mic.swift" && echo "  dd-mic built" \
+      || echo "  dd-mic build failed — app uses ffmpeg mic (no echo cancellation); see errors above"
+  else
+    echo "  swiftc illa — run: xcode-select --install   (then: bash install_app.sh install again)"
+  fi
   echo "[3/6] sign (ad-hoc) so macOS remembers the mic/automation permissions"
   if command -v codesign >/dev/null 2>&1; then run codesign --force --deep --sign - "$APP" 2>/dev/null || true
   else echo "  codesign illa (skip)"; fi
@@ -140,6 +149,8 @@ selftest() {
   grep -q 'examples/dd_app.py' "$SRC/launcher.sh" || { echo "launcher does not start dd_app"; return 1; }
   grep -q 'proc_translated' "$SRC/launcher.sh" || { echo "launcher lacks the Rosetta guard"; return 1; }
   grep -q 'launcher.sh' "$SRC/dd.applescript" && grep -q 'with timeout' "$SRC/dd.applescript" || { echo "applescript wrong"; return 1; }
+  grep -q 'setVoiceProcessingEnabled(true)' "$SRC/dd-mic.swift" && grep -q 'sampleRate: 16000' "$SRC/dd-mic.swift" || { echo "dd-mic.swift wrong"; return 1; }
+  grep -q 'swiftc' "$SRC/launcher.sh" || { echo "launcher does not build dd-mic"; return 1; }
   [ "$(head -c 4 "$SRC/dd.icns")" = "icns" ] || { echo "icon missing/invalid"; return 1; }
   # build with the fake applet skeleton, then check the customized bundle
   FAKE_APPLET=1; export DD_FAKE_APPLET=1
@@ -156,6 +167,7 @@ EOF
   out=$(DD_AGENT=1 bash "$REPO/install_app.sh" install 2>&1); echo "$out" | grep -q REFUSED || { echo "agent not refused"; return 1; }
   out=$(env -u DD_AGENT -u DD_FAKE_APPLET DD_APP_DRY=1 DD_FAKE_UNAME=Darwin DD_APPS_DIR="$t/Applications" DD_HOME="$t/.dd" bash "$REPO/install_app.sh" install 2>&1)
   for want in "DRY: osacompile -o" "DRY: customize" "DRY: mv " "repo_path ($REPO)" "DRY: pip install faster-whisper rumps" \
+              "DRY: swiftc -O -o $t/.dd/bin/dd-mic" \
               "make login item" "DRY: open $t/Applications/dd.app" "done."; do
     echo "$out" | grep -qF -- "$want" || { echo "dry install missing: $want"; echo "$out"; return 1; }
   done
