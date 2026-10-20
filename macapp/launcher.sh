@@ -46,6 +46,7 @@ echo "python: $PY ($("$PY" -c 'import platform; print(platform.machine(), platfo
 need=""
 "$PY" -c 'import faster_whisper' >/dev/null 2>&1 || need="$need faster-whisper"
 "$PY" -c 'import rumps' >/dev/null 2>&1 || need="$need rumps"
+"$PY" -c 'import openwakeword' >/dev/null 2>&1 || need="$need openwakeword"
 if [ -n "$need" ]; then
   say_note "First run: voice + menu bar setup pannudhu (1-3 nimisham)…"
   # shellcheck disable=SC2086

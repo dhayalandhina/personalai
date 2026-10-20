@@ -108,6 +108,7 @@ install() {
   else
     "$py" -c 'import faster_whisper' >/dev/null 2>&1 || pip_install "$py" faster-whisper || echo "  faster-whisper install aagala (voice venumna: pip3 install faster-whisper)"
     "$py" -c 'import rumps' >/dev/null 2>&1 || pip_install "$py" rumps || echo "  rumps install aagala (menu bar venumna: pip3 install rumps)"
+    "$py" -c 'import openwakeword' >/dev/null 2>&1 || pip_install "$py" openwakeword || echo "  openwakeword install aagala (hey-jarvis wake model; Whisper text wake dhaan varum)"
   fi
   command -v ffmpeg >/dev/null 2>&1 || echo "  ffmpeg illa: brew install ffmpeg   (mic ku venum)"
   echo "[2b] mic helper with echo cancellation (swiftc, one-time) — hears you while a video plays"

@@ -316,12 +316,66 @@ def open_mic_settings() -> None:
         subprocess.run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"], check=False)
 
 
+# ---------------- wake-word detector (Siri-style: tiny always-on model, Whisper only after the wake) ----------------
+class WakeDetector:
+    """openWakeWord 'hey jarvis' (bundled ONNX model). 80 ms chunks, ~3% of one CPU core, ignores speech that
+    isn't the wake phrase — so the mic can stay open next to a video without transcribing it."""
+    CHUNK = 1280 * 2  # bytes = 80 ms of 16 kHz int16
+
+    def __init__(self, threshold: float | None = None, names: tuple[str, ...] = ("hey_jarvis",)):
+        import warnings
+        warnings.filterwarnings("ignore", message=".*ExecutionProvider.*")
+        import openwakeword
+        from openwakeword.model import Model
+        paths = [openwakeword.models[n]["model_path"] for n in names if n in getattr(openwakeword, "models", {})]
+        if not paths:
+            raise RuntimeError("openwakeword has no hey_jarvis model")
+        self.model = Model(wakeword_model_paths=paths)
+        self.threshold = float(os.environ.get("DD_WAKE_THRESHOLD", "0.5")) if threshold is None else threshold
+        self.buf = b""
+        self.cooldown = 0
+        self.last_score = 0.0
+
+    def feed(self, frame: bytes) -> float | None:
+        """Returns the score when the wake phrase was just heard, else None."""
+        import numpy as np
+        self.buf += frame
+        if len(self.buf) < self.CHUNK:
+            return None
+        chunk, self.buf = self.buf[:self.CHUNK], self.buf[self.CHUNK:]
+        scores = self.model.predict(np.frombuffer(chunk, dtype=np.int16))
+        s = max(scores.values()) if scores else 0.0
+        self.last_score = s
+        if self.cooldown > 0:
+            self.cooldown -= 1
+            return None
+        if s >= self.threshold:
+            self.model.reset()
+            self.cooldown = 20  # 1.6 s: one trigger per wake
+            return s
+        return None
+
+
+def make_wake_detector():
+    """A WakeDetector when openwakeword is installed and DD_WAKE_MODEL != 0; else None (text-wake fallback)."""
+    if os.environ.get("DD_WAKE_MODEL", "1") == "0":
+        return None
+    try:
+        return WakeDetector()
+    except Exception as e:
+        print(f"(wake model unavailable: {str(e)[:120]} — pip install openwakeword; using Whisper text wake)", flush=True)
+        return None
+
+
 # ---------------- the listener ----------------
 class Listener:
     def __init__(self, source=None, stt_fn=None, speak=None, handle=None, on_state=None, on_heard=None,
                  on_problem=None, followup_s: float | None = None, clock=time.monotonic, log=print,
-                 inline: bool = False):
+                 inline: bool = False, wake=None):
         self.source = source or mic_source
+        # wake: a WakeDetector (default: openwakeword if installed), False = none (Whisper text wake only)
+        self.wake = make_wake_detector() if wake is None else (wake or None)
+        self.armed_until = 0.0  # after a wake (or a reply) the next utterance is a command
         # Utterances are transcribed/answered on a worker thread, so the mic keeps streaming while Whisper or the
         # model is busy (a slow turn never backs up the audio pipe). inline=True runs them synchronously (tests).
         self.inline = inline
@@ -384,19 +438,27 @@ class Listener:
             self.tail = 20  # 400 ms: let the room go quiet before listening again
         self.set_state("listening")
 
+    def on_wake(self, score: float) -> None:
+        """'hey jarvis' detected: short sound (without pausing the mic), then the next utterance is the command."""
+        self.log(f"  wake: hey jarvis ({score:.2f})")
+        self._last_activity = self.clock()
+        self.last_heard = "hey jarvis ✓"
+        self.on_heard("hey jarvis", 0.0)
+        self.ack(sound_only=True)
+        self.seg.reset()
+        self.seg.pre.clear()
+        self.armed_until = self.clock() + self.followup_s
+        self.set_state("recording")
+
     def ack(self, sound_only: bool = False) -> None:
         """Wake word heard. sound_only: a short system sound (command already understood, action follows).
         Otherwise a spoken 'Sollu.' — unmistakable: dd is waiting for the command."""
         tink = Path("/System/Library/Sounds/Tink.aiff")
-        if sound_only and MAC and tink.exists() and os.environ.get("DD_MUTE") != "1":
-            self.speaking = True
-            try:
-                subprocess.run(["afplay", str(tink)], check=False, timeout=5)
-            finally:
-                self.speaking, self.tail = False, 10
+        if sound_only:
+            if MAC and tink.exists() and os.environ.get("DD_MUTE") != "1":  # async: the mic keeps listening
+                subprocess.Popen(["afplay", str(tink)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
-        if not sound_only:
-            self.say("Sollu.")
+        self.say("Sollu.")
 
     def process(self, utt: bytes) -> None:
         audio = len(utt) / (RATE * 2)
@@ -420,8 +482,9 @@ class Listener:
         self.on_heard(text, secs)
         self.log(f"  heard: {text!r}  ({audio:.1f}s audio, stt {secs:.1f}s)")
         woke, cmd = parse_wake(text)
+        armed = self.clock() < self.armed_until
         followup = self.clock() < self.followup_until
-        if not woke and not followup:
+        if not woke and not followup and not armed:
             return
         if woke and not cmd:  # just the wake word
             self.ack()
@@ -429,7 +492,8 @@ class Listener:
             self.set_state("recording")
             return
         command = cmd if woke else text
-        if woke:
+        self.armed_until = 0.0
+        if woke or armed:
             self.ack(sound_only=True)  # "heard you" — instant, before the action or the model
         self.set_state("thinking")
         t1 = self.clock()
@@ -466,8 +530,21 @@ class Listener:
             return
         if self.state in ("paused", "starting"):
             self.set_state("listening")
-        if self.state == "recording" and self.clock() >= self.followup_until:
+        if self.state == "recording" and self.clock() >= max(self.followup_until, self.armed_until):
             self.set_state("listening")
+        if self.wake is not None:
+            score = self.wake.feed(frame)
+            if score:
+                self.on_wake(score)
+                return
+            if self.clock() >= self.armed_until and self.clock() >= self.followup_until:
+                if self.state == "recording":
+                    self.set_state("listening")
+                if e < self.seg.threshold():  # learn the room's quiet level only (never from speech/media)
+                    self.seg._idle_level(e)
+                self.seg.reset()
+                self.seg.pre.clear()
+                return
         if frame.count(b"\x00") == len(frame):
             self.zero_run += 1
             if self.zero_run * FRAME_MS >= 8000 and not self.problem_sent:
@@ -672,7 +749,7 @@ def selftest() -> int:
 
     lis = Listener(source=lambda: iter([]), stt_fn=fake_stt, speak=fake_speak, handle=fake_handle,
                    on_state=states.append, on_heard=lambda t, s: heard_log.append(t) if t else None,
-                   on_problem=problems.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None, inline=True)
+                   on_problem=problems.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None, inline=True, wake=False)
     utterance = _tone(800) + _quiet(800)
 
     def speak_utt():
@@ -758,6 +835,56 @@ def selftest() -> int:
         lis.feed(f)
     assert len(problems) == 1, "reported once"
 
+    # 4a. Siri-style gating: with a wake detector, speech is NOT transcribed until "hey jarvis" fires;
+    #     the next utterance is the command; after the reply an 8 s follow-up stays open
+    class FakeWake:
+        CHUNK = 2560
+
+        def __init__(self):
+            self.fire_in = None  # frames until a trigger
+            self.last_score = 0.0
+
+        def feed(self, frame):
+            if self.fire_in is None:
+                return None
+            self.fire_in -= 1
+            if self.fire_in <= 0:
+                self.fire_in = None
+                return 0.97
+            return None
+
+    fw = FakeWake()
+    gate_stt_calls = []
+    g_handled, g_spoken = [], []
+    lg = Listener(source=lambda: iter([]), stt_fn=lambda b: (gate_stt_calls.append(1), "open chrome")[1],
+                  speak=g_spoken.append, handle=lambda c: (g_handled.append(c), "ok")[1],
+                  followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None, inline=True, wake=fw)
+    speak_utt()  # (the old listener) no-op here; the gated one:
+    for f in utterance:
+        lg.feed(f)
+    assert gate_stt_calls == [] and g_handled == [], "speech without the wake phrase must not reach Whisper"
+    fw.fire_in = 3
+    for f in _quiet(200):  # the detector fires during quiet
+        lg.feed(f)
+    assert lg.state == "recording" and lg.last_heard == "hey jarvis ✓"
+    for f in utterance:  # the command
+        lg.feed(f)
+    assert gate_stt_calls == [1] and g_handled == ["open chrome"] and g_spoken[-1] == "ok", (gate_stt_calls, g_handled, g_spoken)
+    for f in utterance:  # follow-up window: another command without the wake phrase
+        lg.feed(f)
+    assert g_handled == ["open chrome", "open chrome"]
+    now["t"] += 30
+    for f in utterance:  # window closed: ignored again
+        lg.feed(f)
+    assert len(gate_stt_calls) == 2 and lg.state == "listening"
+    fw.fire_in = 2
+    for f in _quiet(200):
+        lg.feed(f)
+    now["t"] += 30  # armed but said nothing: disarms quietly
+    for f in _quiet(200):
+        lg.feed(f)
+    assert lg.state == "listening" and len(gate_stt_calls) == 2
+
     # 4b. mic helper plumbing: frames stream from the helper's stdout; a dead helper counts as a failure and,
     #     after two, the ffmpeg path is chosen; DD_AEC=0 forces ffmpeg
     import stat as _stat
@@ -795,7 +922,7 @@ def selftest() -> int:
         slow_calls.append(cmd)
         return "ok"
     lw = Listener(source=lambda: iter([]), stt_fn=lambda b: "jarvis volume 30", speak=lambda t: None,
-                  handle=slow_handle, followup_s=0.0, log=lambda *_: None)
+                  handle=slow_handle, followup_s=0.0, log=lambda *_: None, wake=False)
     t0 = time.monotonic()
     for f in utterance:
         lw.feed(f)
@@ -825,7 +952,7 @@ def selftest() -> int:
 
     probs2 = []
     lis2 = Listener(source=flaky_source, stt_fn=fake_stt, speak=fake_speak, handle=fake_handle,
-                    on_problem=probs2.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None, inline=True)
+                    on_problem=probs2.append, followup_s=8.0, clock=lambda: now["t"], log=lambda *_: None, inline=True, wake=False)
     lis2.stop.wait = lambda *_: None  # don't actually sleep in the test
     lis2.run()
     assert calls["n"] == 2 and probs2 and "mic error" in probs2[0] and lis2.state == "stopped", (calls, probs2)

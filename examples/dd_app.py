@@ -232,10 +232,34 @@ def ensure_mic_helper() -> None:
     print(("dd-mic built: " + note) if r.returncode == 0 else f"dd-mic build failed: {r.stderr.strip()[-400:]}", flush=True)
 
 
+def ensure_python_deps(mods=(("openwakeword", "openwakeword"), ("faster_whisper", "faster-whisper"))) -> None:
+    """Install missing voice deps into this python once (hey-jarvis wake model, Whisper)."""
+    missing = []
+    for mod, pkg in mods:
+        try:
+            __import__(mod)
+        except Exception:
+            missing.append(pkg)
+    if not missing:
+        return
+    print(f"installing {' '.join(missing)} (one-time)...", flush=True)
+    notify(f"First run: {' '.join(missing)} install pannudhu (1-2 nimisham)…")
+    for extra in ([], ["--break-system-packages"], ["--user"]):
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", *extra, *missing], capture_output=True, text=True, timeout=900)
+        if r.returncode == 0:
+            print("installed", flush=True)
+            return
+    print("install failed: " + (r.stderr or "")[-300:], flush=True)
+
+
 def run_app() -> int:
-    """Update, build the mic helper, warm up, start the ears, then the menu bar (terminal mode without rumps)."""
+    """Update, deps, mic helper, warm up, start the ears, then the menu bar (terminal mode without rumps)."""
     if auto_update():
         os.execv(sys.executable, [sys.executable, __file__] + sys.argv[1:])  # run the new code right away
+    try:
+        ensure_python_deps()
+    except Exception as e:
+        print(f"(deps skipped: {e})", flush=True)
     try:
         ensure_mic_helper()
     except Exception as e:
@@ -244,6 +268,8 @@ def run_app() -> int:
     if problem:
         notify(f"Brain ready illa: {problem}")
     core = AppCore()
+    print("wake: " + ("'hey jarvis' model (openwakeword) — Whisper runs only after the wake" if core.listener.wake
+                      else "Whisper text wake (install openwakeword for the always-on model)"), flush=True)
     threading.Thread(target=lambda: (dd_listen.warm_stt(), dd.warm()), daemon=True).start()
     dd.start_reminder_watcher(lambda text: core.listener.say(text))
     core.start()
