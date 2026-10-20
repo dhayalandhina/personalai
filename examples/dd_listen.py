@@ -40,7 +40,7 @@ RATE = 16000
 FRAME_MS = 20
 FRAME_BYTES = RATE * 2 * FRAME_MS // 1000  # 640 bytes = 20 ms of 16-bit mono
 MAC = platform.system() == "Darwin"
-HINT = "Dhina speaking Thanglish: dd, jarvis, enna pannura, sollu, paaru, innaiku, chrome open pannu, volume, screenshot."
+HINT = "Jarvis. dd. Chrome open pannu. Volume thirty. Innaiku weather enna? Screenshot edu. Sollu."
 VOICE_SUFFIX = ("\n\nVOICE MODE: your reply is spoken aloud. 1-2 short sentences, no tables, no lists; "
                 "put code only when asked (it is shown, not read).")
 # How Whisper tends to write a spoken "dd" / "jarvis". Compared after lower-casing and dropping punctuation/spaces.
@@ -60,14 +60,17 @@ def rms(frame: bytes) -> float:
 
 
 class Segmenter:
-    """Energy-based voice activity: feed 20 ms frames; returns one utterance (PCM bytes) when the speaker stops."""
+    """Energy-based voice activity: feed 20 ms frames; returns one utterance (PCM bytes) when the speaker stops.
+    Thresholds adapt to the room: the start level sits well above the measured noise floor, and "silence" means
+    back down near that floor — so a fan or AC never keeps an utterance open until the max window."""
 
-    def __init__(self, min_start: float | None = None, end_silence_ms: int = 700, min_speech_ms: int = 250,
-                 max_ms: int = 12000, pre_roll_ms: int = 300):
-        # DD_VAD_START: RMS level that counts as speech (lower = more sensitive; a false start only costs one Whisper call)
-        self.min_start = float(os.environ.get("DD_VAD_START", "200")) if min_start is None else min_start
+    def __init__(self, min_start: float | None = None, end_silence_ms: int = 600, min_speech_ms: int = 250,
+                 max_ms: int = 8000, pre_roll_ms: int = 300):
+        # DD_VAD_START: absolute minimum RMS that counts as speech (the adaptive floor usually sets it higher)
+        self.min_start = float(os.environ.get("DD_VAD_START", "300")) if min_start is None else min_start
         self.end_silence_ms, self.min_speech_ms, self.max_ms = end_silence_ms, min_speech_ms, max_ms
-        self.noise = 100.0  # running noise floor; threshold adapts to the room
+        self.idle: deque[float] = deque(maxlen=150)  # last 3 s of idle levels -> noise floor (median) and p90
+        self.floor, self.p90 = 100.0, 140.0
         self.pre: deque[bytes] = deque(maxlen=max(1, pre_roll_ms // FRAME_MS))
         self.reset()
 
@@ -75,25 +78,39 @@ class Segmenter:
         self.speaking, self.frames, self.silence, self.speech_frames, self.loud_run = False, [], 0, 0, 0
         self.energy_sum = 0.0
 
-    def threshold(self) -> float:
-        return max(self.min_start, self.noise * 2.0)
+    @property
+    def noise(self) -> float:
+        return self.floor
+
+    def _idle_level(self, e: float) -> None:
+        self.idle.append(e)
+        if len(self.idle) >= 25:
+            s = sorted(self.idle)
+            self.floor, self.p90 = s[len(s) // 2], s[int(len(s) * 0.9)]
+
+    def threshold(self) -> float:  # speech starts above this
+        return max(self.min_start, self.floor * 3.0, self.p90 * 1.4)
+
+    def end_threshold(self) -> float:  # ... and has stopped when it stays below this
+        return max(self.floor * 1.5, self.threshold() * 0.4)
 
     def feed(self, frame: bytes) -> bytes | None:
         e = rms(frame)
         thr = self.threshold()
         if not self.speaking:
             if e < thr:
-                self.noise = 0.95 * self.noise + 0.05 * e
+                self._idle_level(e)
                 self.loud_run = 0
             else:
                 self.loud_run += 1
             self.pre.append(frame)
-            if self.loud_run >= 3:  # 60 ms of sound = speech started; keep the pre-roll so the first syllable survives
+            if self.loud_run >= 4:  # 80 ms of sound = speech started; keep the pre-roll so the first syllable survives
                 self.speaking, self.frames, self.silence, self.speech_frames = True, list(self.pre), 0, self.loud_run
+                self.energy_sum = 0.0
             return None
         self.frames.append(frame)
         self.energy_sum += e
-        if e >= thr * 0.6:
+        if e >= self.end_threshold():
             self.silence, self.speech_frames = 0, self.speech_frames + 1
         else:
             self.silence += 1
@@ -101,8 +118,10 @@ class Segmenter:
         if self.silence * FRAME_MS < self.end_silence_ms and not forced:
             return None
         utt, spoken = b"".join(self.frames), self.speech_frames * FRAME_MS
-        if forced:  # steady noise (music, fan) kept it "speaking" for the whole window: treat that level as the new floor
-            self.noise = max(self.noise, self.energy_sum / max(1, len(self.frames)))
+        if forced:  # steady noise kept it "speaking" for the whole window: treat that level as room noise from now on
+            avg = self.energy_sum / max(1, len(self.frames))
+            for _ in range(40):
+                self._idle_level(avg)
         self.reset()
         return utt if spoken >= self.min_speech_ms else None  # a click or cough is not an utterance
 
@@ -112,20 +131,26 @@ def wake_words() -> set[str]:
     return WAKE_FORMS | extra
 
 
+def _is_wake(cand: str, forms: set[str]) -> bool:
+    c = re.sub(r"[^a-z0-9]", "", cand)
+    if not c:
+        return False
+    return c in forms or (len(c) >= 4 and difflib.SequenceMatcher(None, c, "jarvis").ratio() >= 0.75)
+
+
 def parse_wake(text: str) -> tuple[bool, str]:
-    """('D.D. open chrome') -> (True, 'open chrome'); ('address check') -> (False, 'address check')."""
+    """('D.D. open chrome') -> (True, 'open chrome'); ('enna rvis, open chrome') -> (True, 'open chrome');
+    ('address check') -> (False, 'address check'). The wake word may sit anywhere in the first four words."""
     words = re.findall(r"[\w']+", text.lower())
-    i = 0
-    while i < len(words) and words[i] in LEAD_SKIP:
-        i += 1
     forms = wake_words()
-    for n in (3, 2, 1):  # longest first: "D.D." is the two words "d d" -> "dd", not a lone "d"
-        cand = re.sub(r"[^a-z0-9]", "", "".join(words[i:i + n]))
-        if not cand:
-            continue
-        fuzzy = len(cand) >= 5 and difflib.SequenceMatcher(None, cand, "jarvis").ratio() >= 0.8
-        if cand in forms or fuzzy:
-            return True, " ".join(words[i + n:]).strip()
+    for i in range(min(len(words), 4)):
+        for n in (3, 2, 1):  # longest first: "D.D." is the two words "d d" -> "dd", not a lone "d"
+            if i + n > len(words) or not _is_wake("".join(words[i:i + n]), forms):
+                continue
+            rest = words[i + n:]
+            while rest and (_is_wake(rest[0], forms) or rest[0] in LEAD_SKIP):  # "dd jarvis ..." / "dd, hey ..."
+                rest = rest[1:]
+            return True, " ".join(rest).strip()
     return False, text.strip()
 
 
@@ -191,10 +216,17 @@ def stt(pcm: bytes) -> str:
     import numpy as np
     if _whisper is None:
         from faster_whisper import WhisperModel  # pip install faster-whisper
-        _whisper = WhisperModel(os.environ.get("DD_STT_MODEL", "base"), device="auto", compute_type="int8")
+        name = os.environ.get("DD_STT_MODEL", "small")  # small: clearly better for Thanglish; base: faster
+        try:
+            _whisper = WhisperModel(name, device="auto", compute_type="int8")
+        except Exception as e:
+            if name == "base":
+                raise
+            print(f"(whisper '{name}' unavailable: {str(e)[:80]} — using base)")
+            _whisper = WhisperModel("base", device="auto", compute_type="int8")
     a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     pad = np.zeros(int(0.3 * RATE), dtype=np.float32)
-    lang = os.environ.get("DD_STT_LANG", "auto")
+    lang = os.environ.get("DD_STT_LANG", "en")  # English decoding reads romanised Tamil best; "auto" wanders
     segs, _ = _whisper.transcribe(np.concatenate([pad, a, pad]), language=None if lang == "auto" else lang,
                                   beam_size=1, vad_filter=False, condition_on_previous_text=False,
                                   initial_prompt=HINT, no_speech_threshold=0.6)
@@ -291,6 +323,20 @@ class Listener:
             self.tail = 20  # 400 ms: let the room go quiet before listening again
         self.set_state("listening")
 
+    def ack(self) -> None:
+        """Wake word heard, no command yet: a short system sound (instant) or a spoken 'Sollu.'"""
+        tink = Path("/System/Library/Sounds/Tink.aiff")
+        if MAC and tink.exists() and os.environ.get("DD_MUTE") != "1":
+            self.set_state("speaking")
+            self.speaking = True
+            try:
+                subprocess.run(["afplay", str(tink)], check=False, timeout=5)
+            finally:
+                self.speaking, self.tail = False, 10
+            self.set_state("listening")
+        else:
+            self.say("Sollu.")
+
     def process(self, utt: bytes) -> None:
         t0 = self.clock()
         text = self.stt(utt).strip()
@@ -310,7 +356,7 @@ class Listener:
         if not woke and not followup:
             return
         if woke and not cmd:  # just the wake word
-            self.say("Sollu.")
+            self.ack()
             self.followup_until = self.clock() + self.followup_s
             self.set_state("recording")
             return
@@ -340,8 +386,8 @@ class Listener:
                 self._finish_test()
             return
         if self._frames % 750 == 0 and self.clock() - self._last_activity > 15:  # idle: a level line every 15 s
-            self.log(f"  mic level: peak {self.level:.0f} (speech starts above {self.seg.threshold():.0f}, "
-                     f"noise floor {self.seg.noise:.0f}) — nothing heard yet")
+            self.log(f"  mic level: peak {self.level:.0f} (room floor {self.seg.floor:.0f}/p90 {self.seg.p90:.0f}; "
+                     f"speech starts above {self.seg.threshold():.0f}, ends below {self.seg.end_threshold():.0f}) — nothing heard yet")
         if self.paused:
             self.set_state("paused")
             return
@@ -472,11 +518,20 @@ def selftest() -> int:
     dur = len(utts[0]) / (RATE * 2)
     assert 1.5 <= dur <= 2.3, dur  # ~0.3 pre-roll + 1.0 speech + 0.7 tail
     assert not any(seg.feed(f) for f in _tone(100) + _quiet(900)), "a 100 ms click must not be an utterance"
-    long_utt = [u for u in (seg.feed(f) for f in _tone(13000)) if u]
-    assert long_utt and len(long_utt[0]) / (RATE * 2) <= 12.5, "max utterance length"
+    long_utt = [u for u in (seg.feed(f) for f in _tone(9000)) if u]
+    assert long_utt and len(long_utt[0]) / (RATE * 2) <= 8.5, "max utterance length"
+    # a noisy room (fan/AC ~230 RMS): speech must still end ~0.6 s after the voice stops, not run to the max window
+    noisy = Segmenter()
+    for f in _quiet(3000, amp=400):
+        noisy.feed(f)
+    assert 150 < noisy.floor < 320 and noisy.threshold() > 600, (noisy.floor, noisy.threshold())
+    got = [u for u in (noisy.feed(f) for f in _tone(1000) + _quiet(1500, amp=400)) if u]
+    assert len(got) == 1 and 1.4 <= len(got[0]) / (RATE * 2) <= 2.3, [len(u) / (RATE * 2) for u in got]
 
     # 2. wake word parsing — the ways Whisper writes "dd"/"jarvis", and words that must NOT wake
     cases = {
+        "enna rvis, open chrome.": (True, "open chrome"), "dd, jarvis, ennaiku,": (True, "ennaiku"),
+        "Hendemiz.": (False, "Hendemiz."), "na jan tharvisan tannaw": (False, "na jan tharvisan tannaw"),
         "D.D. open chrome": (True, "open chrome"), "Didi, volume 30.": (True, "volume 30"),
         "Dee dee screenshot edu": (True, "screenshot edu"), "dd": (True, ""), "DD.": (True, ""),
         "Hey Jarvis, what's the time?": (True, "what's the time"), "Jervis open safari": (True, "open safari"),

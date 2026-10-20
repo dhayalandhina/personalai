@@ -4,6 +4,7 @@
   open-app NAME | quit-app NAME | open-url URL | search-web QUERY
   volume N|up|down|mute|unmute | media play|pause|next|previous
   notify TEXT | time | battery | wifi | apps | screenshot [--out FILE] | lock
+  read-screen                       screenshot + Apple Vision OCR (built-in) -> the text on screen
   dark-mode on|off|toggle | clipboard get|set TEXT
   route "spoken or typed text"      fast intent router -> JSON {"action", "args"} or {"action": null}
   do "text"                         route + run in one step (what the dd loop calls)
@@ -18,8 +19,10 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -143,7 +146,68 @@ def run_skill_action(action: str, args: list[str]) -> dict:
     raise ValueError(action)
 
 
+OCR_JXA = r"""
+ObjC.import('Foundation'); ObjC.import('AppKit'); ObjC.import('Vision');
+function run(argv) {
+  const img = $.NSImage.alloc.initWithContentsOfFile(argv[0]);
+  if (!img || img.isNil()) return 'ERR: cannot read image';
+  const cg = img.CGImageForProposedRectContextHints(null, null, null);
+  const req = $.VNRecognizeTextRequest.alloc.init;
+  req.recognitionLevel = $.VNRequestTextRecognitionLevelAccurate;
+  req.usesLanguageCorrection = true;
+  const handler = $.VNImageRequestHandler.alloc.initWithCGImageOptions(cg, $({}));
+  const err = Ref();
+  if (!handler.performRequestsError($([req]), err)) return 'ERR: ' + (err[0] ? ObjC.unwrap(err[0].localizedDescription) : 'vision failed');
+  const res = req.results, lines = [];
+  for (let i = 0; i < res.count; i++) {
+    const c = res.objectAtIndex(i).topCandidatesWithMaximumCandidates(1);
+    if (c.count) lines.push(ObjC.unwrap(c.objectAtIndex(0).string));
+  }
+  return lines.join('\n');
+}
+"""
+
+
+def ocr(image: str) -> tuple[bool, str]:
+    """Text on an image: Apple Vision through built-in JXA (no install), else tesseract if present."""
+    js = Path(tempfile.gettempdir()) / "dd_ocr.js"
+    js.write_text(OCR_JXA, encoding="utf-8")
+    r = subprocess.run(["osascript", "-l", "JavaScript", str(js), image], capture_output=True, text=True, timeout=60)
+    out = (r.stdout or "").strip()
+    if r.returncode == 0 and out and not out.startswith("ERR:"):
+        return True, out
+    if shutil.which("tesseract"):
+        t = subprocess.run(["tesseract", image, "-", "--psm", "3"], capture_output=True, text=True, timeout=120)
+        if t.returncode == 0 and t.stdout.strip():
+            return True, t.stdout.strip()
+    return False, (out or r.stderr.strip() or "OCR failed")[:300]
+
+
+def read_screen() -> dict:
+    """Screenshot the screen and return its text (for 'screen la enna irukku', 'read my screen')."""
+    shot = str(Path(tempfile.gettempdir()) / f"dd_screen_{int(time.time())}.png")
+    cmds = [["screencapture", "-x", shot]]
+    if DRY:
+        return {"ok": True, "action": "read-screen", "dry_run": True, "would_run": cmds + [["osascript", "-l", "JavaScript", "<vision-ocr>", shot]]}
+    r = subprocess.run(cmds[0], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0 or not Path(shot).exists():
+        return {"ok": False, "action": "read-screen", "error": "screenshot aagala: " + (r.stderr or "").strip()[:200]
+                + " (System Settings → Privacy & Security → Screen Recording la dd ku ON pannu)"}
+    ok, text = ocr(shot)
+    try:
+        Path(shot).unlink()
+    except OSError:
+        pass
+    if not ok:
+        return {"ok": False, "action": "read-screen", "error": text}
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return {"ok": True, "action": "read-screen", "lines": len(lines), "text": text[:6000],
+            "say": f"Screen la {len(lines)} lines text irukku. " + (" ".join(lines[:6])[:220] if lines else "")}
+
+
 def run(action: str, args: list[str]) -> dict:
+    if action == "read-screen":
+        return read_screen()
     if action == "time":
         return {"ok": True, "action": "time", "say": time.strftime("Ippo mani %I:%M %p, %A %d %B")}
     if action in ("weather", "news", "remind"):
@@ -192,6 +256,8 @@ ROUTES: list[tuple[str, str, object]] = [
     (r"\b(?:previous|prev|munnadi)\s+(?:song|track|paattu|pattu)\b", "media", ["previous"]),
     (r"\b(?:pause|stop)\s+(?:song|music|paattu|pattu)\b|\b(?:song|music|paattu|pattu)\s+(?:pause|stop|niruthu)\w*", "media", ["pause"]),
     (r"\b(?:play|podu)\s+(?:song|music|paattu|pattu)\b|\b(?:song|music|paattu|pattu)\s+(?:play|podu)\w*", "media", ["play"]),
+    (r"\b(?:read|padi|padikka|paaru|paar|sollu)\b.{0,12}\bscreen\b|\bscreen\b.{0,16}\b(?:padi|padikka|read|enna irukku|enna iruku|la enna)\b"
+     r"|\bwhat(?:'s| is) on (?:my |the )?screen\b|\bidha padi\b|\bidhai padi\b", "read-screen", []),
     (r"\bscreen\s*shot\b|\bscreenshot\b", "screenshot", []),
     (r"\block\s+(?:the\s+)?(?:screen|mac|laptop|system)\b|\b(?:screen|mac|laptop)\s+lock\b", "lock", []),
     (r"\bbattery\b|\bcharge\s+(?:evlo|enna|how much)\b", "battery", []),
@@ -245,6 +311,7 @@ def route(text: str) -> dict:
 REPLIES = {"open-folder": "{0} folder open panniten.", "open-app": "{0} open panniten.", "quit-app": "{0} close panniten.", "open-url": "{0} open panniten.",
            "search-web": "Google la '{0}' search panniten.", "volume": "Volume {0}.", "media": "Music {0}.",
            "screenshot": "Screenshot eduthuten, Desktop la irukku.", "lock": "Screen lock panniten.",
+           "read-screen": "Screen padichiten.",
            "dark-mode": "Dark mode {0}.", "notify": "Notification potten."}
 
 
@@ -279,6 +346,9 @@ def selftest() -> int:
         "news feed component la bug fix pannu": (None, None), "weather app ku api design pannu": (None, None),
         "innaiku news enna": ("news", []), "weather eppadi": ("weather", []), "mazhai varuma": ("weather", []),
         "downloads folder open pannu": ("open-folder", ["downloads"]), "desktop folder": ("open-folder", ["desktop"]),
+        "screen la enna irukku": ("read-screen", []), "read my screen": ("read-screen", []), "idha padi": ("read-screen", []),
+        "screen padi": ("read-screen", []), "what's on my screen": ("read-screen", []),
+        "screen recording app ku api design pannu": (None, None),
         "remind me in 10 minutes to call amma": ("remind", ["10m", "call amma"]),
         "20 nimisham la tea kudikka remind pannu": ("remind", ["20m", "tea kudikka"]),
         "2 mani neram kalichu client ku call pannanum nu nyabagapaduthu": ("remind", ["2h", "client ku call pannanum"]),
@@ -298,6 +368,8 @@ def selftest() -> int:
     assert d["handled"] and d["say"] == "chrome open panniten." and d["dry_run"], d
     assert do("time enna")["say"].startswith("Ippo mani")
     assert do("write a poem") == {"handled": False}
+    rs = do("screen la enna irukku")
+    assert rs["handled"] and rs["dry_run"] and rs["would_run"][0][0] == "screencapture", rs
     assert do("downloads folder open pannu")["would_run"] == [["open", os.path.expanduser("~/Downloads")]]
     import tempfile
     os.environ["DD_HOME"] = tempfile.mkdtemp(prefix="dd-mac-")

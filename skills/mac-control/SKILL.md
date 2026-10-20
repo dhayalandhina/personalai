@@ -22,6 +22,7 @@ python3 scripts/mac.py media play | pause | next | previous      # Spotify if ru
 python3 scripts/mac.py notify "Build mudinjiduchu"
 python3 scripts/mac.py time | battery | wifi | apps
 python3 scripts/mac.py screenshot [--out ~/Desktop/shot.png]
+python3 scripts/mac.py read-screen                                # screenshot + Apple Vision OCR (built-in): JSON {lines, text, say}
 python3 scripts/mac.py lock
 python3 scripts/mac.py dark-mode on | off | toggle
 python3 scripts/mac.py clipboard get | set "text"
@@ -36,6 +37,7 @@ python3 scripts/mac.py route "chrome open pannu"                  # fast router:
 
 Examples it understands: "chrome open pannu", "downloads folder", "volume 30", "adutha paattu", "innaiku weather enna", "innaiku news", "20 nimisham la tea kudikka remind pannu", "remind me in 2 hours to call client", "mani enna".
 Weather/news/reminder routes only fire on clear phrasing, so coding requests like "news feed component fix pannu" still go to the LLM.
+"screen la enna irukku" / "read my screen" / "idha padi" → `read-screen`: a screenshot is OCR'd with Apple Vision through built-in JXA (tesseract as fallback), the text comes back for dd to summarise or act on (needs Screen Recording permission for dd once).
 Spelled-out numbers from voice transcripts work too ("remind me in ten minutes …", "twenty five minutes", "an hour").
 On the cloud server (`DD_HOST=server`) this skill is hidden from the model and `do` only handles time / weather / news / remind — dd says it can't control the Mac from there.
 

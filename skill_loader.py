@@ -257,12 +257,13 @@ class SkillLibrary:
                 "name": "mac_action",
                 "description": "Do something on the Mac: open-app/quit-app (args: [app name]), open-url ([url]), "
                                "search-web ([query]), volume ([0-100|up|down|mute|unmute]), media ([play|pause|next|previous]), "
-                               "notify ([text]), time, battery, wifi, apps, screenshot, lock, dark-mode ([on|off|toggle]), "
+                               "notify ([text]), time, battery, wifi, apps, screenshot, read-screen (returns the text on screen), "
+                               "lock, dark-mode ([on|off|toggle]), "
                                "clipboard ([get] or [set, text]).",
                 "parameters": {"type": "object", "required": ["action"],
                                "properties": {"action": {"type": "string", "enum": [
                                    "open-app", "quit-app", "open-url", "search-web", "volume", "media", "notify", "time",
-                                   "battery", "wifi", "apps", "screenshot", "lock", "dark-mode", "clipboard"]},
+                                   "battery", "wifi", "apps", "screenshot", "read-screen", "lock", "dark-mode", "clipboard"]},
                                    "args": {"type": "array", "items": {"type": "string"}}}}}},
             {"type": "function", "function": {
                 "name": "list_skills",
