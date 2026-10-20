@@ -804,6 +804,7 @@ class Listener:
         if self.clock() >= self.tentative_until:  # (a confirmed candidate keeps what it captured meanwhile)
             self.seg.reset()
             self.seg.pre.clear()
+            self.seg.pre.extend(list(self.recent)[-self.seg.pre.maxlen:])  # "hey jarvis chrome open pannu" in one go
         self.tentative_until = 0.0
         self.armed_until = self.clock() + self.followup_s
         self.set_state("recording")
@@ -932,11 +933,11 @@ class Listener:
                     and self.clock() >= self.tentative_until:
                 if self.state == "recording":
                     self.set_state("listening")
-                if self.woke_at and not self.wake_answered:  # armed, but no command came: a false wake
+                if self.woke_at and not self.wake_answered:  # armed, but no command came
                     self.wake_answered = True
                     head = getattr(self.wake, "dd", None)
-                    if head is not None and getattr(self.wake, "last_word", "") == "dd":
-                        head.false_wake(self.clock())
+                    if head is not None and getattr(self.wake, "last_word", "") == "dd" and not self.verify:
+                        head.false_wake(self.clock())  # unconfirmed head wakes only; confirmed ones were real
                         self.log(f"  (dd wake with no command — threshold now {head.threshold:.2f})")
                 if e < self.seg.threshold():  # learn the room's quiet level only (never from speech/media)
                     self.seg._idle_level(e)
@@ -952,6 +953,9 @@ class Listener:
         running so a command said in the same breath is not lost. on_wake() runs only if Whisper agrees."""
         pcm = b"".join(self.recent)
         self.tentative_until = self.clock() + 2.5
+        self.seg.reset()
+        self.seg.pre.clear()
+        self.seg.pre.extend(list(self.recent)[-self.seg.pre.maxlen:])  # a command in the same breath starts right now
         self.log(f"  wake? dd candidate ({score:.2f}) — confirming")
         job = ("verify", pcm, score)
         if self.inline:
