@@ -567,12 +567,64 @@ def build_oww_model(folder: str):
         return Model(**second)
 
 
+DD_HEAD_FILE = os.environ.get("DD_WAKE_DD_MODEL") or str(dd.ROOT / "skills" / "voice" / "assets" / "wake_dd.npz")
+
+
+class DDHead:
+    """'dee dee' wake word: a tiny classifier (one hidden layer, numpy) on the same openWakeWord embeddings the
+    hey-jarvis model reads — trained from thousands of synthetic voices by skills/voice/scripts/wakeword_train.py.
+    Fires only when two consecutive 80 ms chunks agree; a wake that is never followed by a command raises its
+    own threshold a little (false-wake learning), so a noisy room cannot keep triggering it."""
+
+    def __init__(self, path: str = DD_HEAD_FILE, threshold: float | None = None):
+        import numpy as np
+        z = np.load(path)
+        self.mu, self.sd = z["mu"], z["sd"]
+        self.w1, self.b1, self.w2, self.b2 = z["w1"], z["b1"], z["w2"], z["b2"]
+        self.T = int(z["T"])
+        self.threshold = float(os.environ.get("DD_WAKE_DD_THRESHOLD", "0.9")) if threshold is None else threshold
+        self.base_threshold = self.threshold
+        self.streak = 0
+        self.last_score = 0.0
+        self.false_wakes: deque[float] = deque(maxlen=20)
+
+    def score(self, feats) -> float:
+        import numpy as np
+        x = (np.asarray(feats, dtype=np.float32).reshape(1, -1) - self.mu) / self.sd
+        h = np.maximum(0.0, x @ self.w1 + self.b1)
+        o = float((h @ self.w2 + self.b2)[0, 0])
+        return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, o))))
+
+    def step(self, feats) -> float | None:
+        """Score one chunk's embedding window; the score when it fires (2 chunks in a row above threshold)."""
+        s = self.score(feats)
+        self.last_score = s
+        self.streak = self.streak + 1 if s >= self.threshold else 0
+        if self.streak >= 2:
+            self.streak = 0
+            return s
+        return None
+
+    def false_wake(self, now: float) -> None:
+        """Called when a wake was followed by no command: three of those within 10 min nudge the threshold up."""
+        self.false_wakes.append(now)
+        recent = [t for t in self.false_wakes if now - t < 600]
+        if len(recent) >= 3 and self.threshold < 0.985:
+            self.threshold = min(0.985, self.threshold + 0.02)
+            self.false_wakes.clear()
+
+    def good_wake(self) -> None:
+        """A wake followed by a real command: relax halfway back towards the base threshold."""
+        self.threshold = max(self.base_threshold, self.threshold - 0.01)
+
+
 class WakeDetector:
-    """openWakeWord 'hey jarvis' (ONNX model). 80 ms chunks, ~3% of one CPU core, ignores speech that
-    isn't the wake phrase — so the mic can stay open next to a video without transcribing it."""
+    """openWakeWord 'hey jarvis' (ONNX model) + the 'dee dee' head when its weights exist. 80 ms chunks, ~3% of one
+    CPU core, ignores speech that isn't a wake phrase — so the mic can stay open next to a video without
+    transcribing it."""
     CHUNK = 1280 * 2  # bytes = 80 ms of 16 kHz int16
 
-    def __init__(self, threshold: float | None = None, log=print):
+    def __init__(self, threshold: float | None = None, log=print, dd_head: DDHead | None | bool = None):
         import warnings
         warnings.filterwarnings("ignore", message=".*ExecutionProvider.*")
         folder = oww_model_dir()
@@ -582,9 +634,18 @@ class WakeDetector:
         self.buf = b""
         self.cooldown = 0
         self.last_score = 0.0
+        self.last_word = ""
+        if dd_head is None:
+            dd_head = None
+            if os.environ.get("DD_WAKE_DD", "1") != "0" and os.path.isfile(DD_HEAD_FILE):
+                try:
+                    dd_head = DDHead()
+                except Exception as e:
+                    log(f"  (dd wake head not loaded: {str(e)[:100]})")
+        self.dd = dd_head or None
 
     def feed(self, frame: bytes) -> float | None:
-        """Returns the score when the wake phrase was just heard, else None."""
+        """Returns the score when a wake phrase was just heard, else None (self.last_word says which one)."""
         import numpy as np
         self.buf += frame
         if len(self.buf) < self.CHUNK:
@@ -593,13 +654,22 @@ class WakeDetector:
         scores = self.model.predict(np.frombuffer(chunk, dtype=np.int16))
         s = max(scores.values()) if scores else 0.0
         self.last_score = s
+        d = None
+        if self.dd is not None:
+            try:
+                d = self.dd.step(self.model.preprocessor.get_features(self.dd.T))
+            except Exception:
+                d = None
         if self.cooldown > 0:
             self.cooldown -= 1
             return None
-        if s >= self.threshold:
+        if s >= self.threshold or d is not None:
+            self.last_word = "hey jarvis" if s >= self.threshold else "dd"
             self.model.reset()
+            if self.dd is not None:
+                self.dd.streak = 0
             self.cooldown = 20  # 1.6 s: one trigger per wake
-            return s
+            return s if s >= self.threshold else d
         return None
 
 
@@ -645,6 +715,7 @@ class Listener:
         self.tail = 0            # frames still to drop after dd finished speaking (its own echo)
         self.speaking = False
         self.pending_wake = False  # a wake heard while dd spoke (barge-in): armed as soon as it is quiet
+        self.wake_answered = True  # False between a wake and its command (false-wake learning for the dd head)
         self.stop_speak_fn = stop_speak or default_stop_speaking
         self.zero_run = 0        # consecutive all-zero frames (mic blocked -> digital silence)
         self.problem_sent = False
@@ -706,12 +777,14 @@ class Listener:
             self.log(f"  (could not stop speaking: {e})")
 
     def on_wake(self, score: float) -> None:
-        """'hey jarvis' detected: short sound (without pausing the mic), then the next utterance is the command."""
-        self.log(f"  wake: hey jarvis ({score:.2f})")
+        """A wake phrase was detected: short sound (without pausing the mic), then the next utterance is the command."""
+        word = getattr(self.wake, "last_word", "") or "hey jarvis"
+        self.log(f"  wake: {word} ({score:.2f})")
         self._last_activity = self.woke_at = self.clock()
         self.last_command = ""
-        self.last_heard = "hey jarvis ✓"
-        self.on_heard("hey jarvis", 0.0)
+        self.last_heard = f"{word} ✓"
+        self.wake_answered = False
+        self.on_heard(word, 0.0)
         self.ack(sound_only=True)
         self.seg.reset()
         self.seg.pre.clear()
@@ -766,6 +839,11 @@ class Listener:
         command = cmd if woke else text
         self.armed_until = 0.0
         self.last_command = command
+        if not self.wake_answered:
+            self.wake_answered = True
+            head = getattr(self.wake, "dd", None)
+            if head is not None and getattr(self.wake, "last_word", "") == "dd":
+                head.good_wake()
         if woke or armed:
             self.ack(sound_only=True)  # "heard you" — instant, before the action or the model
         self.set_state("thinking")
@@ -832,6 +910,12 @@ class Listener:
             if self.clock() >= self.armed_until and self.clock() >= self.followup_until:
                 if self.state == "recording":
                     self.set_state("listening")
+                if self.woke_at and not self.wake_answered:  # armed, but no command came: a false wake
+                    self.wake_answered = True
+                    head = getattr(self.wake, "dd", None)
+                    if head is not None and getattr(self.wake, "last_word", "") == "dd":
+                        head.false_wake(self.clock())
+                        self.log(f"  (dd wake with no command — threshold now {head.threshold:.2f})")
                 if e < self.seg.threshold():  # learn the room's quiet level only (never from speech/media)
                     self.seg._idle_level(e)
                 self.seg.reset()
@@ -1179,6 +1263,51 @@ def selftest() -> int:
     for f in _quiet(200):
         lg.feed(f)
     assert lg.state == "listening" and len(gate_stt_calls) == 2
+    # the 'dee dee' head: numpy forward pass, 2-chunk agreement, false-wake learning; and the listener's bookkeeping
+    import tempfile as _tf2
+    import numpy as _np
+    T = 16
+    w1 = _np.zeros((T * 96, 4), dtype=_np.float32); w1[0, 0] = 40.0  # decides on feature[0] alone
+    z = _tf2.mkdtemp(prefix="dd-head-") + "/wake_dd.npz"
+    _np.savez(z, mu=_np.zeros(T * 96, _np.float32), sd=_np.ones(T * 96, _np.float32), w1=w1, b1=_np.zeros(4, _np.float32),
+              w2=_np.array([[1.0], [0], [0], [0]], _np.float32), b2=_np.array([-8.0], _np.float32), T=T)
+    head = DDHead(z, threshold=0.9)
+    hot, cold = _np.zeros((T, 96), _np.float32), _np.zeros((T, 96), _np.float32)
+    hot[0, 0] = 1.0
+    assert head.score(cold) < 0.01 and head.score(hot) > 0.99
+    assert head.step(hot) is None and head.step(cold) is None and head.step(hot) is None and head.step(hot) > 0.99
+    assert head.step(hot) is None, "streak resets after a fire"
+    for t in (0.0, 100.0, 200.0):
+        head.false_wake(t)
+    assert abs(head.threshold - 0.92) < 1e-9, head.threshold
+    head.good_wake(); head.good_wake(); head.good_wake()
+    assert head.threshold == 0.9, "never below the base threshold"
+
+    class FakeHead:
+        threshold = 0.9
+
+        def __init__(self): self.calls = []
+        def false_wake(self, t): self.calls.append(("false", t))
+        def good_wake(self): self.calls.append(("good",))
+    fw.dd, fw.last_word = FakeHead(), "dd"
+    fw.fire_in = 1
+    lg.feed(_quiet(20)[0])
+    assert lg.state == "recording" and lg.last_heard == "dd ✓" and lg.wake_answered is False
+    for f in utterance:  # a command follows: good wake
+        lg.feed(f)
+    assert fw.dd.calls == [("good",)], fw.dd.calls
+    now["t"] += 30
+    for f in _quiet(2000):  # (drains the post-speech tail too)
+        lg.feed(f)
+    fw.fire_in = 1
+    lg.feed(_quiet(20)[0])
+    assert lg.wake_answered is False
+    now["t"] += 30  # nothing said: false wake
+    for f in _quiet(2000):
+        lg.feed(f)
+    assert fw.dd.calls[-1][0] == "false" and lg.wake_answered, fw.dd.calls
+    fw.dd, fw.last_word = None, "hey jarvis"
+
     # barge-in: "hey jarvis" while dd is talking cuts the sentence, then arms as soon as it is quiet
     stops = []
     lg.stop_speak_fn = lambda: stops.append(1) or True
