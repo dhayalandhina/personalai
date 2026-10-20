@@ -99,7 +99,30 @@ def build(action: str, args: list[str]) -> list[list[str]]:
         return [osa(f'tell application "System Events" to tell appearance preferences to set dark mode to {val}')]
     if action == "clipboard":
         return [["pbpaste"]] if a0 != "set" else [["pbcopy"]]
+    if action == "type-text":  # types into whatever has the keyboard focus (form fields, editors, chat boxes)
+        txt = " ".join(args).replace("\\", "\\\\").replace('"', '\\"')
+        return [osa(f'tell application "System Events" to keystroke "{txt}"')]
+    if action == "press-key":  # "enter", "tab", "cmd+s", "shift+tab", "cmd+shift+t"
+        parts = [p.strip().lower() for p in a0.replace("command", "cmd").replace("-", "+").split("+") if p.strip()]
+        key, mods = (parts[-1] if parts else "return"), parts[:-1]
+        using = ", ".join(KEY_MODS[m] for m in mods if m in KEY_MODS)
+        suffix = f" using {{{using}}}" if using else ""
+        if key in KEY_CODES:
+            return [osa(f'tell application "System Events" to key code {KEY_CODES[key]}{suffix}')]
+        return [osa(f'tell application "System Events" to keystroke "{key[:1]}"{suffix}')]
     raise ValueError(f"unknown action '{action}'")
+
+
+KEY_CODES = {"enter": 36, "return": 36, "tab": 48, "escape": 53, "esc": 53, "space": 49, "delete": 51, "backspace": 51,
+             "up": 126, "down": 125, "left": 123, "right": 124, "home": 115, "end": 119, "pageup": 116, "pagedown": 121}
+KEY_MODS = {"cmd": "command down", "shift": "shift down", "alt": "option down", "option": "option down", "ctrl": "control down",
+            "control": "control down"}
+# typing keeps the original text (case, punctuation) — matched on the raw message, before the router normalises it
+TYPE_RE = re.compile(r"(?is)^\s*(?:(?:hey|ok|dd|jarvis)[,\s]+)*(?:idha|idhai|this|intha)?\s*type(?:\s+pannu|\s+this|\s+in|\s+it)?\s*[:,\-]?\s+(.+?)\s*$")
+TYPE_TA_RE = re.compile(r"(?is)^\s*(?:(?:hey|ok|dd|jarvis)[,\s]+)*(.+?)\s+(?:nu|nnu|-nu|endru)\s+type\s+pann\w*\s*$")
+COMBO = r"(?:cmd|command|ctrl|control|shift|alt|option)(?:\s*\+\s*\w+)+"
+PRESS_RE = re.compile(rf"(?i)\b(?:press|adi|thattu|hit)\s+(enter|return|tab|escape|esc|space|delete|backspace|up|down|left|right|{COMBO})\b"
+                      rf"|\b(enter|return|tab|escape|esc|space|delete|backspace|{COMBO})\s+(?:key\s+)?(?:press|adi|thattu|podu)\w*")
 
 
 SKILLS = Path(__file__).resolve().parents[2]
@@ -281,6 +304,13 @@ _NUM_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, _NUM_WORDS), key=le
 
 
 def route(text: str) -> dict:
+    m = TYPE_RE.match(text) or TYPE_TA_RE.match(text)
+    if m and len(m.group(1)) <= 2000:
+        return {"action": "type-text", "args": [m.group(1)]}
+    m = PRESS_RE.search(text)
+    if m:
+        key = (m.group(1) or m.group(2)).lower().replace(" ", "")
+        return {"action": "press-key", "args": [key]}
     t = re.sub(r"[^\w\s\-.']", " ", text.lower()).strip()
     t = re.sub(r"\s+", " ", t)
     t = _NUM_RE.sub(lambda m: str(_NUM_WORDS[m.group(1)]), t)
@@ -312,7 +342,8 @@ REPLIES = {"open-folder": "{0} folder open panniten.", "open-app": "{0} open pan
            "search-web": "Google la '{0}' search panniten.", "volume": "Volume {0}.", "media": "Music {0}.",
            "screenshot": "Screenshot eduthuten, Desktop la irukku.", "lock": "Screen lock panniten.",
            "read-screen": "Screen padichiten.",
-           "dark-mode": "Dark mode {0}.", "notify": "Notification potten."}
+           "dark-mode": "Dark mode {0}.", "notify": "Notification potten.", "type-text": "Type panniten.",
+           "press-key": "{0} press panniten."}
 
 
 def do(text: str) -> dict:
@@ -355,6 +386,11 @@ def selftest() -> int:
         "Remind me in ten minutes to call the client.": ("remind", ["10m", "call the client"]),
         "remind me in twenty five minutes to stretch": ("remind", ["25m", "stretch"]),
         "remind me in an hour to call a friend": ("remind", ["1h", "call a friend"]),
+        "type pannu: Hello Dhina, invoice attached.": ("type-text", ["Hello Dhina, invoice attached."]),
+        "Jarvis, type this: dhayalandhina355@gmail.com": ("type-text", ["dhayalandhina355@gmail.com"]),
+        "Vanakkam sir nu type pannu": ("type-text", ["Vanakkam sir"]),
+        "press enter": ("press-key", ["enter"]), "tab press pannu": ("press-key", ["tab"]), "cmd + s adi": ("press-key", ["cmd+s"]),
+        "what type of database is best": (None, None),
     }
     for text, (action, args) in cases.items():
         r = route(text)
@@ -364,6 +400,10 @@ def selftest() -> int:
     assert build("open-app", ["chrome"]) == [["open", "-a", "Google Chrome"]]
     assert build("volume", ["150"])[0][-1].endswith("volume 100")
     assert build("open-url", ["github.com"]) == [["open", "https://github.com"]]
+    assert build("type-text", ['say "hi"'])[0][-1] == 'tell application "System Events" to keystroke "say \\"hi\\""'
+    assert build("press-key", ["enter"])[0][-1].endswith("key code 36")
+    assert build("press-key", ["cmd+shift+t"])[0][-1].endswith('keystroke "t" using {command down, shift down}')
+    assert do("tab press pannu")["say"] == "tab press panniten." and do("press enter")["would_run"][0][-1].endswith("key code 36")
     d = do("chrome open pannu")
     assert d["handled"] and d["say"] == "chrome open panniten." and d["dry_run"], d
     assert do("time enna")["say"].startswith("Ippo mani")

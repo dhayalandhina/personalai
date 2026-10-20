@@ -260,11 +260,13 @@ class SkillLibrary:
                                "search-web ([query]), volume ([0-100|up|down|mute|unmute]), media ([play|pause|next|previous]), "
                                "notify ([text]), time, battery, wifi, apps, screenshot, read-screen (returns the text on screen), "
                                "lock, dark-mode ([on|off|toggle]), "
-                               "clipboard ([get] or [set, text]).",
+                               "clipboard ([get] or [set, text]), type-text ([text] — types into the focused field/app), "
+                               "press-key ([enter|tab|escape|cmd+s|...]).",
                 "parameters": {"type": "object", "required": ["action"],
                                "properties": {"action": {"type": "string", "enum": [
                                    "open-app", "quit-app", "open-url", "search-web", "volume", "media", "notify", "time",
-                                   "battery", "wifi", "apps", "screenshot", "read-screen", "lock", "dark-mode", "clipboard"]},
+                                   "battery", "wifi", "apps", "screenshot", "read-screen", "lock", "dark-mode", "clipboard",
+                                   "type-text", "press-key"]},
                                    "args": {"type": "array", "items": {"type": "string"}}}}}},
             {"type": "function", "function": {
                 "name": "list_skills",

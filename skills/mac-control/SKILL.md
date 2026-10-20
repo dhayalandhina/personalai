@@ -11,6 +11,8 @@ metadata:
 
 All actions use built-in macOS tools (`open`, `osascript`, `screencapture`, `pmset`, `pbcopy`) — no installs, zero cost.
 
+**Typing**: `type-text [text]` types into whatever has keyboard focus (form fields, editors, chat boxes) — router: "type pannu: Hello sir", "Vanakkam sir nu type pannu", "type this: …"; `press-key [enter|tab|escape|cmd+s|shift+tab…]` — "press enter", "tab press pannu", "cmd + s adi". Needs Accessibility/Automation permission for dd (macOS asks once).
+
 ## Commands
 ```bash
 python3 scripts/mac.py open-app "Google Chrome"
