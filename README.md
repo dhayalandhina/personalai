@@ -8,6 +8,7 @@ dd-skills/
 ├── test_skills.py         # validates all 26 skills + runs 36 selftests (run after every change)
 ├── examples/dd_loop_ollama.py   # minimal agent loop: rules check → memory recall → tool calls → log
 ├── examples/dd_telegram.py      # Telegram bot runner (text + voice notes, reminders) — the cloud server mode
+├── examples/dd_chat.py          # Mac chat window (Tkinter); examples/dd_app.py = menu-bar app around it
 ├── install.sh             # pip deps, ~/.dd layout, rules lock, briefing config
 ├── requirements.txt
 └── skills/
@@ -80,6 +81,14 @@ python3 examples/dd_jarvis.py --text        # type, dd speaks back
 ```
 Mic via ffmpeg, speech-to-text via faster-whisper (local), brain = same dd agent loop + skills, voice via macOS `say` (Piper/espeak elsewhere). First run asks macOS for microphone permission for your terminal app.
 
+## Mac app (menu bar + chat window)
+A real app instead of the Terminal — same dd loop + mac-control underneath, so no new power over the Mac and irreversible actions still ask first.
+```bash
+python3 examples/dd_chat.py                 # chat window: type or press 🎤, dd replies and acts (zero install)
+pip3 install rumps && python3 examples/dd_app.py   # 🤖 in the menu bar: Open chat · Voice · Status · Quit; fires reminders
+```
+The window is pure Tkinter (needs `python-tk` on Homebrew Python). The menu-bar app opens the same window, toggles hands-free JARVIS, and keeps delivering reminders as macOS notifications while it sits in the bar.
+
 ## Use from any agent
 - **dd's own loop (Ollama / llama.cpp)**: see `examples/dd_loop_ollama.py` — `SkillLibrary.index_prompt()` in the system prompt, `tool_schemas()` as tools, `dispatch()` for calls.
 - **Claude Code / Claude Agent SDK**: copy or symlink `skills/*` into `.claude/skills/` — the format is identical; skills appear as slash commands and load on trigger.
@@ -92,4 +101,4 @@ Mic via ffmpeg, speech-to-text via faster-whisper (local), brain = same dd agent
 - Nothing here edits the locked rules. Learned preferences lose to rules on conflict.
 
 ## Status
-Validated on 19 Oct 2026: 26 skills, 36 scripts, all selftests passing (`test_skills.py`), plus `examples/*.py --selftest` (agent loop, JARVIS, daemon, Telegram bot) and a full `cloud_setup.sh install` run on Ubuntu 24.04 (systemd/Ollama stubbed). Live ComfyUI / Ollama / Telegram / IMAP paths need those services on your machine; their scripts fail gracefully with the install line when absent.
+Validated on 20 Oct 2026: 26 skills, 36 scripts, all selftests passing (`test_skills.py`), plus `examples/*.py --selftest` (agent loop, JARVIS, daemon, Telegram bot, chat window, menu-bar app) and a full hardened `cloud_setup.sh install` emulated on Ubuntu 24.04 (root-owned secrets, separate pairing user, metadata firewall; systemd/Ollama stubbed). Live ComfyUI / Ollama / Telegram / IMAP paths need those services on your machine; their scripts fail gracefully with the install line when absent.

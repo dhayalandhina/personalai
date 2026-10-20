@@ -9,6 +9,7 @@ matplotlib>=3.9
 pillow>=10.0
 playwright>=1.45
 # optional (install when you use the skill):
-# faster-whisper, piper-tts            -> voice
+# faster-whisper, piper-tts            -> voice (and the chat window's 🎤 / menu-bar Voice toggle)
+# rumps                                 -> the macOS menu-bar app (examples/dd_app.py); the chat window needs nothing
 # torch, diffusers, transformers, accelerate, imageio, imageio-ffmpeg -> diffusers backends
 # rembg                                 -> image background removal
