@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import os
+import platform
 import subprocess
 import sys
 import threading
@@ -37,7 +38,22 @@ def _load_env() -> None:
             os.environ.setdefault(k.strip(), v.strip().strip('"\''))
 
 
+def _self_heal_exec_bits() -> None:
+    """Files that arrive through a synced folder can lose their executable flag, and macOS refuses to open
+    dd.app without it. Whenever dd's own code runs on the Mac, put the flag back on dd's own launchers."""
+    if platform.system() != "Darwin":
+        return
+    for rel in ("dd.app/Contents/MacOS/dd", "install_app.sh", "install.sh"):
+        p = ROOT / rel
+        try:
+            if p.is_file() and not os.access(p, os.X_OK):
+                p.chmod(p.stat().st_mode | 0o755)
+        except OSError:
+            pass
+
+
 _load_env()
+_self_heal_exec_bits()
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 MODEL = os.environ.get("DD_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
 SERVER = os.environ.get("DD_HOST") == "server"  # running on the cloud server, reached via Telegram
