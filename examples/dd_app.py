@@ -142,17 +142,23 @@ class AppCore:
         return f"Heard: {heard}\nmic peak {r.get('peak')}, speech starts above {r.get('threshold')}{tip}"
 
     def update(self) -> tuple[bool, str]:
-        """git pull --ff-only in the dd folder. (changed, message)"""
+        """git pull --ff-only in the dd folder, then compare with the code this process is running: a restart is
+        due whenever HEAD moved — also when the folder was updated some other way while GitHub was unreachable."""
         repo = dd.ROOT
-        before = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
-        r = subprocess.run(["git", "-C", str(repo), "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=10",
-                            "pull", "--ff-only", "-q"], capture_output=True, text=True, timeout=60)
+        running = RUNNING_COMMIT or subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+                                                   capture_output=True, text=True).stdout.strip()
+        try:
+            r = subprocess.run(["git", "-C", str(repo), "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=10",
+                                "pull", "--ff-only", "-q"], capture_output=True, text=True, timeout=60)
+            err = "" if r.returncode == 0 else (r.stderr or r.stdout).strip()[-200:]
+        except subprocess.TimeoutExpired:
+            err = "git pull timed out"
         after = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
-        if r.returncode != 0:
-            return False, f"update aagala: {(r.stderr or r.stdout).strip()[-200:]}"
-        if before == after:
-            return False, f"already latest ({after})"
-        return True, f"updated {before} → {after} — dd restart aagudhu"
+        if after and after != running[:len(after)]:
+            return True, f"updated {running[:7]} → {after} — dd restart aagudhu" + (f" (pull: {err})" if err else "")
+        if err:
+            return False, f"update aagala: {err}"
+        return False, f"already latest ({after})"
 
     def relaunch(self) -> None:
         """Quit and reopen (macOS): a detached shell reopens the app after we exit."""
@@ -254,16 +260,24 @@ def run_menu_bar(core: AppCore) -> int:
     return 0
 
 
+RUNNING_COMMIT = ""  # the commit this process started from (auto_update sets it)
+
+
 def auto_update() -> bool:
     """At launch: fast-forward the dd code (bounded). True when it changed (caller re-execs so the new code runs)."""
-    if os.environ.get("DD_NO_UPDATE") == "1" or not (dd.ROOT / ".git").is_dir():
+    global RUNNING_COMMIT
+    if not (dd.ROOT / ".git").is_dir():
         return False
     try:
         git = ["git", "-C", str(dd.ROOT)]
         before = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        if os.environ.get("DD_NO_UPDATE") == "1":
+            RUNNING_COMMIT = before
+            return False
         subprocess.run(git + ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=10", "pull", "--ff-only", "-q"],
                        capture_output=True, text=True, timeout=40)
         after = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, timeout=10).stdout.strip()
+        RUNNING_COMMIT = after
         print(f"code: {after[:7]}" + (" (updated)" if after != before else ""), flush=True)
         return bool(before) and after != before
     except Exception as e:
