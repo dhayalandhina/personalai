@@ -43,7 +43,7 @@ def _self_heal_exec_bits() -> None:
     dd.app without it. Whenever dd's own code runs on the Mac, put the flag back on dd's own launchers."""
     if platform.system() != "Darwin":
         return
-    for rel in ("dd.app/Contents/MacOS/dd", "install_app.sh", "install.sh"):
+    for rel in ("macapp/launcher.sh", "install_app.sh", "install.sh"):
         p = ROOT / rel
         try:
             if p.is_file() and not os.access(p, os.X_OK):

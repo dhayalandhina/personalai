@@ -8,7 +8,7 @@ dd-skills/
 ├── test_skills.py         # validates all 26 skills + runs 36 selftests (run after every change)
 ├── examples/dd_loop_ollama.py   # minimal agent loop: rules check → memory recall → tool calls → log
 ├── examples/dd_telegram.py      # Telegram bot runner (text + voice notes, reminders) — the cloud server mode
-├── dd.app + install_app.sh      # the Mac app: menu bar, always listening (examples/dd_app.py + dd_listen.py)
+├── install_app.sh + macapp/     # builds the Mac app (native applet): menu bar, always listening (dd_app.py + dd_listen.py)
 ├── examples/dd_chat.py          # Mac chat window (Tkinter), opened from the menu bar
 ├── install.sh             # pip deps, ~/.dd layout, rules lock, briefing config
 ├── requirements.txt
@@ -83,7 +83,7 @@ python3 examples/dd_jarvis.py --text        # type, dd speaks back
 Mic via ffmpeg, speech-to-text via faster-whisper (local), brain = same dd agent loop + skills, voice via macOS `say` (Piper/espeak elsewhere). First run asks macOS for microphone permission for your terminal app.
 
 ## Mac app (menu bar, always listening)
-Finder → `personalai` folder → double-click **dd.app** (first run sets itself up, 1–3 min). Or install it properly so it starts at login:
+One command builds **dd.app** natively on your Mac (AppleScript applet via `osacompile` — so it runs natively on Apple silicon and macOS asks Microphone permission for "dd"), installs the deps, and starts it at login:
 ```bash
 bash install_app.sh install          # → ~/Applications/dd.app + Login Item; uninstall: bash install_app.sh uninstall
 ```
