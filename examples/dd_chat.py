@@ -123,6 +123,8 @@ def run_window() -> int:
 
     def set_busy(on: bool) -> None:
         busy["on"] = on
+        if not on:
+            busy["token"] = None
         send_btn.configure(state="disabled" if on else "normal", text="…" if on else "Send")
         mic_btn.configure(state="disabled" if on else "normal")
 
@@ -130,7 +132,8 @@ def run_window() -> int:
         if prefix:
             add("you", prefix, "you")
         add("dd", reply, "dd")
-        speak(reply)
+        if reply and not reply.startswith(("Error:", "Brain ready illa", "Rules file", "(reply")):
+            speak(reply)
         set_busy(False)
 
     def do_send(_evt=None) -> None:
@@ -142,7 +145,25 @@ def run_window() -> int:
         entry.delete(0, "end")
         add("you", text, "you")
         set_busy(True)
-        threading.Thread(target=lambda: root.after(0, deliver, "", core.send(text)), daemon=True).start()
+        add("sys", "yosikkiren…", "sys")
+        token = object()
+        busy["token"] = token
+
+        def work():
+            try:
+                reply = core.send(text)
+            except Exception as e:  # never leave the window stuck silently
+                import traceback
+                traceback.print_exc()
+                reply = f"Error: {type(e).__name__}: {str(e)[:200]}"
+            root.after(0, deliver, "", reply or "(reply kaali)")
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def slow_hint():
+            if busy["on"] and busy.get("token") is token:
+                add("sys", "(innum yosikkiren — model cold-a irundha first reply slow; Ollama up-a paaru)", "sys")
+        root.after(45000, slow_hint)
 
     def do_voice() -> None:
         if busy["on"]:
@@ -170,6 +191,8 @@ def run_window() -> int:
     else:
         problem = core.ready()
         add("sys", "dd ready." if not problem else f"dd ready (brain: {problem})", "sys")
+        if not problem:
+            threading.Thread(target=dd.warm, daemon=True).start()  # load the model now so the first reply is fast
         dd.start_reminder_watcher(on_fire=lambda t: root.after(0, add, "dd", "⏰ " + t, "dd"))
     root.mainloop()
     return 0

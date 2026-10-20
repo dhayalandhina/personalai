@@ -33,7 +33,10 @@ import dd_loop_ollama as dd  # noqa: E402  (loads ~/.dd/.env, skills, rules, age
 MAC = platform.system() == "Darwin"
 STT_MODEL = os.environ.get("DD_STT_MODEL", "base")
 STT_LANG = os.environ.get("DD_STT_LANG", "auto")
-WAKE = [w.strip().lower() for w in os.environ.get("DD_WAKE", "jarvis,dd,d d").split(",") if w.strip()]
+# "dd" spoken aloud is often heard by Whisper as "dee dee", "didi", etc. — accept the common mishears.
+# "jarvis" transcribes most reliably, so it stays the first/primary wake word. Override with DD_WAKE.
+WAKE = [w.strip().lower() for w in
+        os.environ.get("DD_WAKE", "jarvis,dd,d d,dee dee,didi,deedee,dee dee dee").split(",") if w.strip()]
 # Biases Whisper toward romanised Thanglish instead of Tamil script for mixed speech.
 THANGLISH_HINT = "Dhina speaking Thanglish: enna pannura, sollu, paaru, innaiku, ollama, github, code fix pannu."
 TMP = Path(tempfile.mkdtemp(prefix="dd-jarvis-"))
@@ -149,18 +152,22 @@ def handle(messages: list[dict], heard: str, mute: bool) -> None:
     messages[:] = [messages[0]] + messages[-20:]
 
 
+CHUNK = float(os.environ.get("DD_WAKE_CHUNK", "3"))   # how often it samples the mic for the wake word
+CMD_SECS = float(os.environ.get("DD_CMD_SECS", "6"))  # how long it records the command after waking
+
+
 def hands_free(messages: list[dict], mute: bool) -> None:
-    print(f"Hands-free: '{WAKE[0].title()} ...' nu sollunga. Ctrl-C to stop.")
+    print(f"Hands-free: '{WAKE[0].title()} ...' nu sollunga (eppovum kekkudhu). Ctrl-C to stop.")
     while True:
-        heard = transcribe(record_seconds(TMP / "chunk.wav", 5))
+        heard = transcribe(record_seconds(TMP / "chunk.wav", CHUNK))
         if not heard:
             continue
         woke, cmd = split_wake(heard)
         if not woke:
             continue
-        if not cmd:
-            speak("Haan Dhina, sollunga.", mute)
-            cmd = transcribe(record_seconds(TMP / "cmd.wav", 8))
+        if not cmd:  # just the wake word -> short beep-ack, then listen for the command
+            speak("Sollu.", mute)
+            cmd = transcribe(record_seconds(TMP / "cmd.wav", CMD_SECS))
         if cmd:
             handle(messages, cmd, mute)
 
@@ -194,7 +201,10 @@ def selftest() -> int:
     assert split_wake("Jarvis, innaiku weather enna?") == (True, "innaiku weather enna?")
     assert split_wake("hey jarvis") == (True, "")
     assert split_wake("dd status kaattu") == (True, "status kaattu")
+    assert split_wake("didi chrome open pannu") == (True, "chrome open pannu")  # common mishear of "dd"
+    assert split_wake("dee dee volume koodu")[1] == "volume koodu"
     assert split_wake("add this file")[0] is False  # 'dd' inside a word must not wake
+    assert split_wake("address check pannu")[0] is False
     assert split_wake("enna news")[0] is False
     s = for_speech("Done ✅ `ls -la`\n```bash\nrm x\n```\nSee https://ollama.com **now**")
     assert "Code screen la" in s and "link screen la" in s and "```" not in s and "**" not in s, s
@@ -241,6 +251,10 @@ def main(argv: list[str]) -> int:
                  "\n\nVOICE MODE: your reply is spoken aloud. 1-2 short sentences, no tables, no lists; "
                  "put code only when asked (it is shown, not read)."}]
     print(f"JARVIS mode — dd ({dd.MODEL}), STT whisper-{STT_MODEL}, TTS {'say' if MAC else 'piper/espeak'}")
+    if not typed:
+        print("  loading voice + model (one-time, so replies are fast)...")
+        transcribe(record_seconds(TMP / "warm.wav", 0.4))  # load Whisper now, not on the first command
+    dd.warm()  # keep the LLM in RAM so the first real reply is quick
     dd.start_reminder_watcher(lambda text: speak(text, mute))
     speak("Vanakkam Dhina. dd ready.", mute)
     try:

@@ -76,10 +76,11 @@ def boot_system_prompt() -> str:
 
 
 def keep_alive():
-    """DD_KEEP_ALIVE (e.g. -1 on the server) keeps the model loaded between messages; unset = Ollama default."""
+    """How long Ollama keeps the model in RAM between messages, so replies stay fast.
+    DD_KEEP_ALIVE if set (server uses -1 = forever); otherwise default 30m on the Mac so it stays warm."""
     v = os.environ.get("DD_KEEP_ALIVE", "").strip()
     if not v:
-        return None
+        return "30m"
     try:
         return int(v)
     except ValueError:
@@ -88,13 +89,21 @@ def keep_alive():
 
 def chat(messages: list[dict], tools: list[dict], **options) -> dict:
     req_body = {"model": MODEL, "messages": messages, "tools": tools, "stream": False,
+                "keep_alive": keep_alive(),
                 "options": {"temperature": 0.3, "num_ctx": int(os.environ.get("DD_NUM_CTX", "8192")), **options}}
-    if keep_alive() is not None:
-        req_body["keep_alive"] = keep_alive()
     body = json.dumps(req_body).encode()
     req = urllib.request.Request(f"{OLLAMA}/api/chat", data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
         return json.loads(r.read().decode())["message"]
+
+
+def warm() -> bool:
+    """Load the model into RAM once (and keep it warm) so the first real reply is fast. Best effort."""
+    try:
+        chat([{"role": "user", "content": "hi"}], [], num_predict=1)
+        return True
+    except Exception:
+        return False
 
 
 def fast_action(user_text: str) -> str | None:
