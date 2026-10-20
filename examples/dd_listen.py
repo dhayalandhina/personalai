@@ -613,7 +613,7 @@ class DDHead:
         self.mu, self.sd = z["mu"], z["sd"]
         self.w1, self.b1, self.w2, self.b2 = z["w1"], z["b1"], z["w2"], z["b2"]
         self.T = int(z["T"])
-        self.threshold = float(os.environ.get("DD_WAKE_DD_THRESHOLD", "0.75")) if threshold is None else threshold
+        self.threshold = float(os.environ.get("DD_WAKE_DD_THRESHOLD", "0.8")) if threshold is None else threshold
         self.base_threshold = self.threshold
         self.streak = 0
         self.last_score = 0.0
