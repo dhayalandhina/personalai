@@ -273,7 +273,55 @@ def assign_employee(user_text: str) -> str:
     return out if out.startswith("<employee>") else ""
 
 
+FEEDBACK_BAD = re.compile(r"(?i)^\s*(?:no[,.!\s]+)?(wrong|illa|thappu|not correct|incorrect|athu illa|correct answer is|actually it is|actually,?|mistake)\b[\s,:.-]*(.*)$")
+FEEDBACK_GOOD = re.compile(r"(?i)^\s*(super|correct|sari|sariya|nalla irukku|perfect|exactly|right|good|great|nandri|thanks|thank you|well done)\b[\s!.]*$")
+
+
+def feedback_signal(user_text: str) -> tuple[str, str | None] | None:
+    """('good'|'bad', correction) when the message is a reaction to the previous reply, else None.
+    Conservative: short praise, or an explicit 'wrong / correct answer is ...' opener."""
+    t = user_text.strip()
+    if len(t.split()) <= 4 and FEEDBACK_GOOD.match(t):
+        return "good", None
+    m = FEEDBACK_BAD.match(t)
+    if m and len(t) <= 400:
+        correction = m.group(2).strip() or None
+        return "bad", correction
+    return None
+
+
+def record_feedback(user_text: str) -> bool:
+    """Capture Dhina's reaction to the last reply in the learning log (good / bad + correction). Silent."""
+    fb = feedback_signal(user_text)
+    if not fb:
+        return False
+    args = ["feedback", "--last", "--rating", fb[0]] + (["--correction", fb[1]] if fb[1] else [])
+    return bool(run_script("self-learning", "learn.py", args)["ok"])
+
+
+def maybe_daily_learning(now: float | None = None) -> bool:
+    """Once a day: extract standing preferences into memory and refresh the SFT/DPO exports (learn.py daily).
+    Stamp: $DD_HOME/learning/last_daily. Runs in the background; True when it was started."""
+    home = Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "learning"
+    stamp = home / "last_daily"
+    now = time.time() if now is None else now
+    try:
+        if stamp.is_file() and now - float(stamp.read_text().strip() or 0) < 86400:
+            return False
+        home.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(f"{now:.0f}")
+    except (OSError, ValueError):
+        return False
+
+    def job():
+        r = run_script("self-learning", "learn.py", ["daily"])
+        print("learning: daily " + ("done" if r["ok"] else "failed") + " " + (r["stdout"] or r["stderr"]).strip()[:160].replace("\n", " "), flush=True)
+    threading.Thread(target=job, daemon=True, name="dd-learn").start()
+    return True
+
+
 def turn(messages: list[dict], user_text: str, model_fn=chat) -> str:
+    record_feedback(user_text)
     quick = fast_action(user_text)
     if quick:
         messages += [{"role": "user", "content": user_text}, {"role": "assistant", "content": quick}]
@@ -347,6 +395,7 @@ def start_reminder_watcher(on_fire=None, every: int = 30) -> threading.Thread:
         while True:
             try:
                 check_reminders(on_fire)
+                maybe_daily_learning()
             except Exception as e:  # never kill the chat because of a reminder
                 print(f"\n(reminder check failed: {e})")
             time.sleep(every)
@@ -450,7 +499,29 @@ def selftest() -> int:
         for k in ("GEMINI_API_KEY", "GROQ_API_KEY", "DD_BRAIN", "DD_BRAIN_MODEL"):
             os.environ.pop(k, None)
         os.environ.update(saved)
-    print("dd_loop selftest ok (brain pick, history conversion, fake OpenAI round trip with tool call, 429 cool-down)")
+    # feedback capture + daily learning stamp (isolated DD_HOME)
+    import tempfile
+    saved_home = os.environ.get("DD_HOME")
+    os.environ["DD_HOME"] = tempfile.mkdtemp(prefix="dd-loop-test-")
+    try:
+        assert feedback_signal("super") == ("good", None) and feedback_signal("sari") == ("good", None)
+        assert feedback_signal("wrong, correct answer is 42") == ("bad", "correct answer is 42")
+        assert feedback_signal("illa") == ("bad", None) and feedback_signal("Correct answer is Chennai")[1] == "Chennai"
+        assert feedback_signal("chrome open pannu") is None and feedback_signal("good morning dd, weather enna") is None
+        run_script("self-learning", "learn.py", ["log", "--user", "capital of tn", "--assistant", "Madurai"])
+        assert record_feedback("wrong, correct answer is Chennai") is True
+        st = json.loads(run_script("self-learning", "learn.py", ["stats"])["stdout"] or "{}")
+        assert st.get("bad", 0) == 1 or st.get("corrected", 0) == 1 or st.get("rated", 0) == 1, st
+        assert maybe_daily_learning(now=1000.0) is True and maybe_daily_learning(now=2000.0) is False
+        assert maybe_daily_learning(now=1000.0 + 86401) is True
+        time.sleep(0.5)
+    finally:
+        if saved_home is None:
+            os.environ.pop("DD_HOME", None)
+        else:
+            os.environ["DD_HOME"] = saved_home
+    print("dd_loop selftest ok (brain pick, history conversion, fake OpenAI round trip with tool call, 429 cool-down, "
+          "feedback capture, daily learning stamp)")
     return 0
 
 

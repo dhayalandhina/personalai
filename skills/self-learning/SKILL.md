@@ -18,7 +18,7 @@ python3 scripts/learn.py log --user "<msg>" --assistant "<reply>" --skill web-se
 Appends to `$DD_HOME/learning/interactions.jsonl` with timestamp + id. Secrets are redacted before writing.
 
 ## 2. Feedback (when Dhina reacts)
-Signals: "wrong", "illa", "correct answer is…", "super", "ithu than", 👍/👎, or he pastes a fixed version.
+Signals: "wrong", "illa", "correct answer is…", "super", "ithu than", 👍/👎, or he pastes a fixed version. The agent loop (`dd_loop_ollama.turn`) captures short reactions automatically — "super"/"sari" → good, "wrong"/"illa"/"correct answer is …" → bad + correction — before answering.
 ```bash
 python3 scripts/learn.py feedback --id 17 --rating bad --correction "<the right answer / fixed code>"
 python3 scripts/learn.py feedback --last --rating good
@@ -26,6 +26,7 @@ python3 scripts/learn.py feedback --last --rating good
 A correction becomes the preferred target for that prompt; dd's original becomes the rejected one.
 
 ## 3. Extract preferences (nightly, or when he says "from now on / always / never")
+The running app/bot does `learn.py daily` by itself once every 24 h (stamp `$DD_HOME/learning/last_daily`); the cron below is only needed for a bare CLI setup.
 ```bash
 python3 scripts/learn.py extract            # proposes [{key, content, evidence}] as JSON
 python3 scripts/learn.py extract --apply    # writes them to memory as kind=preference
