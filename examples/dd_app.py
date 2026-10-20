@@ -49,6 +49,9 @@ class AppCore:
         self.test_result: dict | None = None
         self.problems: list[str] = []
         self.thread: threading.Thread | None = None
+        self.hud = None                      # dd_hud.Hud when the on-screen panel could be created
+        self._seen_wake, self._seen_said = 0.0, ""
+        self._update_check = 0.0
 
     # ----- listener wiring -----
     def start(self) -> None:
@@ -68,8 +71,41 @@ class AppCore:
     def problem(self, msg: str) -> None:
         self.problems.append(msg)
         notify(msg)
+        if self.hud is not None:
+            self.hud.report(msg)
         if "Microphone" in msg or "mic" in msg.lower():
             dd_listen.open_mic_settings()
+
+    def events(self) -> list[tuple[str, str]]:
+        """What changed since the last poll: ('wake', '') when 'hey jarvis' was just heard, ('said', text) when
+        dd spoke. Without the on-screen panel these become notifications, so you always know it heard you."""
+        out = []
+        lis = self.listener
+        if lis.woke_at != self._seen_wake:
+            self._seen_wake = lis.woke_at
+            if lis.woke_at:
+                out.append(("wake", ""))
+        if lis.last_said != self._seen_said:
+            self._seen_said = lis.last_said
+            if lis.last_said:
+                out.append(("said", lis.last_said))
+        return out
+
+    def update_requested(self) -> bool:
+        """True once when someone asked for an update by touching <repo>/logs/update.req or ~/.dd/update.req
+        (checked every 5 s) — lets a fix roll out without touching the menu. The marker is removed."""
+        now = time.time()
+        if now - self._update_check < 5:
+            return False
+        self._update_check = now
+        for p in (dd.ROOT / "logs" / "update.req", Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "update.req"):
+            if p.is_file():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+                return True
+        return False
 
     # ----- menu -----
     def icon(self) -> str:
@@ -148,14 +184,45 @@ def run_menu_bar(core: AppCore) -> int:
             self.menu["Heard: (nothing yet)"].set_callback(None)
             self.timer = rumps.Timer(self.refresh, 0.4)
             self.timer.start()
+            self.hud_timer = None
+            if os.environ.get("DD_HUD", "1") != "0":
+                try:
+                    import dd_hud
+                    core.hud = dd_hud.Hud(core.listener)
+                    self.hud_timer = rumps.Timer(self.tick_hud, 0.05)  # 20 fps: the voice bars follow you live
+                    self.hud_timer.start()
+                    print("hud: on-screen voice panel ready", flush=True)
+                except Exception as e:
+                    print(f"(hud unavailable: {type(e).__name__}: {str(e)[:120]} — notifications instead)", flush=True)
+
+        def tick_hud(self, _):
+            if core.hud is not None:
+                core.hud.tick()
 
         def refresh(self, _):  # AppKit must be touched from the main thread: poll state from a timer
             self.title = core.icon()
             self.menu["Pause listening"].title = core.listening_label()
             self.menu["Heard: (nothing yet)"].title = core.last_label()
+            if core.hud is None or not core.hud.ok:  # no panel: say it with notifications
+                for kind, text in core.events():
+                    notify("🎙 Kekkuren… sollu" if kind == "wake" else text[:200])
+            else:
+                core.events()
             if core.test_result is not None:
                 text, core.test_result = core.test_text(), None
                 rumps.alert("dd mic test", text)
+            if core.update_requested():
+                self.do_update()
+
+        def do_update(self) -> None:
+            changed, msg = core.update()
+            notify(msg)
+            print(f"update: {msg}", flush=True)
+            if changed:
+                core.relaunch()
+                core.stop()
+                threading.Timer(2.0, lambda: os._exit(0)).start()
+                rumps.quit_application()
 
         @rumps.clicked("Mic test (3 s)")
         def mic_test(self, _):
@@ -175,13 +242,7 @@ def run_menu_bar(core: AppCore) -> int:
 
         @rumps.clicked("Update dd")
         def update(self, _):
-            changed, msg = core.update()
-            notify(msg)
-            if changed:
-                core.relaunch()
-                core.stop()
-                threading.Timer(2.0, lambda: os._exit(0)).start()
-                rumps.quit_application()
+            self.do_update()
 
         @rumps.clicked("Quit dd")
         def quit(self, _):
@@ -357,6 +418,26 @@ def selftest() -> int:
     assert not core.thread.is_alive() and lis.state == "stopped"
     cmd, note = mic_helper_build_cmd()  # no swiftc / no macOS here: a reason, never an exception
     assert cmd is None or cmd[0].endswith("swiftc"), (cmd, note)
+    # events for the notification fallback: a wake and a spoken reply are each reported once
+    assert core.events() == [("said", "Sollu, moonu second.")] and core.events() == []  # the mic test's prompt above
+    lis.woke_at = 123.0
+    assert core.events() == [("wake", "")] and core.events() == []
+    lis.last_said = "Chrome open pannitten."
+    assert core.events() == [("said", "Chrome open pannitten.")] and core.events() == []
+    # update marker: touch ~/.dd/update.req -> one True (marker removed), then False; checked every 5 s
+    marker = Path(os.environ["DD_HOME"]) / "update.req"
+    marker.write_text("")
+    core._update_check = 0.0
+    assert core.update_requested() is True and not marker.exists()
+    core._update_check = 0.0
+    assert core.update_requested() is False
+    # the HUD model follows the same listener (panel itself needs macOS; the model is exercised here)
+    import dd_hud
+    hud = dd_hud.Hud(lis, panel=type("P", (), {"render": lambda self, f, t: None})())
+    lis.state, lis.armed_until = "recording", time.monotonic() + 5
+    assert hud.tick()["mode"] == "listen"
+    lis.state = "listening"
+    assert "AppKit" not in sys.modules
     os.environ["DD_NO_UPDATE"] = "1"
     assert auto_update() is False
     os.environ.pop("DD_NO_UPDATE")

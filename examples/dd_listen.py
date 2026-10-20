@@ -232,6 +232,7 @@ def helper_binary() -> str:
 
 
 _helper_failures = 0
+SILENCE_FALLBACK_MS = 4000  # dd-mic gave nothing but digital zeros for this long since start -> ffmpeg instead
 
 
 def choose_source() -> tuple[str, str | None]:
@@ -242,62 +243,115 @@ def choose_source() -> tuple[str, str | None]:
     return "ffmpeg", None
 
 
-def helper_source(binary: str):
-    """Frames from dd-mic (AVAudioEngine voice processing: cancels the Mac's own playback). Same pipe protocol."""
+def _relay_stderr(p, tag: str, sink: list, log=print) -> None:
+    """Log a child's stderr lines as they come (its diagnostics: permission, device, format), keep the last few."""
+    try:
+        for raw in iter(p.stderr.readline, b""):
+            line = raw.decode(errors="ignore").rstrip()
+            if line:
+                sink.append(line)
+                del sink[:-6]
+                log(f"  {tag}: {line}")
+    except Exception:
+        pass
+
+
+def helper_source(binary: str, log=print):
+    """Frames from dd-mic (AVAudioEngine voice processing: cancels the Mac's own playback). Same pipe protocol.
+    Digital silence from the first frame on (wrong input device, no permission, voice processing muted) is
+    detected within SILENCE_FALLBACK_MS and the helper is given up for this run -> ffmpeg takes over."""
     global _helper_failures
     started = time.monotonic()
     p = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
     _children.append(p)
-    got = 0
+    said: list[str] = []
+    relay = threading.Thread(target=_relay_stderr, args=(p, "dd-mic", said, log), daemon=True)
+    relay.start()
+    got = zeros = 0
+    silent = False
     try:
         while True:
             frame = p.stdout.read(FRAME_BYTES)
             if len(frame) < FRAME_BYTES:
                 break
             got += 1
+            if frame.count(b"\x00") == len(frame):
+                zeros += 1
+                if zeros == got and zeros * FRAME_MS >= SILENCE_FALLBACK_MS:
+                    silent = True
+                    break
+            else:
+                zeros = 0
             yield frame
     finally:
         p.kill()
-    err = (p.stderr.read() or b"").decode(errors="ignore").strip()
+        try:
+            p.wait(timeout=2)
+        except Exception:
+            pass
+        relay.join(timeout=1)
+    if silent:
+        _helper_failures = 2
+        raise RuntimeError("dd-mic hears nothing (digital silence since start — input device / permission)")
     if time.monotonic() - started < 3 or got == 0:  # died at once: count it; after two, fall back to ffmpeg
         _helper_failures += 1
-    raise RuntimeError(f"dd-mic ended: {err[-300:] or 'no output'}")
+    raise RuntimeError(f"dd-mic ended: {' | '.join(said[-2:]) or 'no output'}")
 
 
-def mic_source():
+def mic_source(log=print):
     kind, path = choose_source()
     if kind == "helper":
-        print(f"  mic: dd-mic helper (echo cancellation) {path}", flush=True)
-        yield from helper_source(path)
+        log(f"  mic: dd-mic helper (echo cancellation) {path}")
+        try:
+            yield from helper_source(path, log=log)
+            return
+        except RuntimeError as e:
+            if _helper_failures < 2:
+                raise  # it worked and then died: the listener restarts the stream
+            log(f"  mic: {e} -> ffmpeg avfoundation instead (no echo cancellation)")
     else:
-        print("  mic: ffmpeg avfoundation (no echo cancellation — build dd-mic for playback-proof listening)", flush=True)
-        yield from ffmpeg_source()
+        log("  mic: ffmpeg avfoundation (no echo cancellation — build dd-mic for playback-proof listening)")
+    yield from ffmpeg_source()
 
 
 # ---------------- speech to text ----------------
 _whisper = None
+_whisper_lock = threading.Lock()
+
+
+def load_whisper():
+    """The faster-whisper model, loaded once (the warm-up thread and the first command share one download).
+    DD_STT_MODEL (default small — clearly better for Thanglish); falls back to base when small cannot be fetched."""
+    global _whisper
+    with _whisper_lock:
+        if _whisper is not None:
+            return _whisper
+        from faster_whisper import WhisperModel  # pip install faster-whisper
+        name = os.environ.get("DD_STT_MODEL", "small")
+        last = None
+        for candidate in [name, name] + (["base"] if name != "base" else []):
+            try:
+                _whisper = WhisperModel(candidate, device="auto", compute_type="int8")
+                if candidate != name:
+                    print(f"(whisper '{name}' unavailable: {str(last)[:80]} — using base)", flush=True)
+                return _whisper
+            except Exception as e:  # a flaky download: once more, then the small/base fallback
+                last = e
+                print(f"(whisper '{candidate}' load failed: {str(e)[:100]})", flush=True)
+                time.sleep(2)
+        raise RuntimeError(f"whisper unavailable: {last}")
 
 
 def stt(pcm: bytes) -> str:
     """16 kHz mono PCM -> text (faster-whisper, int8). Short utterances are padded so Whisper hears them whole."""
-    global _whisper
     import numpy as np
-    if _whisper is None:
-        from faster_whisper import WhisperModel  # pip install faster-whisper
-        name = os.environ.get("DD_STT_MODEL", "small")  # small: clearly better for Thanglish; base: faster
-        try:
-            _whisper = WhisperModel(name, device="auto", compute_type="int8")
-        except Exception as e:
-            if name == "base":
-                raise
-            print(f"(whisper '{name}' unavailable: {str(e)[:80]} — using base)")
-            _whisper = WhisperModel("base", device="auto", compute_type="int8")
+    model = load_whisper()
     a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     pad = np.zeros(int(0.3 * RATE), dtype=np.float32)
     lang = os.environ.get("DD_STT_LANG", "en")  # English decoding reads romanised Tamil best; "auto" wanders
-    segs, _ = _whisper.transcribe(np.concatenate([pad, a, pad]), language=None if lang == "auto" else lang,
-                                  beam_size=1, vad_filter=False, condition_on_previous_text=False,
-                                  initial_prompt=HINT, no_speech_threshold=0.6)
+    segs, _ = model.transcribe(np.concatenate([pad, a, pad]), language=None if lang == "auto" else lang,
+                               beam_size=1, vad_filter=False, condition_on_previous_text=False,
+                               initial_prompt=HINT, no_speech_threshold=0.6)
     return " ".join(s.text.strip() for s in segs).strip()
 
 
@@ -343,20 +397,69 @@ def open_mic_settings() -> None:
 
 
 # ---------------- wake-word detector (Siri-style: tiny always-on model, Whisper only after the wake) ----------------
+OWW_FILES = ("melspectrogram.onnx", "embedding_model.onnx", "hey_jarvis_v0.1.onnx")  # ~10 MB together
+OWW_RELEASE = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/"
+
+
+def oww_model_dir() -> str:
+    """Where the hey-jarvis ONNX files live: inside openwakeword 0.4.x (bundled) or ~/.dd/models/oww (0.5+ ships
+    no models — they are downloaded there once from the openWakeWord GitHub release)."""
+    import openwakeword
+    pkg = os.path.join(os.path.dirname(os.path.abspath(openwakeword.__file__)), "resources", "models")
+    if all(os.path.isfile(os.path.join(pkg, f)) for f in OWW_FILES):
+        return pkg
+    return str(Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "models" / "oww")
+
+
+def ensure_oww_models(folder: str, log=print) -> None:
+    """Download the missing wake-model files into `folder` (atomic: .part then rename)."""
+    missing = [f for f in OWW_FILES if not os.path.isfile(os.path.join(folder, f))]
+    if not missing:
+        return
+    import urllib.request
+    os.makedirs(folder, exist_ok=True)
+    for i, name in enumerate(missing, 1):
+        log(f"  wake model: downloading {name} ({i}/{len(missing)}, one-time)...")
+        part = os.path.join(folder, name + ".part")
+        with urllib.request.urlopen(OWW_RELEASE + name, timeout=60) as r, open(part, "wb") as out:
+            shutil.copyfileobj(r, out)
+        if os.path.getsize(part) < 10_000:
+            os.remove(part)
+            raise RuntimeError(f"{name}: download came back empty")
+        os.replace(part, os.path.join(folder, name))
+
+
+def build_oww_model(folder: str):
+    """openwakeword.Model for hey_jarvis from `folder`, whatever the installed openwakeword version calls its args
+    (0.5+: wakeword_models + inference_framework="onnx" — the tflite default does not exist on macOS; 0.4: *_paths)."""
+    import importlib.metadata as md
+    from openwakeword.model import Model
+    paths = [os.path.join(folder, "hey_jarvis_v0.1.onnx")]
+    mel, emb = os.path.join(folder, "melspectrogram.onnx"), os.path.join(folder, "embedding_model.onnx")
+    try:
+        ver = tuple(int(x) for x in md.version("openwakeword").split(".")[:2])
+    except Exception:
+        ver = (0, 5)
+    new = dict(wakeword_models=paths, inference_framework="onnx", melspec_model_path=mel, embedding_model_path=emb)
+    old = dict(wakeword_model_paths=paths, melspec_onnx_model_path=mel, embedding_onnx_model_path=emb)
+    first, second = (new, old) if ver >= (0, 5) else (old, new)
+    try:
+        return Model(**first)
+    except TypeError:
+        return Model(**second)
+
+
 class WakeDetector:
-    """openWakeWord 'hey jarvis' (bundled ONNX model). 80 ms chunks, ~3% of one CPU core, ignores speech that
+    """openWakeWord 'hey jarvis' (ONNX model). 80 ms chunks, ~3% of one CPU core, ignores speech that
     isn't the wake phrase — so the mic can stay open next to a video without transcribing it."""
     CHUNK = 1280 * 2  # bytes = 80 ms of 16 kHz int16
 
-    def __init__(self, threshold: float | None = None, names: tuple[str, ...] = ("hey_jarvis",)):
+    def __init__(self, threshold: float | None = None, log=print):
         import warnings
         warnings.filterwarnings("ignore", message=".*ExecutionProvider.*")
-        import openwakeword
-        from openwakeword.model import Model
-        paths = [openwakeword.models[n]["model_path"] for n in names if n in getattr(openwakeword, "models", {})]
-        if not paths:
-            raise RuntimeError("openwakeword has no hey_jarvis model")
-        self.model = Model(wakeword_model_paths=paths)
+        folder = oww_model_dir()
+        ensure_oww_models(folder, log=log)
+        self.model = build_oww_model(folder)
         self.threshold = float(os.environ.get("DD_WAKE_THRESHOLD", "0.5")) if threshold is None else threshold
         self.buf = b""
         self.cooldown = 0
@@ -389,7 +492,8 @@ def make_wake_detector():
     try:
         return WakeDetector()
     except Exception as e:
-        print(f"(wake model unavailable: {str(e)[:120]} — pip install openwakeword; using Whisper text wake)", flush=True)
+        print(f"(wake model unavailable: {type(e).__name__}: {str(e)[:160]} — pip install openwakeword; "
+              "using Whisper text wake)", flush=True)
         return None
 
 
@@ -425,6 +529,9 @@ class Listener:
         self.zero_run = 0        # consecutive all-zero frames (mic blocked -> digital silence)
         self.problem_sent = False
         self.last_heard = ""
+        self.last_command = ""   # what dd is acting on right now (HUD: shown while thinking)
+        self.last_said = ""      # dd's latest spoken reply (HUD: shown while speaking + follow-up window)
+        self.woke_at = 0.0       # clock() of the last wake (HUD: countdown)
         self.level = 0.0         # recent peak mic level (RMS), for the menu / log — "is the mic even hearing me?"
         self._level_win: deque[float] = deque(maxlen=25)
         self._frames = 0
@@ -460,6 +567,7 @@ class Listener:
             self.on_state(s)
 
     def say(self, text: str) -> None:
+        self.last_said = text
         self.set_state("speaking")
         self.speaking = True
         try:
@@ -472,7 +580,8 @@ class Listener:
     def on_wake(self, score: float) -> None:
         """'hey jarvis' detected: short sound (without pausing the mic), then the next utterance is the command."""
         self.log(f"  wake: hey jarvis ({score:.2f})")
-        self._last_activity = self.clock()
+        self._last_activity = self.woke_at = self.clock()
+        self.last_command = ""
         self.last_heard = "hey jarvis ✓"
         self.on_heard("hey jarvis", 0.0)
         self.ack(sound_only=True)
@@ -499,6 +608,7 @@ class Listener:
             self._last_activity = self.clock()
             self.last_heard = f"(continuous audio {audio:.0f}s — video/music? skipped)"
             self.log(f"  skipped: {audio:.0f}s of continuous audio (media?) — pause dd or use earphones while a video plays")
+            self.set_state(self._idle_state())
             return
         t0 = self.clock()
         text = self.stt(utt).strip()
@@ -508,6 +618,7 @@ class Listener:
             self.last_heard = f"(sound, no words — {audio:.1f}s)" if not text else f"(ignored: {text})"
             self.on_heard("", secs)
             self.log(f"  heard: {text!r} -> ignored  ({audio:.1f}s audio, stt {secs:.1f}s)")
+            self.set_state(self._idle_state())
             return
         self.last_heard = text
         self.on_heard(text, secs)
@@ -516,14 +627,17 @@ class Listener:
         armed = self.clock() < self.armed_until
         followup = self.clock() < self.followup_until
         if not woke and not followup and not armed:
+            self.set_state(self._idle_state())
             return
         if woke and not cmd:  # just the wake word
+            self.woke_at, self.last_command = self.clock(), ""
             self.ack()
             self.followup_until = self.clock() + self.followup_s
             self.set_state("recording")
             return
         command = cmd if woke else text
         self.armed_until = 0.0
+        self.last_command = command
         if woke or armed:
             self.ack(sound_only=True)  # "heard you" — instant, before the action or the model
         self.set_state("thinking")
@@ -563,6 +677,14 @@ class Listener:
             self.set_state("listening")
         if self.state == "recording" and self.clock() >= max(self.followup_until, self.armed_until):
             self.set_state("listening")
+        if frame.count(b"\x00") == len(frame):  # digital silence = no mic at all (permission / device)
+            self.zero_run += 1
+            if self.zero_run * FRAME_MS >= 8000 and not self.problem_sent:
+                self.problem_sent = True
+                self.on_problem("Mic la onnum varala (digital silence). System Settings → Privacy & Security → "
+                                "Microphone la dd/Terminal ku ON pannu.")
+        else:
+            self.zero_run = 0
         if self.wake is not None:
             score = self.wake.feed(frame)
             if score:
@@ -576,19 +698,17 @@ class Listener:
                 self.seg.reset()
                 self.seg.pre.clear()
                 return
-        if frame.count(b"\x00") == len(frame):
-            self.zero_run += 1
-            if self.zero_run * FRAME_MS >= 8000 and not self.problem_sent:
-                self.problem_sent = True
-                self.on_problem("Mic la onnum varala (digital silence). System Settings → Privacy & Security → "
-                                "Microphone la dd/Terminal ku ON pannu.")
-        else:
-            self.zero_run = 0
         utt = self.seg.feed(frame)
         if utt:
             self.submit(utt)
 
+    def _idle_state(self) -> str:
+        """'recording' while a wake/follow-up window is open (the next words are a command), else 'listening'."""
+        return "recording" if self.clock() < max(self.armed_until, self.followup_until) else "listening"
+
     def submit(self, utt: bytes) -> None:
+        if self.clock() < max(self.armed_until, self.followup_until):
+            self.set_state("thinking")  # a command just ended: transcribing it (the HUD/menu show it at once)
         if self.inline:
             self.process(utt)
             return
@@ -898,9 +1018,14 @@ def selftest() -> int:
     for f in _quiet(200):  # the detector fires during quiet
         lg.feed(f)
     assert lg.state == "recording" and lg.last_heard == "hey jarvis ✓"
+    assert lg.woke_at == now["t"] and lg.last_command == "" and lg.armed_until > now["t"]  # what the HUD reads
+    hud_states = []
+    lg.on_state = hud_states.append
     for f in utterance:  # the command
         lg.feed(f)
     assert gate_stt_calls == [1] and g_handled == ["open chrome"] and g_spoken[-1] == "ok", (gate_stt_calls, g_handled, g_spoken)
+    assert hud_states[:1] == ["thinking"] and lg.last_command == "open chrome" and lg.last_said == "ok", hud_states
+    lg.on_state = lambda s: None
     for f in utterance:  # follow-up window: another command without the wake phrase
         lg.feed(f)
     assert g_handled == ["open chrome", "open chrome"]
@@ -937,6 +1062,35 @@ def selftest() -> int:
     assert _helper_failures == 1  # it exited within 3 s
     _helper_failures = 2
     assert choose_source()[0] == "ffmpeg", "two early deaths must fall back to ffmpeg"
+    # a helper that streams nothing but digital zeros (wrong device / no permission) is given up within
+    # SILENCE_FALLBACK_MS and mic_source() carries on with ffmpeg in the same run — no restart, no notification
+    _helper_failures = 0
+    silent = fake.parent / "dd-mic-silent"
+    silent.write_text("#!/bin/sh\necho 'input: Virtual Cable 48000 Hz x1' >&2\nexec cat /dev/zero\n")
+    silent.chmod(silent.stat().st_mode | _stat.S_IEXEC)
+    os.environ["DD_MIC_BIN"] = str(silent)
+    relayed: list[str] = []
+    zero_frames, fell = 0, ""
+    try:
+        for _f in helper_source(str(silent), log=relayed.append):
+            zero_frames += 1
+    except RuntimeError as e:
+        fell = str(e)
+    assert "hears nothing" in fell and zero_frames == SILENCE_FALLBACK_MS // FRAME_MS - 1 and _helper_failures == 2, \
+        (fell, zero_frames, _helper_failures)
+    assert any("Virtual Cable" in r for r in relayed), relayed  # the helper's own diagnostics reach the log
+    g = globals()
+    real_ffmpeg = g["ffmpeg_source"]
+    g["ffmpeg_source"] = lambda: iter([b"\x01\x00" * (FRAME_BYTES // 2)])
+    try:
+        _helper_failures = 0
+        logged: list[str] = []
+        out = list(mic_source(log=logged.append))
+        assert out[-1] == b"\x01\x00" * (FRAME_BYTES // 2) and out[0] == b"\x00" * FRAME_BYTES \
+            and len(out) == SILENCE_FALLBACK_MS // FRAME_MS, (len(out), logged)
+        assert any("ffmpeg avfoundation instead" in m for m in logged), logged
+    finally:
+        g["ffmpeg_source"] = real_ffmpeg
     _helper_failures = 0
     os.environ["DD_AEC"] = "0"
     assert choose_source()[0] == "ffmpeg"
