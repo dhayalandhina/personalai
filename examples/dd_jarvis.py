@@ -177,7 +177,7 @@ def speak(text: str, mute: bool = False) -> None:
     line = for_speech(text)
     if mute or not line:
         return
-    if os.environ.get("DD_TTS", "kokoro") == "kokoro":  # the neural voice chosen in the menu (dd_voice.py)
+    if os.environ.get("DD_TTS", "neural") != "say":  # the voice chosen in the menu (dd_voice.py); DD_TTS=say: Mac only
         try:
             import dd_voice
             if dd_voice.speak(line):

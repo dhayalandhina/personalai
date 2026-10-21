@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""dd_voice.py — dd's speaking voice: six natural neural voices (Kokoro-82M, free, offline) you pick from the menu.
+"""dd_voice.py — dd's speaking voice: natural Tamil Nadu voices (free), picked from the menu (Voice ▸).
 
-  Heart   — female, warm (default)        Michael — male, calm
-  Bella   — female, bright                George  — male, British
-  Alpha   — female, Indian accent         Omega   — male, Indian accent
+  Pallavi  — Tamil Nadu, female (default)      Neerja  — Indian English, female
+  Valluvar — Tamil Nadu, male                  Prabhat — Indian English, male
 
-Kokoro runs locally through onnxruntime (int8 model, ~120 MB with the voices, fetched once into
-~/.dd/models/kokoro). Replies are spoken sentence by sentence: the next sentence is synthesised while the
-current one plays, so dd starts talking quickly. Until Kokoro is ready (first run) the Mac's own voice speaks.
-The choice lives in ~/.dd/voice.json.
+These are Microsoft's neural voices (the ones in the Edge browser's read-aloud), free and with no key, through
+edge-tts. dd thinks in Thanglish; before a Tamil voice speaks, dd_thanglish.py writes the Tamil words in Tamil
+script and leaves the English words as they are ("Chrome open பண்ணிட்டேன்"), so it sounds like someone from Tamil
+Nadu talking, not an English voice reading Tamil. Replies are spoken sentence by sentence: the next sentence is
+fetched while the current one plays, so dd starts talking in well under a second.
 
-  python3 examples/dd_voice.py --setup          install + download (the app does this by itself)
-  python3 examples/dd_voice.py --say "text" [--voice heart]
+Online voices: the reply text goes to Microsoft's speech service to be spoken (nothing else is sent). Offline (or if
+that service fails) dd falls back on its own: the Mac's Tamil voice (Vani) when installed, else Kokoro (local, if it
+was downloaded earlier), else the Mac voice. Choice + speed live in ~/.dd/voice.json.
+
+  python3 examples/dd_voice.py --setup                 install edge-tts (the app does this by itself)
+  python3 examples/dd_voice.py --say "text" [--voice valluvar] [--out reply.mp3]
   python3 examples/dd_voice.py --selftest
 """
 from __future__ import annotations
@@ -28,19 +32,28 @@ import time
 import wave
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import dd_thanglish  # noqa: E402
+
 MAC = sys.platform == "darwin"
-VOICES: dict[str, dict] = {  # id -> Kokoro voice, phonemiser language, label, gender
-    "heart": {"kokoro": "af_heart", "lang": "en-us", "label": "Heart — female, warm", "gender": "female"},
-    "bella": {"kokoro": "af_bella", "lang": "en-us", "label": "Bella — female, bright", "gender": "female"},
-    "alpha": {"kokoro": "hf_alpha", "lang": "en-us", "label": "Alpha — female, Indian accent", "gender": "female"},
-    "michael": {"kokoro": "am_michael", "lang": "en-us", "label": "Michael — male, calm", "gender": "male"},
-    "george": {"kokoro": "bm_george", "lang": "en-gb", "label": "George — male, British", "gender": "male"},
-    "omega": {"kokoro": "hm_omega", "lang": "en-us", "label": "Omega — male, Indian accent", "gender": "male"},
+VOICES: dict[str, dict] = {  # id -> online voice, whether it reads Tamil, offline Kokoro stand-in, label, gender
+    "pallavi": {"edge": "ta-IN-PallaviNeural", "tamil": True, "kokoro": "hf_alpha",
+                "label": "Pallavi — Tamil Nadu, female", "gender": "female"},
+    "valluvar": {"edge": "ta-IN-ValluvarNeural", "tamil": True, "kokoro": "hm_omega",
+                 "label": "Valluvar — Tamil Nadu, male", "gender": "male"},
+    "neerja": {"edge": "en-IN-NeerjaExpressiveNeural", "tamil": False, "kokoro": "hf_alpha",
+               "label": "Neerja — Indian English, female", "gender": "female"},
+    "prabhat": {"edge": "en-IN-PrabhatNeural", "tamil": False, "kokoro": "hm_omega",
+                "label": "Prabhat — Indian English, male", "gender": "male"},
 }
-DEFAULT = "heart"
-RELEASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
-FILES = ("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
-SAMPLE = "Vanakkam Dhina! Naan {name}. Chrome open pannitten — innum enna venum?"
+DEFAULT = "pallavi"
+SPEEDS = {"slow": ("-10%", 0.9), "normal": ("+0%", 1.0), "fast": ("+15%", 1.15)}  # edge rate, Kokoro speed
+SAMPLE_TA = "Vanakkam Dhina! Naan {name}. Chrome open pannitten — innum enna venum?"
+SAMPLE_EN = "Hello Dhina! I'm {name}. Chrome is open — what would you like next?"
+SAMPLE = SAMPLE_TA  # (older name)
+KOKORO_RELEASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+KOKORO_FILES = ("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
+FILES = KOKORO_FILES  # (older name)
 
 
 def home() -> Path:
@@ -55,128 +68,175 @@ def settings_file() -> Path:
     return home() / "voice.json"
 
 
-def current() -> str:
+def _settings() -> dict:
     try:
-        v = json.loads(settings_file().read_text()).get("voice", DEFAULT)
+        data = json.loads(settings_file().read_text())
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
-        v = DEFAULT
-    return v if v in VOICES else DEFAULT
+        return {}
 
 
-def speed() -> float:
-    try:
-        return max(0.7, min(1.4, float(json.loads(settings_file().read_text()).get("speed", 1.0))))
-    except (OSError, ValueError, TypeError):
-        return 1.0
+def _save(**kv) -> None:
+    data = _settings()
+    data.update(kv)
+    settings_file().parent.mkdir(parents=True, exist_ok=True)
+    settings_file().write_text(json.dumps(data))
+
+
+def current() -> str:
+    v = _settings().get("voice", DEFAULT)
+    return v if v in VOICES else DEFAULT  # older Kokoro choices (heart, omega...) map to the default
 
 
 def set_voice(voice: str) -> str:
     if voice not in VOICES:
         raise ValueError(f"unknown voice {voice!r}: {', '.join(VOICES)}")
-    try:
-        data = json.loads(settings_file().read_text())
-    except (OSError, ValueError):
-        data = {}
-    data["voice"] = voice
-    settings_file().parent.mkdir(parents=True, exist_ok=True)
-    settings_file().write_text(json.dumps(data))
+    _save(voice=voice)
     return voice
 
 
+def current_speed() -> str:
+    s = _settings().get("speed", "normal")
+    return s if s in SPEEDS else "normal"
+
+
+def set_speed(speed: str) -> str:
+    if speed not in SPEEDS:
+        raise ValueError(f"unknown speed {speed!r}: {', '.join(SPEEDS)}")
+    _save(speed=speed)
+    return speed
+
+
+def sample_line(voice: str) -> str:
+    v = VOICES[voice]
+    return (SAMPLE_TA if v["tamil"] else SAMPLE_EN).format(name=v["label"].split(" —")[0])
+
+
 # ---------------- setup ----------------
-def _fetch(url: str, dest: Path) -> None:
-    """Download with certifi's CA bundle (python.org Pythons ship without certificates), else curl."""
-    import ssl
-    import urllib.request
-    part = Path(str(dest) + ".part")
+def edge_ready() -> bool:
     try:
-        ctx = None
-        try:
-            import certifi
-            ctx = ssl.create_default_context(cafile=certifi.where())
-        except Exception:
-            pass
-        with urllib.request.urlopen(url, timeout=120, context=ctx) as r, open(part, "wb") as out:
-            shutil.copyfileobj(r, out, 1 << 20)
+        import edge_tts  # noqa: F401
+        return True
     except Exception:
-        if not shutil.which("curl"):
-            raise
-        subprocess.run(["curl", "-fsSL", "--retry", "3", "--max-time", "1800", "-o", str(part), url], check=True)
-    if part.stat().st_size < 1_000_000:
-        part.unlink()
-        raise RuntimeError(f"{dest.name}: download incomplete")
-    os.replace(part, dest)
+        return False
 
 
-def installed() -> bool:
+def kokoro_ready() -> bool:
     try:
         import kokoro_onnx  # noqa: F401
     except Exception:
         return False
-    return all((model_dir() / f).is_file() for f in FILES)
+    return all((model_dir() / f).is_file() for f in KOKORO_FILES)
+
+
+def installed() -> bool:
+    """Can a neural voice speak right now? (edge-tts installed — it needs the internet — or Kokoro downloaded.)"""
+    return edge_ready() or kokoro_ready()
+
+
+def _pip(pkg: str, log=print) -> bool:
+    for extra in ([], ["--break-system-packages"], ["--user"]):
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", *extra, pkg],
+                           capture_output=True, text=True, timeout=1800)
+        if r.returncode == 0:
+            return True
+    log(f"voice: {pkg} install failed: {(r.stderr or '')[-200:]}")
+    return False
 
 
 def setup(log=print) -> bool:
-    """pip install kokoro-onnx (once) and fetch the model + voices (~120 MB, once). True when ready."""
-    try:
-        import kokoro_onnx  # noqa: F401
-    except Exception:
-        log("voice: installing kokoro-onnx (one-time)...")
-        for extra in ([], ["--break-system-packages"], ["--user"]):
-            r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", *extra, "kokoro-onnx"],
-                               capture_output=True, text=True, timeout=1800)
-            if r.returncode == 0:
-                break
-        else:
-            log(f"voice: kokoro-onnx install failed: {(r.stderr or '')[-200:]} — Mac voice stays")
-            return False
-    model_dir().mkdir(parents=True, exist_ok=True)
-    for f in FILES:
-        dest = model_dir() / f
-        if not dest.is_file():
-            log(f"voice: downloading {f} (one-time)...")
-            try:
-                _fetch(RELEASE + f, dest)
-            except Exception as e:
-                log(f"voice: {f} download failed ({str(e)[:120]}) — Mac voice stays")
-                return False
+    """pip install edge-tts once (a few MB). True when a neural voice is ready. Kokoro is no longer downloaded — an
+    existing download stays as the offline fallback."""
+    if not edge_ready():
+        log("voice: installing edge-tts (one-time)...")
+        _pip("edge-tts", log)
     return installed()
 
 
-# ---------------- synthesis ----------------
+# ---------------- engines ----------------
+_edge_down_until = 0.0
+_edge_lock = threading.Lock()
+
+
+def _edge_synth(text: str, voice: str, rate: str, path: str, timeout: float) -> bool:
+    import asyncio
+    import edge_tts
+
+    async def run() -> bool:
+        got = False
+        c = edge_tts.Communicate(text, voice, rate=rate)
+        with open(path, "wb") as f:
+            async for chunk in c.stream():
+                if chunk.get("type") == "audio" and chunk.get("data"):
+                    f.write(chunk["data"])
+                    got = True
+        return got
+    return asyncio.run(asyncio.wait_for(run(), timeout))
+
+
+def edge_synth(text: str, voice: str, rate: str, path: str, timeout: float = 8.0) -> bool:
+    """One sentence -> mp3 via Microsoft's online voices. Retries once; after a failure the online voices are skipped
+    for 30 s (no internet: every sentence would otherwise wait for a timeout)."""
+    global _edge_down_until
+    if time.monotonic() < _edge_down_until or not edge_ready():
+        return False
+    for attempt in range(2):
+        try:
+            if _edge_synth(text, voice, rate, path, timeout) and os.path.getsize(path) > 0:
+                return True
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:80]}"
+            if attempt:
+                print(f"(voice: online voice failed — {err}; offline voice for now)", flush=True)
+        time.sleep(0.2)
+    with _edge_lock:
+        _edge_down_until = time.monotonic() + 30
+    return False
+
+
+_mac_tamil: str | None = None
+
+
+def mac_tamil_voice() -> str:
+    """The Mac's own Tamil voice (Vani — System Settings → Accessibility → Spoken Content → Manage Voices), or ''."""
+    global _mac_tamil
+    if _mac_tamil is None:
+        _mac_tamil = ""
+        if MAC and shutil.which("say"):
+            try:
+                out = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10).stdout
+                for line in out.splitlines():
+                    m = re.match(r"^(.+?)\s+(ta[_-][A-Z]{2})\b", line)
+                    if m:
+                        _mac_tamil = m.group(1).strip()
+                        break
+            except Exception:
+                pass
+    return _mac_tamil
+
+
+def say_synth(text: str, voice: str, path: str) -> bool:
+    if not (MAC and shutil.which("say")):
+        return False
+    cmd = ["say", "-o", path] + (["-v", voice] if voice else []) + [text]
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0 and os.path.getsize(path) > 0
+    except Exception:
+        return False
+
+
 _engine = None
 _engine_lock = threading.Lock()
 
 
 def engine():
+    """Kokoro (offline fallback), loaded once when it was downloaded earlier."""
     global _engine
     with _engine_lock:
         if _engine is None:
             from kokoro_onnx import Kokoro
-            _engine = Kokoro(str(model_dir() / FILES[0]), str(model_dir() / FILES[1]))
+            _engine = Kokoro(str(model_dir() / KOKORO_FILES[0]), str(model_dir() / KOKORO_FILES[1]))
         return _engine
-
-
-def sentences(text: str, max_len: int = 220) -> list[str]:
-    """Speakable pieces: sentence by sentence (long ones split at commas) so the first can play while the rest
-    is synthesised."""
-    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p.strip()]
-    out = []
-    for p in parts:
-        while len(p) > max_len:
-            cut = p.rfind(", ", 0, max_len)
-            cut = cut if cut > 40 else max_len
-            out.append(p[:cut + 1].strip())
-            p = p[cut + 1:].strip()
-        if p:
-            out.append(p)
-    return out
-
-
-def synth(text: str, voice: str | None = None) -> tuple:
-    v = VOICES[voice or current()]
-    samples, rate = engine().create(text, voice=v["kokoro"], speed=speed(), lang=v["lang"])
-    return samples, rate
 
 
 def write_wav(path: str, samples, rate: int) -> None:
@@ -189,9 +249,56 @@ def write_wav(path: str, samples, rate: int) -> None:
         w.writeframes(a.tobytes())
 
 
+def kokoro_synth(text: str, kvoice: str, speed: float, path: str) -> bool:
+    if not kokoro_ready() and _engine is None:
+        return False
+    try:
+        samples, rate = engine().create(text, voice=kvoice, speed=speed, lang="en-us")
+        write_wav(path, samples, rate)
+        return True
+    except Exception as e:
+        print(f"(voice: Kokoro failed: {str(e)[:100]})", flush=True)
+        return False
+
+
+def synth(text: str, voice: str | None, path_stem: str) -> tuple[str, str] | None:
+    """One sentence -> (audio file, engine name), trying the chosen online voice, then the offline ones."""
+    vid = voice or current()
+    v = VOICES[vid]
+    rate, kspeed = SPEEDS[current_speed()]
+    spoken = dd_thanglish.to_tamil(text) if v["tamil"] else text
+    if edge_synth(spoken, v["edge"], rate, path_stem + ".mp3"):
+        return path_stem + ".mp3", "edge"
+    if v["tamil"] and mac_tamil_voice() and dd_thanglish.has_tamil(spoken) \
+            and say_synth(spoken, mac_tamil_voice(), path_stem + ".aiff"):
+        return path_stem + ".aiff", "mac-tamil"
+    if kokoro_synth(text, v["kokoro"], kspeed, path_stem + ".wav"):
+        return path_stem + ".wav", "kokoro"
+    return None
+
+
+def sentences(text: str, max_len: int = 220, first_len: int = 90) -> list[str]:
+    """Speakable pieces: sentence by sentence (long ones split at commas; the first piece kept short) so the first
+    can play while the rest is fetched."""
+    parts = [p.strip() for p in re.split(r"(?<=[.!?।])\s+", text.strip()) if p.strip()]
+    out: list[str] = []
+    for p in parts:
+        limit = first_len if not out else max_len
+        while len(p) > limit:
+            cut = max(p.rfind(", ", 0, limit), p.rfind(" — ", 0, limit))
+            cut = cut if cut > 25 else (p.rfind(" ", 0, limit) if p.rfind(" ", 0, limit) > 25 else limit)
+            out.append(p[:cut + 1].strip())
+            p = p[cut + 1:].strip()
+            limit = max_len
+        if p:
+            out.append(p)
+    return out
+
+
 # ---------------- playback ----------------
 _player: subprocess.Popen | None = None
 _cancel = threading.Event()
+last_engine = ""
 
 
 def stop() -> bool:
@@ -209,10 +316,11 @@ def stop() -> bool:
 
 def _play_file(path: str) -> None:
     global _player
-    player = shutil.which("afplay") or shutil.which("ffplay") or shutil.which("aplay")
+    player = shutil.which("afplay") or shutil.which("ffplay") or shutil.which("mpg123") or shutil.which("aplay")
     if not player:
         return
-    extra = ["-nodisp", "-autoexit", "-loglevel", "error"] if player.endswith("ffplay") else []
+    extra = ["-nodisp", "-autoexit", "-loglevel", "error"] if player.endswith("ffplay") else \
+        (["-q"] if player.endswith("mpg123") else [])
     _player = subprocess.Popen([player, *extra, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         _player.wait()
@@ -221,7 +329,8 @@ def _play_file(path: str) -> None:
 
 
 def speak(text: str, voice: str | None = None, play=None) -> bool:
-    """Say `text` with the chosen neural voice. False when Kokoro is not ready (the caller falls back)."""
+    """Say `text` with the chosen voice. False when no neural voice can speak at all (the caller uses the Mac's)."""
+    global last_engine
     if not text.strip() or not installed():
         return False
     play = play or _play_file
@@ -236,10 +345,7 @@ def speak(text: str, voice: str | None = None, play=None) -> bool:
             if _cancel.is_set():
                 break
             try:
-                samples, rate = synth(piece, voice)
-                path = str(tmp / f"{i}.wav")
-                write_wav(path, samples, rate)
-                ready[i] = path
+                ready[i] = synth(piece, voice, str(tmp / str(i)))
             except Exception as e:
                 print(f"(voice: synthesis failed: {str(e)[:100]})", flush=True)
             finally:
@@ -247,51 +353,81 @@ def speak(text: str, voice: str | None = None, play=None) -> bool:
         for ev in done:
             ev.set()
     threading.Thread(target=produce, daemon=True, name="dd-voice-synth").start()
+    spoke = False
     for i in range(len(pieces)):
-        done[i].wait(60)
+        done[i].wait(30)
         if _cancel.is_set():
+            spoke = True
             break
         if ready[i]:
-            play(ready[i])
+            last_engine = ready[i][1]
+            play(ready[i][0])
+            spoke = True
+        elif i == 0:
+            break  # not even the first sentence: let the caller's voice say it all
     shutil.rmtree(tmp, ignore_errors=True)
-    return True
+    return spoke
 
 
 def preview(voice: str) -> bool:
-    return speak(SAMPLE.format(name=VOICES[voice]["label"].split(" —")[0]), voice)
+    return speak(sample_line(voice), voice)
+
+
+def save(text: str, out: str, voice: str | None = None) -> str | None:
+    """Text -> one audio file (for --say --out and for sending samples)."""
+    v = VOICES[voice or current()]
+    spoken = dd_thanglish.to_tamil(text) if v["tamil"] else text
+    stem = str(Path(out).with_suffix(""))
+    if edge_synth(spoken, v["edge"], SPEEDS[current_speed()][0], stem + ".mp3", timeout=20):
+        return stem + ".mp3"
+    return None
 
 
 # ---------------- selftest ----------------
 def selftest() -> int:
     os.environ["DD_HOME"] = tempfile.mkdtemp(prefix="dd-voice-test-")
-    assert current() == DEFAULT and set_voice("omega") == "omega" and current() == "omega"
+    os.environ["DD_TRANSLIT_LEARN"] = "0"
+    assert current() == DEFAULT == "pallavi" and set_voice("valluvar") == "valluvar" and current() == "valluvar"
+    settings_file().write_text(json.dumps({"voice": "heart"}))  # an old Kokoro choice
+    assert current() == "pallavi"
     try:
         set_voice("robot")
         raise AssertionError("unknown voices must be refused")
     except ValueError:
         pass
-    assert len(VOICES) == 6 and sum(v["gender"] == "female" for v in VOICES.values()) == 3
+    assert set_speed("fast") == "fast" and current_speed() == "fast" and current() == "pallavi"
+    assert len(VOICES) == 4 and sum(v["gender"] == "female" for v in VOICES.values()) == 2
+    assert sum(v["tamil"] for v in VOICES.values()) == 2
+    assert "Naan Pallavi" in sample_line("pallavi") and "I'm Prabhat" in sample_line("prabhat")
     s = sentences("Chrome open pannitten. Innaiku weather nalla irukku! Enna venum? " + "word, " * 60 + "end.")
     assert s[0] == "Chrome open pannitten." and s[2] == "Enna venum?" and all(len(x) <= 221 for x in s), s
-    assert speak("hello") is False or installed(), "not installed -> False, the caller falls back"
-    # the pipeline with a fake engine + fake player: every sentence played in order; stop() cancels the rest
-    global _engine
-    import numpy as np
+    s = sentences("Innaiku Coimbatore la 31 degree, konjam mazhai varum pola irukku, umbrella eduthuttu ponga Dhina.")
+    assert len(s[0]) <= 91 and len(s) == 2, s  # a long first sentence is cut early: dd starts talking sooner
 
-    class FakeEngine:
-        def create(self, text, voice, speed, lang):
-            return np.zeros(2400, dtype=np.float32), 24000
-    _engine = FakeEngine()
-    md = model_dir()
-    md.mkdir(parents=True, exist_ok=True)
-    for f in FILES:
-        (md / f).write_bytes(b"x")
+    # the pipeline with fake engines + a fake player: every sentence in order, Tamil voices get Tamil script,
+    # stop() cancels the rest, a dead online voice falls back to the offline one
+    global edge_synth, kokoro_synth
+    real_edge, real_kokoro = edge_synth, kokoro_synth
+    sent: list[tuple[str, str]] = []
+
+    def fake_edge(text, voice, rate, path, timeout=8.0):
+        sent.append((voice, text))
+        Path(path).write_bytes(b"mp3")
+        return True
+    edge_synth = fake_edge
     real_installed = globals()["installed"]
     globals()["installed"] = lambda: True
     try:
         played: list[str] = []
-        assert speak("One. Two. Three.", play=lambda p: played.append(Path(p).name))
-        assert played == ["0.wav", "1.wav", "2.wav"], played
+        set_voice("pallavi")
+        assert speak("Chrome open pannitten. Innum enna venum? Done.", play=lambda p: played.append(Path(p).name))
+        assert played == ["0.mp3", "1.mp3", "2.mp3"], played
+        assert sent[0] == ("ta-IN-PallaviNeural", "Chrome open பண்ணிட்டேன்."), sent[0]
+        assert sent[1][1] == "இன்னும் என்ன வேணும்?" and last_engine == "edge"
+        sent.clear()
+        set_voice("prabhat")
+        speak("Chrome open pannitten.", play=lambda p: None)
+        assert sent == [("en-IN-PrabhatNeural", "Chrome open pannitten.")], sent  # English voices: as written
         played.clear()
 
         def play_then_stop(p):
@@ -299,10 +435,28 @@ def selftest() -> int:
             stop()
         speak("One. Two. Three.", play=play_then_stop)
         assert len(played) == 1, played
+        # online voice down -> Kokoro stand-in of the same gender; nothing at all -> False (the caller speaks)
+        edge_synth = lambda *a, **k: False  # noqa: E731
+        used: list[str] = []
+
+        def fake_kokoro(text, kvoice, speed, path):
+            used.append(kvoice)
+            Path(path).write_bytes(b"wav")
+            return True
+        kokoro_synth = fake_kokoro
+        set_voice("valluvar")
+        played.clear()
+        assert speak("Seri. Ok.", play=lambda p: played.append(Path(p).name)) and played == ["0.wav", "1.wav"]
+        assert used == ["hm_omega", "hm_omega"] and last_engine == "kokoro", used
+        kokoro_synth = lambda *a, **k: False  # noqa: E731
+        globals()["_mac_tamil"] = ""
+        assert speak("Seri.", play=lambda p: None) is False
     finally:
+        edge_synth, kokoro_synth = real_edge, real_kokoro
         globals()["installed"] = real_installed
-        _engine = None
-    print("dd_voice selftest ok (6 voices, settings, sentence split, pipelined playback, barge-in stop)")
+        globals()["_mac_tamil"] = None
+    print("dd_voice selftest ok (4 voices + speed, Tamil script for Tamil voices, pipelined playback, barge-in, "
+          "offline fallback)")
     return 0
 
 
@@ -314,8 +468,12 @@ def main(argv: list[str]) -> int:
     if "--say" in argv:
         text = argv[argv.index("--say") + 1]
         voice = argv[argv.index("--voice") + 1] if "--voice" in argv else None
+        if "--out" in argv:
+            out = save(text, argv[argv.index("--out") + 1], voice)
+            print(out or "online voice unavailable")
+            return 0 if out else 1
         if not speak(text, voice):
-            print("kokoro not ready: python3 examples/dd_voice.py --setup")
+            print("no neural voice ready: python3 examples/dd_voice.py --setup")
             return 1
         return 0
     print(__doc__)

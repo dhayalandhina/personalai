@@ -144,13 +144,21 @@ class AppCore:
         cur = dd_voice.current()
         return [(vid, v["label"], vid == cur) for vid, v in dd_voice.VOICES.items()]
 
+    def speed_items(self) -> list[tuple[str, str, bool]]:
+        cur = dd_voice.current_speed()
+        return [(sp, f"Speed: {sp}", sp == cur) for sp in dd_voice.SPEEDS]
+
     def pick_voice(self, vid: str) -> None:
         """Choose a voice and let it introduce itself (on a thread: synthesis must not block the menu)."""
         dd_voice.set_voice(vid)
-        name = dd_voice.VOICES[vid]["label"].split(" —")[0]
-        line = dd_voice.SAMPLE.format(name=name) if dd_voice.installed() else \
-            f"{name} voice download aagudhu, konjam neram la ready."
+        line = dd_voice.sample_line(vid) if dd_voice.installed() else \
+            f"{dd_voice.VOICES[vid]['label'].split(' —')[0]} voice install aagudhu, konjam neram la ready."
         threading.Thread(target=self.listener.say, args=(line,), daemon=True, name="dd-voice-preview").start()
+
+    def pick_speed(self, speed: str) -> None:
+        dd_voice.set_speed(speed)
+        threading.Thread(target=self.listener.say, args=(f"Seri, ippo {speed} speed la pesuren.",), daemon=True,
+                         name="dd-voice-preview").start()
 
     def teach(self) -> bool:
         """Siri-style voice setup: dd asks for 'Jarvis' five times and learns how *you* say it. False if busy."""
@@ -234,10 +242,19 @@ def run_menu_bar(core: AppCore) -> int:
             self.voice_menu = rumps.MenuItem("Voice")
             self.voice_items = {}
             for vid, label, chosen in core.voice_items():
+                if vid == "neerja":
+                    self.voice_menu.add(None)  # Tamil Nadu voices first, then the Indian-English ones
                 item = rumps.MenuItem(label, callback=self.choose_voice)
                 item.state = int(chosen)
                 self.voice_menu.add(item)
                 self.voice_items[label] = (vid, item)
+            self.voice_menu.add(None)
+            self.speed_items = {}
+            for sp, label, chosen in core.speed_items():
+                item = rumps.MenuItem(label, callback=self.choose_speed)
+                item.state = int(chosen)
+                self.voice_menu.add(item)
+                self.speed_items[label] = (sp, item)
             self.menu = ["Pause listening", "Heard: (nothing yet)", None, self.voice_menu, TEACH, "Mic test (3 s)",
                          None, "Open chat", "Status", "Update dd", None, "Quit dd"]
             self.menu["Heard: (nothing yet)"].set_callback(None)
@@ -259,6 +276,12 @@ def run_menu_bar(core: AppCore) -> int:
             for _label, (_v, it) in self.voice_items.items():
                 it.state = int(it is sender)
             core.pick_voice(vid)
+
+        def choose_speed(self, sender):
+            sp, _item = self.speed_items[sender.title]
+            for _label, (_s, it) in self.speed_items.items():
+                it.state = int(it is sender)
+            core.pick_speed(sp)
 
         def tick_hud(self, _):
             if core.hud is not None:
@@ -442,10 +465,14 @@ def run_app() -> int:
         if dd_listen.ram_gb() < 12:
             time.sleep(20)  # 8 GB Mac: let Whisper settle before the LLM load (both at once starve the mic)
         dd.warm()
-        try:  # the neural voices (Kokoro): installed + downloaded once, then loaded so the first reply is quick
+        try:  # the Tamil Nadu voices (edge-tts, a few MB): installed once; Kokoro stays as the offline fallback
             if dd_voice.setup(log=lambda m: print(m, flush=True)):
-                dd_voice.engine()
-                print(f"voice: {dd_voice.VOICES[dd_voice.current()]['label']} (neural) ready", flush=True)
+                if dd_voice.kokoro_ready():
+                    dd_voice.engine()
+                tamil = dd_voice.mac_tamil_voice()
+                print(f"voice: {dd_voice.VOICES[dd_voice.current()]['label']} ({dd_voice.current_speed()} speed) ready"
+                      f"; offline: {('Mac ' + tamil) if tamil else ''}{' + ' if tamil and dd_voice.kokoro_ready() else ''}"
+                      f"{'Kokoro' if dd_voice.kokoro_ready() else ('' if tamil else 'Mac voice')}", flush=True)
         except Exception as e:
             print(f"(voice setup skipped: {type(e).__name__}: {str(e)[:120]})", flush=True)
         if dd_listen.mlx_wanted():
@@ -561,13 +588,18 @@ def selftest() -> int:
         assert tmpl is (st not in ("recording", "error")), (st, tmpl)
     assert TEACH in core.menu_labels()
     items = core.voice_items()
-    assert len(items) == 6 and sum(1 for _, _, c in items if c) == 1 and items[0][0] == "heart"
+    assert len(items) == 4 and sum(1 for _, _, c in items if c) == 1 and items[0][0] == "pallavi"
+    assert [sp for sp, _, _ in core.speed_items()] == ["slow", "normal", "fast"]
     said_voice = []
     lis.speak_fn = said_voice.append
-    core.pick_voice("omega")
+    core.pick_voice("valluvar")
     time.sleep(0.2)
-    assert dd_voice.current() == "omega" and said_voice and "Omega" in said_voice[-1], said_voice
-    dd_voice.set_voice("heart")
+    assert dd_voice.current() == "valluvar" and said_voice and "Valluvar" in said_voice[-1], said_voice
+    core.pick_speed("fast")
+    time.sleep(0.2)
+    assert dd_voice.current_speed() == "fast" and "fast" in said_voice[-1], said_voice
+    dd_voice.set_voice("pallavi")
+    dd_voice.set_speed("normal")
     core.teach_result = {"clips": 5, "detect": 0.7}
     assert "Ready" in core.teach_text() and "5 recordings" in core.teach_text()
     core.teach_result = {"error": "ValueError: not enough clear recordings"}

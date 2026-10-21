@@ -609,12 +609,54 @@ def _mlx_transcribe(audio, prompt: str | None = HINT) -> str:
 CONFIRM_HINT = "Jarvis."
 
 
+CONFIRM_MIN_LOGPROB = float(os.environ.get("DD_CONFIRM_LOGPROB", "-1.0"))
+CONFIRM_MAX_NOSPEECH = float(os.environ.get("DD_CONFIRM_NOSPEECH", "0.6"))
+
+
 def stt_plain(pcm: bytes) -> str:
     """stt() for *confirming* a wake word: the only prompt is the wake word itself. Dhina's real "Jarvis"
     recordings came out as "Janis / Damage / Don't miss" with no prompt (1 of 5) and as "Jarvis." with it (5 of
     5), while other speech kept its own words ("Venom", "Vanakkam") — so the prompt helps the word without
     inventing it. Echoes of the prompt on near-silence are stopped by speech_in() before Whisper runs."""
     return stt(pcm, hint=CONFIRM_HINT)
+
+
+def stt_confirm(pcm: bytes) -> tuple[str, float, float]:
+    """Whisper on a wake candidate: (text, avg log-prob, no-speech prob). The clip is first brought up to a normal
+    level — a "Jarvis" said from the sofa reaches the Mac's mic at about -45 dBFS, where Whisper hears only noise —
+    and decoded with the wake word as the only prompt. The two confidences tell a real word from a prompt echo:
+    Dhina's own "Jarvis" decodes at log-prob -0.33..-0.58 / no-speech <= 0.34; anime, YouTube and room noise
+    never came out as "Jarvis", and what they did come out as sat at -0.8..-2.2 / 0.35..0.86."""
+    import numpy as np
+    a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    peak = float(np.abs(a).max()) if a.size else 0.0
+    if 0.0 < peak < 0.3:
+        a = a * min(20.0, 0.3 / peak)
+    pad = np.zeros(int(0.3 * RATE), dtype=np.float32)
+    audio = np.concatenate([pad, a, pad])
+    lang = os.environ.get("DD_STT_LANG", "en")
+    lang = None if lang == "auto" else lang
+    if _mlx_ready:
+        try:
+            import mlx_whisper
+            r = mlx_whisper.transcribe(audio, path_or_hf_repo=MLX_MODEL, language=lang, temperature=0.0,
+                                       condition_on_previous_text=False, initial_prompt=CONFIRM_HINT,
+                                       no_speech_threshold=None, logprob_threshold=None, verbose=None)
+            segs = r.get("segments") or []
+            text = (r.get("text") or "").strip()
+            lp = max((float(x.get("avg_logprob", -9)) for x in segs), default=-9.0)
+            ns = min((float(x.get("no_speech_prob", 1)) for x in segs), default=1.0)
+            return text, lp, ns
+        except Exception as e:
+            print(f"(mlx confirm failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
+    model = load_whisper()
+    segs, _ = model.transcribe(audio, language=lang, beam_size=1, vad_filter=False, condition_on_previous_text=False,
+                               initial_prompt=CONFIRM_HINT, no_speech_threshold=None, log_prob_threshold=None)
+    segs = list(segs)
+    text = " ".join(x.text.strip() for x in segs).strip()
+    lp = max((float(x.avg_logprob) for x in segs), default=-9.0)
+    ns = min((float(x.no_speech_prob) for x in segs), default=1.0)
+    return text, lp, ns
 
 
 def speech_in(pcm: bytes, floor: float = 0.0, min_rms: float = 250.0) -> bool:
@@ -804,10 +846,10 @@ JARVIS_HEAD_FILE = os.environ.get("DD_WAKE_JARVIS_MODEL") or str(ASSETS / "wake_
 class WakeHead:
     """A custom wake word ('dee dee', or plain 'jarvis'): a tiny classifier (one hidden layer, numpy) on the same
     openWakeWord embeddings the hey-jarvis model reads — trained from thousands of synthetic voices by
-    skills/voice/scripts/wakeword_train.py. Fires only when two consecutive 80 ms chunks agree, and the listener
-    then confirms the candidate with Whisper on the last 2 s of audio (a two-stage wake, like Siri's) — so a head
-    can be recall-oriented. Candidates Whisper rejects, and wakes never followed by a command, raise its threshold
-    by themselves."""
+    skills/voice/scripts/wakeword_train.py. 'dee dee' fires when two consecutive 80 ms chunks agree, 'jarvis' on
+    one; the listener then confirms the candidate with Whisper on the last 2 s of audio (a two-stage wake, like
+    Siri's) — so a head can be recall-oriented. Wakes never followed by a command raise its threshold by
+    themselves (only when Whisper confirmation is off)."""
 
     def __init__(self, path: str = DD_HEAD_FILE, threshold: float | None = None, word: str = "dd"):
         import numpy as np
@@ -817,8 +859,13 @@ class WakeHead:
         self.w1, self.b1, self.w2, self.b2 = z["w1"], z["b1"], z["w2"], z["b2"]
         self.T = int(z["T"])
         env = f"DD_WAKE_{word.upper()}_THRESHOLD"
-        self.threshold = float(os.environ.get(env, "0.8")) if threshold is None else threshold
+        default = "0.7" if word == "jarvis" else "0.8"  # 'jarvis': every candidate is checked by Whisper anyway
+        self.threshold = float(os.environ.get(env, default)) if threshold is None else threshold
         self.base_threshold = self.threshold
+        # chunks in a row above the threshold: 'jarvis' fires on the first one. Its score swings with where the
+        # 80 ms chunk boundaries fall in the word (Dhina's quiet "Jarvis": 0.75 / 0.96 at two alignments 40 ms
+        # apart), so asking for two in a row missed a third of his real attempts; Whisper checks every candidate.
+        self.need = int(os.environ.get(f"DD_WAKE_{word.upper()}_STREAK", "1" if word == "jarvis" else "2"))
         self.streak = 0
         self.last_score = 0.0
         self.false_wakes: deque[float] = deque(maxlen=20)
@@ -832,11 +879,11 @@ class WakeHead:
         return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, o))))
 
     def step(self, feats) -> float | None:
-        """Score one chunk's embedding window; the score when it fires (2 chunks in a row above threshold)."""
+        """Score one chunk's embedding window; the score when it fires (`need` chunks in a row above threshold)."""
         s = self.score(feats)
         self.last_score = s
         self.streak = self.streak + 1 if s >= self.threshold else 0
-        if self.streak >= 2:
+        if self.streak >= self.need:
             self.streak = 0
             return s
         return None
@@ -854,12 +901,10 @@ class WakeHead:
         self.threshold = max(self.base_threshold, self.threshold - 0.01)
 
     def rejected(self, now: float) -> None:
-        """Whisper heard something else: eight such candidates within 10 min raise the threshold a notch."""
+        """Whisper heard something else. Only counted: raising the threshold on rejections (as this used to) made
+        dd deaf to a quiet real "Jarvis" (head 0.96) after ten minutes of anime had pushed it to 0.985 — and
+        Whisper, not the head, is what keeps videos from waking dd."""
         self.rejects.append(now)
-        recent = [t for t in self.rejects if now - t < 600]
-        if len(recent) >= 8 and self.threshold < 0.985:
-            self.threshold = min(0.985, self.threshold + 0.05)
-            self.rejects.clear()
 
 
 DDHead = WakeHead  # (older name)
@@ -1027,7 +1072,7 @@ class VoicePrint:
         self.last_score = s
         self.recent.append(s)
         self.streak = self.streak + 1 if s >= self.threshold else 0
-        if self.streak >= 2:
+        if self.streak >= self.need:
             self.streak = 0
             return s
         return None
@@ -1221,7 +1266,7 @@ class Listener:
         self.work = threading.Event()
         self.worker: threading.Thread | None = None
         self.stt, self.speak_fn = stt_fn or stt, speak or default_speak
-        self.verify_stt = stt_fn or stt_plain  # wake confirmation: no prompt that could put "Jarvis" in the text
+        self.verify_stt = stt_fn or stt_confirm  # wake confirmation: (text, log-prob, no-speech) or plain text
         self.handle = handle  # built lazily (loads rules + skills) unless injected
         self.on_state = on_state or (lambda s: None)
         self.on_heard = on_heard or (lambda text, secs: None)
@@ -1607,15 +1652,20 @@ class Listener:
         if not speech_in(pcm, self.seg.floor):
             how = "no voice in it"
         else:
+            lp, ns = 0.0, 0.0
             try:
-                text = self.verify_stt(pcm).strip()
+                res = self.verify_stt(pcm)
+                text, lp, ns = (res, 0.0, 0.0) if isinstance(res, str) else res
+                text = (text or "").strip()
             except Exception as e:
                 self.log(f"  (wake confirmation failed: {e})")
-            if text and confirms(word, text):
+            if text and confirms(word, text) and lp >= CONFIRM_MIN_LOGPROB and ns <= CONFIRM_MAX_NOSPEECH:
                 how = "whisper"
-            elif voice is not None and voice.recent_max() >= voice.gate + 0.1:
+            elif text and confirms(word, text):
+                how = f"unsure: log-prob {lp:.2f}, no-speech {ns:.2f}"
+            if not how.startswith("whisper") and voice is not None and voice.recent_max() >= voice.gate + 0.1:
                 how = f"your voice {voice.recent_max():.2f}"  # sounds like your own recorded 'Jarvis'
-        if how in ("whisper",) or how.startswith("your voice"):
+        if how == "whisper" or how.startswith("your voice"):
             self.log(f"  wake: {word} confirmed by {how} ({text!r}, {self.clock() - t0:.1f}s)")
             self.on_wake(score, word, source)
         else:
@@ -2066,10 +2116,10 @@ def selftest() -> int:
     assert fw.dd.calls[-1][0] == "false" and lg.wake_answered, fw.dd.calls
     fw.dd, fw.last_word, fw.last_source = None, "hey jarvis", None
     lg.verify = True
-    # DDHead.rejected: eight rejections in ten minutes raise the threshold by 0.05
-    for t in range(8):
+    # WakeHead.rejected only counts: Whisper is the precision stage, the head stays as sensitive as it was
+    for t in range(20):
         head.rejected(1000.0 + t)
-    assert abs(head.threshold - 0.95) < 1e-9, head.threshold
+    assert head.threshold == 0.9 and len(head.rejects) == 20, head.threshold
 
     # decide(): instant hey-jarvis > your voice print > heads > soft; with a voice print, heads/soft must sound like you
     class _H:
