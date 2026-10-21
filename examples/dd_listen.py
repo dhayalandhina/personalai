@@ -110,17 +110,51 @@ class Segmenter:
         self.end_silence_ms, self.min_speech_ms, self.max_ms = end_silence_ms, min_speech_ms, max_ms
         self.idle: deque[float] = deque(maxlen=150)  # last 3 s of idle levels -> noise floor (median) and p90
         self.floor, self.p90 = 100.0, 140.0
+        # (The idle levels above only grow while the room is *below* the speech threshold: in a room louder than
+        # that (TV, fan, a film) the floor stayed at its default for minutes, every sound became one endless
+        # "utterance". A forced, max-length utterance now resets the floor to that sound at once.)
         self.pre: deque[bytes] = deque(maxlen=max(1, pre_roll_ms // FRAME_MS))
         self.reset()
 
     def reset(self) -> None:
         self.speaking, self.frames, self.silence, self.speech_frames, self.loud_run = False, [], 0, 0, 0
         self.energy_sum = 0.0
+        self.energies: list[float] = []
         self.last_forced = False  # True when the last utterance hit max_ms (continuous audio: a video, music, a chat)
+
+    def _set_floor(self, levels: list[float], weight: int) -> None:
+        """Treat `levels` as what the room sounds like now: pushed into the idle window `weight` times over."""
+        s = sorted(levels)
+        q = s[len(s) // 4]
+        hi = s[int(len(s) * 0.6)]
+        for k in range(weight):
+            self.idle.append(q if k % 2 == 0 else hi)
+        si = sorted(self.idle)
+        self.floor, self.p90 = si[len(si) // 2], si[int(len(si) * 0.9)]
+
+
 
     @property
     def noise(self) -> float:
         return self.floor
+
+    def room_level(self, e: float) -> None:
+        """While dd waits for the wake word: quiet frames teach the floor, as always — and when *nothing* has been
+        below the speech threshold for 2 s, the room itself is that loud (TV, fan, a film): the floor jumps to it.
+        (Before, a room that was always above the default threshold never moved the floor off its default, and the
+        command after a real "Jarvis" became one endless 8 s "utterance" that was thrown away as media.)"""
+        if not hasattr(self, "room"):
+            self.room: deque[float] = deque(maxlen=150)
+            self.loud_for = 0
+        self.room.append(e)
+        if e < self.threshold():
+            self._idle_level(e)
+            self.loud_for = 0
+            return
+        self.loud_for += 1
+        if self.loud_for >= 100:  # 2 s (a talker pauses; a TV, a fan or a film does not)
+            self._set_floor(list(self.room), 75)
+            self.loud_for = 0
 
     def _idle_level(self, e: float) -> None:
         self.idle.append(e)
@@ -128,10 +162,18 @@ class Segmenter:
             s = sorted(self.idle)
             self.floor, self.p90 = s[len(s) // 2], s[int(len(s) * 0.9)]
 
+    # eager: the listener only runs the segmenter right after a wake / a reply (it expects a command), so a voice
+    # 6 dB over the room starts one — the 10 dB rule left a command in Dhina's TV-loud room (floor ~1000) unheard.
+    eager = False
+
     def threshold(self) -> float:  # speech starts above this
+        if self.eager:
+            return max(self.min_start, self.floor * 2.0, self.p90 * 1.2)
         return max(self.min_start, self.floor * 3.0, self.p90 * 1.4)
 
     def end_threshold(self) -> float:  # ... and has stopped when it stays below this
+        if self.eager:
+            return max(self.floor * 1.4, self.threshold() * 0.5)
         return max(self.floor * 1.5, self.threshold() * 0.4)
 
     def feed(self, frame: bytes) -> bytes | None:
@@ -150,6 +192,7 @@ class Segmenter:
             return None
         self.frames.append(frame)
         self.energy_sum += e
+        self.energies.append(e)
         if e >= self.end_threshold():
             self.silence, self.speech_frames = 0, self.speech_frames + 1
         else:
@@ -158,10 +201,8 @@ class Segmenter:
         if self.silence * FRAME_MS < self.end_silence_ms and not forced:
             return None
         utt, spoken = b"".join(self.frames), self.speech_frames * FRAME_MS
-        if forced:  # steady noise kept it "speaking" for the whole window: treat that level as room noise from now on
-            avg = self.energy_sum / max(1, len(self.frames))
-            for _ in range(15):  # enough to lift p90 for ~3 s; forgotten once the room is quiet again
-                self._idle_level(avg)
+        if forced and self.energies:  # steady sound kept it "speaking" for the whole window: that is the room now
+            self._set_floor(self.energies, 75)  # (half the window: the floor moves at once, and back once it's quiet)
         self.reset()
         self.last_forced = forced
         return utt if spoken >= self.min_speech_ms else None  # a click or cough is not an utterance
@@ -1322,6 +1363,7 @@ class Listener:
         self.followup_s = float(os.environ.get("DD_FOLLOWUP", "8")) if followup_s is None else followup_s
         self.clock, self.log = clock, log
         self.seg = Segmenter()
+        self.seg.eager = self.wake is not None  # with a wake model it only segments right after a wake / a reply
         self.stop = threading.Event()
         self.paused = False
         self.state = "starting"
@@ -1334,6 +1376,7 @@ class Listener:
         # the same 2 s before the AutoGain: Whisper confirms on this (normalised once, smoothly) — the gain's fast
         # moves at the start of a word after a quiet minute turned Dhina's "Jarvis" into "Damis"
         self.recent_raw: deque[bytes] = deque(maxlen=100)
+        self._utt_started: float | None = None  # when the segmenter's current utterance began
         self._verify_inflight = False   # a Whisper check queued or running
         self._last_verify_at = -1e9
         self._verify_skipped = 0        # candidates skipped while a film kept Whisper busy (shown in the next log)
@@ -1507,9 +1550,13 @@ class Listener:
             return
         self.say("Sollu.")
 
-    def process(self, utt: bytes) -> None:
+    def process(self, utt: bytes, started: float | None = None) -> None:
+        """One utterance. `started`: when it began — a command that began inside the wake / follow-up window counts
+        as one even when it ends (or is transcribed) after the window closed."""
         audio = len(utt) / (RATE * 2)
-        if self.seg.last_forced and self.clock() >= self.followup_until:
+        ts = started if started is not None else self.clock()
+        in_window = ts < max(self.armed_until, self.followup_until)
+        if self.seg.last_forced and not in_window:
             # non-stop audio with no pause (a video, music, people talking) — a command is 1-4 s with a pause after it.
             # Transcribing media would just burn CPU and never contains a wake word, so skip it while idle.
             self._last_activity = self.clock()
@@ -1531,8 +1578,8 @@ class Listener:
         self.on_heard(text, secs)
         self.log(f"  heard: {text!r}  ({audio:.1f}s audio, stt {secs:.1f}s)")
         woke, cmd = parse_wake(text)
-        armed = self.clock() < self.armed_until
-        followup = self.clock() < self.followup_until
+        armed = ts < self.armed_until
+        followup = ts < self.followup_until
         if not woke and not followup and not armed:
             self.set_state(self._idle_state())
             return
@@ -1675,14 +1722,16 @@ class Listener:
                     if src is not None and not self.verify:  # unconfirmed wakes only; confirmed ones were real
                         src.false_wake(self.clock())
                         self.log(f"  ({src.word} wake with no command — threshold now {src.threshold:.2f})")
-                if e < self.seg.threshold():  # learn the room's quiet level only (never from speech/media)
-                    self.seg._idle_level(e)
+                self.seg.room_level(e)  # waiting for the wake word: every frame is room sound
                 self.seg.reset()
                 self.seg.pre.clear()
                 return
+        was = self.seg.speaking
         utt = self.seg.feed(frame)
+        if not was and self.seg.speaking:
+            self._utt_started = self.clock()
         if utt:
-            self.submit(utt)
+            self.submit(utt, started=self._utt_started)
 
     VERIFY_DELAY_FRAMES = 20  # 400 ms: detectors often fire mid-word; Whisper needs the whole word
 
@@ -1777,18 +1826,18 @@ class Listener:
         """'recording' while a wake/follow-up window is open (the next words are a command), else 'listening'."""
         return "recording" if self.clock() < max(self.armed_until, self.followup_until) else "listening"
 
-    def submit(self, utt: bytes) -> None:
-        if self.clock() < max(self.armed_until, self.followup_until):
+    def submit(self, utt: bytes, started: float | None = None) -> None:
+        if (started if started is not None else self.clock()) < max(self.armed_until, self.followup_until):
             self.set_state("thinking")  # a command just ended: transcribing it (the HUD/menu show it at once)
         if self.inline:
-            self.process(utt)
+            self.process(utt, started)
             return
         if self.worker is None or not self.worker.is_alive():
             self.worker = threading.Thread(target=self._worker, daemon=True, name="dd-brain")
             self.worker.start()
         if len(self.queue) == self.queue.maxlen:
             self.log("  (busy — dropped an older utterance)")
-        self.queue.append(utt)
+        self.queue.append(("utt", utt, started))
         self.work.set()
 
     def _worker(self) -> None:
@@ -1801,6 +1850,8 @@ class Listener:
             try:
                 if isinstance(utt, tuple) and utt[0] == "verify":
                     self._verify(*utt[1:])
+                elif isinstance(utt, tuple) and utt[0] == "utt":
+                    self.process(utt[1], utt[2])
                 else:
                     self.process(utt)
             except Exception as e:  # a bad turn must not kill the brain thread
@@ -2324,6 +2375,31 @@ def selftest() -> int:
     for f in _quiet(200):
         lg.feed(f)
     assert lg.state == "listening"
+
+    # loud room (Dhina's Mac, 21 Oct 18:57): a real "Jarvis" woke dd, the room kept the segmenter "speaking" for the
+    # full 8 s, and the command was thrown away as "continuous audio". A command that *began* inside the wake window
+    # is transcribed even when the room forced it to the max length (and even if that ends after the window); one
+    # forced utterance also resets the room floor at once.
+    fl_handled = []
+    fl_clock = {"t": 5000.0}
+    fw2 = FakeWake()
+    lf = Listener(source=lambda: iter([]), stt_fn=lambda b: "chrome open pannu",
+                  speak=lambda t: None, handle=lambda c: (fl_handled.append(c), "ok")[1], followup_s=8.0,
+                  clock=lambda: fl_clock["t"], log=lambda *_: None, inline=True, wake=fw2)
+    lf.agc.enabled = False
+    room_noise = _tone(9000, amp=800)  # a loud, steady room: above the default speech threshold
+
+    def feed_timed(frames):
+        for f in frames:
+            lf.feed(f)
+            fl_clock["t"] += FRAME_MS / 1000
+    feed_timed(room_noise)  # waiting for the wake word in a loud room: the floor learns that room
+    assert lf.seg.floor > 400 and fl_handled == [], (lf.seg.floor, fl_handled)
+    fw2.fire_in = 1
+    feed_timed(_tone(40, amp=800))  # wake
+    assert lf.state == "recording" and lf.armed_until > fl_clock["t"]
+    feed_timed(_tone(1500, amp=6000) + _tone(9000, amp=800))  # the command, then the room carries on
+    assert fl_handled == ["chrome open pannu"], fl_handled
 
     # 3b. auto gain: a quiet mic (speech at ~200 RMS) is brought up; a loud one is left alone; a loud word after a
     #     quiet minute is never clipped (instant attack + limiter)
