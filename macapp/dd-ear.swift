@@ -1,14 +1,15 @@
-// dd-ear.swift — the microphone and what this Mac is playing, on one clock, for dd's echo canceller.
+// dd-ear.swift — the microphone and what this Mac is playing, lined up in time, for dd's echo canceller.
 // stdout: 16 kHz interleaved stereo 16-bit PCM — left = the microphone, right = this Mac's own sound output
 // (a film, music, dd's voice: a Core Audio process tap of every app, macOS 14.2+). dd subtracts the right from the
 // left (examples/dd_aec.py), so "Jarvis" is heard while a film plays on the speakers.
+// The mic runs on its own (an IO proc on the input device) and the tap in its own aggregate device: a tap delivers
+// nothing while nothing plays (Dhina's Mac, 21 Oct: mic + tap in one aggregate stayed silent — mic included — when
+// started with nothing playing), so the mic never waits for it. The two are paired by their host time stamps.
 // Permissions (asked once, for dd): Microphone, and System Audio Recording (Privacy & Security → Screen & System
 // Audio Recording). Without the second one the tap gives silence and dd simply hears the plain mic.
 // Built by the app: swiftc -O -o ~/.dd/bin/dd-ear macapp/dd-ear.swift. Diagnostics go to stderr ("dd-ear: ...").
-// Exit codes: 3 no input device, 5 system-audio tap unavailable, 6 mic permission denied, 8 no callbacks (the mic
-// alone too), 9 aggregate device failed, 10 audio start failed, 11 unexpected stream layout/format.
-// Started with nothing playing, the mic + tap device may deliver nothing: the mic alone goes out meanwhile (Mac
-// sound = silence) and the mic + tap device is rebuilt once the Mac plays.
+// Exit codes: 3 no input device, 6 mic permission denied, 8 no mic callbacks, 10 mic start failed, 11 unexpected mic
+// format. A tap that cannot be made only leaves the right channel silent (logged).
 import AVFoundation
 import CoreAudio
 import Foundation
@@ -83,17 +84,17 @@ func inputStreamFormats(_ dev: AudioObjectID) -> [AudioStreamBasicDescription] {
 
 let unknownID = AudioObjectID(kAudioObjectUnknown)
 var tapID = unknownID
-var aggID = unknownID
-var procID: AudioDeviceIOProcID? = nil
-var soloProc: AudioDeviceIOProcID? = nil  // the mic alone, while the mic + tap device delivers nothing
-var soloDev = AudioDeviceID(0)
+var aggID = unknownID   // the tap's own aggregate device
+var tapProc: AudioDeviceIOProcID? = nil
+var micProc: AudioDeviceIOProcID? = nil
+var micDevice = AudioDeviceID(0)
 
-func destroyAggregate() {
+func destroyTap() {
     if aggID != unknownID {
-        if let p = procID {
+        if let p = tapProc {
             _ = AudioDeviceStop(aggID, p)
             _ = AudioDeviceDestroyIOProcID(aggID, p)
-            procID = nil
+            tapProc = nil
         }
         _ = AudioHardwareDestroyAggregateDevice(aggID)
         aggID = unknownID
@@ -104,25 +105,13 @@ func destroyAggregate() {
     }
 }
 
-func stopSolo() {
-    if let p = soloProc {
-        _ = AudioDeviceStop(soloDev, p)
-        _ = AudioDeviceDestroyIOProcID(soloDev, p)
-        soloProc = nil
-    }
-}
-
 func cleanup() {
-    stopSolo()
-    destroyAggregate()
-}
-
-func runningSomewhere(_ dev: AudioObjectID) -> Bool {
-    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
-                                          mScope: kAudioObjectPropertyScopeGlobal, mElement: mainElement)
-    var v = UInt32(0)
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    return AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &v) == noErr && v != 0
+    if let p = micProc {
+        _ = AudioDeviceStop(micDevice, p)
+        _ = AudioDeviceDestroyIOProcID(micDevice, p)
+        micProc = nil
+    }
+    destroyTap()
 }
 
 signal(SIGTERM, SIG_IGN)
@@ -134,13 +123,24 @@ let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
 intSource.setEventHandler { cleanup(); exit(0) }
 intSource.resume()
 
+func hostSeconds(_ ts: UnsafePointer<AudioTimeStamp>) -> Double {
+    let t = ts.pointee
+    let host = (t.mFlags.contains(.hostTimeValid) && t.mHostTime != 0) ? t.mHostTime : AudioGetCurrentHostTime()
+    return Double(AudioConvertHostTimeToNanos(host)) / 1e9
+}
+
+func isFloat32(_ f: AudioStreamBasicDescription) -> Bool {
+    return f.mFormatID == kAudioFormatLinearPCM && f.mBitsPerChannel == 32 && (f.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+}
+
 @available(macOS 14.2, *)
 func runEar() {
     let micDev = defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
-    guard micDev != 0, let micUID = stringProp(micDev, kAudioDevicePropertyDeviceUID) else {
+    guard micDev != 0 else {
         warn("no input device")
         exit(3)
     }
+    micDevice = micDev
     let outDev = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
     warn("devices: input '\(stringProp(micDev, kAudioObjectPropertyName) ?? "?")' \(Int(rateOf(micDev))) Hz, " +
          "output '\(stringProp(outDev, kAudioObjectPropertyName) ?? "?")' \(Int(rateOf(outDev))) Hz")
@@ -149,25 +149,23 @@ func runEar() {
         exit(11)
     }
 
-    // state shared by the two capture paths — touched on ioQueue only (the main loop reads it through ioQueue.sync)
+    // shared by the two IO procs — touched on ioQueue only (the watchdog reads it through ioQueue.sync)
     let ioQueue = DispatchQueue(label: "dd-ear.io", qos: .userInteractive)
     var micQ = [Int16]()
     var refQ = [Int16]()
+    var micEnd = 0.0     // host time (s) just after the newest sample in each queue
+    var refEnd = 0.0
+    var refSeen = 0.0    // host time of the newest tap audio (0 = none yet)
     var micPeak: Float = 0
     var refPeak: Float = 0
     var lastReport = Date()
-    var aggCallbacks = 0
-    var soloCallbacks = 0
-    var lastAgg = Date()
-    var lastSolo = Date()
-    var aggLive = false  // the mic + tap device delivers: the mic-alone capture stands down
-    var aggMicCh = 1
-    var aggTapCh = 1
-    var aggFmt: AVAudioFormat? = nil
-    var aggMicConv: AVAudioConverter? = nil
-    var aggRefConv: AVAudioConverter? = nil
-    var soloFmt: AVAudioFormat? = nil
-    var soloConv: AVAudioConverter? = nil
+    var micCallbacks = 0
+    var tapCallbacks = 0
+    var lastMic = Date()
+    var micFmt: AVAudioFormat? = nil
+    var micConv: AVAudioConverter? = nil
+    var tapFmt: AVAudioFormat? = nil
+    var tapConv: AVAudioConverter? = nil
 
     func convert(_ conv: AVAudioConverter, _ fmt: AVAudioFormat, _ src: UnsafePointer<Float>, _ stride: Int,
                  _ frames: Int, _ peak: inout Float, _ q: inout [Int16]) {
@@ -200,10 +198,29 @@ func runEar() {
         }
     }
 
-    // pair mic and Mac sound up and write them out; false: the listener went away
+    // the Mac's sound lined up with the mic by time: refQ[i] was playing when micQ[i] was heard (the echo itself
+    // comes a little later — the canceller's filter covers that)
+    func align() {
+        if refSeen == 0 || micEnd - refSeen > 0.15 {  // nothing plays: silence for the Mac's sound
+            if refQ.count < micQ.count {
+                refQ.append(contentsOf: [Int16](repeating: 0, count: micQ.count - refQ.count))
+            } else if refQ.count > micQ.count {
+                refQ.removeLast(refQ.count - micQ.count)
+            }
+            refEnd = micEnd
+            return
+        }
+        // refQ starts 20 ms before micQ: the echo always lands after its reference, even if a time stamp is late
+        let want = micQ.count + Int(((refEnd - micEnd + 0.02) * 16000).rounded())
+        if refQ.count > want + 32 {
+            refQ.removeFirst(min(refQ.count, refQ.count - want))  // older than the oldest mic sample
+        } else if refQ.count < want - 32 {
+            refQ.insert(contentsOf: [Int16](repeating: 0, count: want - refQ.count), at: 0)
+        }
+    }
+
+    // pairs out to stdout; false: the listener went away
     func emit() -> Bool {
-        if refQ.isEmpty && micQ.count > 3200 { refQ = [Int16](repeating: 0, count: micQ.count) }
-        if micQ.isEmpty && refQ.count > 3200 { refQ.removeAll() }
         let n = min(micQ.count, refQ.count)
         if n > 0 {
             var out = [Int16](repeating: 0, count: 2 * n)
@@ -225,10 +242,14 @@ func runEar() {
             }
             if !ok { return false }
         }
+        if micQ.count > 16000 { micQ.removeFirst(micQ.count - 16000) }  // (never more than 1 s behind)
         if Date().timeIntervalSince(lastReport) >= 30 {
-            warn(String(format: "levels (30 s): mic peak %.3f, playback peak %.3f%@", micPeak, refPeak,
-                        refPeak == 0 ? (aggLive ? " (nothing playing — or System Audio Recording not allowed for dd)"
-                                                : " (mic alone: the Mac's sound not joined yet)") : ""))
+            var note = ""
+            if refPeak == 0 {
+                note = tapCallbacks == 0 ? " (nothing played since dd-ear started — or System Audio Recording not allowed for dd)"
+                                         : " (nothing playing)"
+            }
+            warn(String(format: "levels (30 s): mic peak %.3f, playback peak %.3f%@", micPeak, refPeak, note))
             micPeak = 0
             refPeak = 0
             lastReport = Date()
@@ -236,10 +257,55 @@ func runEar() {
         return true
     }
 
-    // 2+3. A tap of everything this Mac plays (mono mix of all apps, not muted: the film keeps playing as it was) and
-    //      one private aggregate device = the mic (clock master) + the tap (drift-compensated to the mic's clock):
-    //      every callback carries both, sample-aligned — what an echo canceller needs. 0 = running, else exit code.
-    func buildAggregate() -> Int32 {
+    // 2. The mic, on its own IO proc (it never waits for the tap)
+    let mfmts = inputStreamFormats(micDev)
+    guard let m0 = mfmts.first, isFloat32(m0) else {
+        warn("unexpected mic stream format: \(mfmts.map { "id \($0.mFormatID) bits \($0.mBitsPerChannel)" })")
+        exit(11)
+    }
+    let micRate = rateOf(micDev) > 0 ? rateOf(micDev) : m0.mSampleRate
+    guard let mf = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: micRate, channels: 1, interleaved: false),
+          let mc = AVAudioConverter(from: mf, to: outFmt) else {
+        warn("audio converter failed for \(micRate) Hz")
+        exit(11)
+    }
+    micFmt = mf
+    micConv = mc
+    var st = AudioDeviceCreateIOProcIDWithBlock(&micProc, micDev, ioQueue) { _, inInput, inTime, _, _ in
+        guard let fmt = micFmt, let conv = micConv else { return }
+        micCallbacks += 1
+        lastMic = Date()
+        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInput))
+        if micCallbacks == 1 || micCallbacks == 200 {  // (diagnostics: what the first callbacks carry)
+            warn("callback \(micCallbacks): \(abl.count) buffers: " + abl.map { b in
+                "\(b.mNumberChannels) ch \(b.mDataByteSize) B\(b.mData == nil ? " (no data)" : "")" }.joined(separator: ", "))
+        }
+        guard abl.count >= 1, let mp = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return }
+        let ch = max(1, Int(abl[0].mNumberChannels))
+        let frames = Int(abl[0].mDataByteSize) / (4 * ch)
+        convert(conv, fmt, UnsafePointer(mp), ch, frames, &micPeak, &micQ)
+        micEnd = hostSeconds(inTime) + Double(frames) / fmt.sampleRate
+        align()
+        if !emit() {  // the listener went away
+            cleanup()
+            exit(0)
+        }
+    }
+    guard st == noErr, micProc != nil else {
+        warn("mic IO proc failed: OSStatus \(st)")
+        exit(10)
+    }
+    st = AudioDeviceStart(micDev, micProc)
+    guard st == noErr else {
+        warn("mic start failed: OSStatus \(st)")
+        cleanup()
+        exit(10)
+    }
+
+    // 3. A tap of everything this Mac plays (mono mix of all apps, not muted: the film keeps playing as it was), in
+    //    its own private aggregate device clocked by the output device; its callbacks come only while something plays.
+    func buildTap() -> String? {
+        guard let outUID = stringProp(outDev, kAudioDevicePropertyDeviceUID) else { return "no output device" }
         let desc = CATapDescription(monoGlobalTapButExcludeProcesses: [])
         desc.uuid = UUID()
         desc.name = "dd-ear"
@@ -247,240 +313,103 @@ func runEar() {
         if desc.responds(to: NSSelectorFromString("setPrivateTap:")) {  // (only visible to dd; KVC: the Swift name
             desc.setValue(true, forKey: "privateTap")                    //  of this flag differs between SDKs)
         }
-        var st = AudioHardwareCreateProcessTap(desc, &tapID)
-        guard st == noErr, tapID != unknownID else {
-            warn("system audio tap failed: OSStatus \(st)")
+        var s = AudioHardwareCreateProcessTap(desc, &tapID)
+        guard s == noErr, tapID != unknownID else {
             tapID = unknownID
-            return 5
+            return "system audio tap failed: OSStatus \(s)"
         }
         let agg: [String: Any] = [
             kAudioAggregateDeviceNameKey: "dd-ear",
             kAudioAggregateDeviceUIDKey: "dd-ear-" + UUID().uuidString,
-            kAudioAggregateDeviceMainSubDeviceKey: micUID,
+            kAudioAggregateDeviceMainSubDeviceKey: outUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: micUID]],
+            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outUID]],
             kAudioAggregateDeviceTapListKey: [[kAudioSubTapDriftCompensationKey: true,
                                                kAudioSubTapUIDKey: desc.uuid.uuidString]],
         ]
-        st = AudioHardwareCreateAggregateDevice(agg as CFDictionary, &aggID)
-        guard st == noErr, aggID != unknownID else {
-            warn("aggregate device failed: OSStatus \(st)")
+        s = AudioHardwareCreateAggregateDevice(agg as CFDictionary, &aggID)
+        guard s == noErr, aggID != unknownID else {
             aggID = unknownID
-            destroyAggregate()
-            return 9
+            destroyTap()
+            return "tap aggregate device failed: OSStatus \(s)"
         }
         var formats = inputStreamFormats(aggID)
-        for _ in 0..<20 where formats.count < 2 {  // (the tap's stream can show up a moment after creation)
+        for _ in 0..<20 where formats.isEmpty {  // (the tap's stream can show up a moment after creation)
             Thread.sleep(forTimeInterval: 0.1)
             formats = inputStreamFormats(aggID)
         }
-        warn("streams: " + formats.map { "\($0.mChannelsPerFrame) ch \(Int($0.mSampleRate)) Hz \($0.mBitsPerChannel) bit" }
-            .joined(separator: " + "))
-        guard formats.count >= 2 else {
-            warn("expected mic + tap input streams, got \(formats.count)")
-            destroyAggregate()
-            return 11
-        }
-        for f in formats where !(f.mFormatID == kAudioFormatLinearPCM && f.mBitsPerChannel == 32
-                                 && (f.mFormatFlags & kAudioFormatFlagIsFloat) != 0) {
-            warn("unsupported stream format: id \(f.mFormatID) flags \(f.mFormatFlags) bits \(f.mBitsPerChannel)")
-            destroyAggregate()
-            return 11
+        guard let tf = formats.last, isFloat32(tf) else {
+            destroyTap()
+            return "unexpected tap streams: \(formats.map { "\($0.mChannelsPerFrame) ch id \($0.mFormatID) bits \($0.mBitsPerChannel)" })"
         }
         let nominal = rateOf(aggID)
-        let rate = nominal > 0 ? nominal : formats[0].mSampleRate
+        let rate = nominal > 0 ? nominal : tf.mSampleRate
         guard let f = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false),
-              let mc = AVAudioConverter(from: f, to: outFmt), let rc = AVAudioConverter(from: f, to: outFmt) else {
-            warn("audio converter failed for \(rate) Hz")
-            destroyAggregate()
-            return 11
+              let c = AVAudioConverter(from: f, to: outFmt) else {
+            destroyTap()
+            return "tap audio converter failed for \(rate) Hz"
         }
-        let micCh = max(1, Int(formats[0].mChannelsPerFrame))
-        let tapCh = max(1, Int(formats[formats.count - 1].mChannelsPerFrame))
         ioQueue.sync {
-            aggMicCh = micCh
-            aggTapCh = tapCh
-            aggFmt = f
-            aggMicConv = mc
-            aggRefConv = rc
-            aggCallbacks = 0
+            tapFmt = f
+            tapConv = c
         }
-        st = AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, ioQueue) { _, inInput, _, _, _ in
-            guard let fmt = aggFmt, let mconv = aggMicConv, let rconv = aggRefConv else { return }
-            lastAgg = Date()
-            aggCallbacks += 1
+        s = AudioDeviceCreateIOProcIDWithBlock(&tapProc, aggID, ioQueue) { _, inInput, inTime, _, _ in
+            guard let fmt = tapFmt, let conv = tapConv else { return }
+            tapCallbacks += 1
             let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInput))
-            if aggCallbacks == 1 || aggCallbacks == 200 {  // (diagnostics: what the first callbacks carry)
-                warn("callback \(aggCallbacks): \(abl.count) buffers: " + abl.map { b in
+            if tapCallbacks == 1 || tapCallbacks == 200 {
+                warn("tap callback \(tapCallbacks): \(abl.count) buffers: " + abl.map { b in
                     "\(b.mNumberChannels) ch \(b.mDataByteSize) B\(b.mData == nil ? " (no data)" : "")" }.joined(separator: ", "))
             }
-            if !aggLive {  // (from now on this device carries the mic: what the mic alone left is dropped)
-                aggLive = true
-                micQ.removeAll()
-                refQ.removeAll()
-            }
-            guard abl.count >= 1, let mp = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return }
-            let mb = abl[0]
-            convert(mconv, fmt, UnsafePointer(mp), aggMicCh, Int(mb.mDataByteSize) / (4 * aggMicCh), &micPeak, &micQ)
-            // the Mac's sound: absent until System Audio Recording is allowed (or while the tap is rebuilt) — then the
-            // mic still goes out, paired with silence
+            guard abl.count >= 1 else { return }
             let tb = abl[abl.count - 1]
-            if abl.count >= 2, let tp = tb.mData?.assumingMemoryBound(to: Float.self), tb.mDataByteSize > 0 {
-                convert(rconv, fmt, UnsafePointer(tp), aggTapCh, Int(tb.mDataByteSize) / (4 * aggTapCh), &refPeak, &refQ)
-            } else if refQ.count < micQ.count {
-                refQ.append(contentsOf: [Int16](repeating: 0, count: micQ.count - refQ.count))
+            guard let tp = tb.mData?.assumingMemoryBound(to: Float.self), tb.mDataByteSize > 0 else { return }
+            let ch = max(1, Int(tb.mNumberChannels))
+            let frames = Int(tb.mDataByteSize) / (4 * ch)
+            let t0 = hostSeconds(inTime)
+            if refEnd > 0 {  // (a pause in the tap, or the first tap audio after silence: place it at its own time)
+                let gap = Int(((t0 - refEnd) * 16000).rounded())
+                if gap > 32 {
+                    refQ.append(contentsOf: [Int16](repeating: 0, count: min(gap, 32000)))
+                } else if gap < -32 {
+                    refQ.removeLast(min(refQ.count, -gap))
+                }
             }
-            if !emit() {  // the listener went away
-                cleanup()
-                exit(0)
-            }
+            convert(conv, fmt, UnsafePointer(tp), ch, frames, &refPeak, &refQ)
+            refEnd = t0 + Double(frames) / fmt.sampleRate
+            refSeen = refEnd
+            if refQ.count > 32000 { refQ.removeFirst(refQ.count - 32000) }
         }
-        guard st == noErr, procID != nil else {
-            warn("IO proc failed: OSStatus \(st)")
-            procID = nil
-            destroyAggregate()
-            return 10
+        guard s == noErr, tapProc != nil else {
+            tapProc = nil
+            destroyTap()
+            return "tap IO proc failed: OSStatus \(s)"
         }
-        st = AudioDeviceStart(aggID, procID)
-        guard st == noErr else {
-            warn("audio start failed: OSStatus \(st)")
-            destroyAggregate()
-            return 10
+        s = AudioDeviceStart(aggID, tapProc)
+        guard s == noErr else {
+            destroyTap()
+            return "tap start failed: OSStatus \(s)"
         }
-        warn("listening: mic + this Mac's sound (tap) at \(Int(rate)) Hz -> 16000 Hz stereo [mic, playback]; " +
-             "streams \(micCh) ch mic, \(tapCh) ch tap")
-        return 0
+        return nil
     }
+    if let why = buildTap() {
+        warn("\(why) — the mic alone (no echo cancellation)")
+    }
+    warn("listening: mic + this Mac's sound (tap) -> 16000 Hz stereo [mic, playback]; mic \(Int(micRate)) Hz " +
+         "\(Int(m0.mChannelsPerFrame)) ch; the Mac's sound joins whenever something plays")
 
-    // The mic alone (Mac sound = silence) while the mic + tap device delivers nothing: on Dhina's Mac it stayed silent
-    // when started with nothing playing (21 Oct 22:53; it ran at once at 22:20 with a film on) — dd keeps hearing him.
-    func startSolo() -> Bool {
-        let fmts = inputStreamFormats(micDev)
-        guard let f0 = fmts.first, f0.mFormatID == kAudioFormatLinearPCM, f0.mBitsPerChannel == 32,
-              (f0.mFormatFlags & kAudioFormatFlagIsFloat) != 0 else {
-            warn("mic alone: unsupported mic format")
-            return false
-        }
-        let r = rateOf(micDev) > 0 ? rateOf(micDev) : f0.mSampleRate
-        guard let f = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: r, channels: 1, interleaved: false),
-              let c = AVAudioConverter(from: f, to: outFmt) else {
-            warn("mic alone: audio converter failed for \(r) Hz")
-            return false
-        }
-        ioQueue.sync {
-            soloFmt = f
-            soloConv = c
-            lastSolo = Date()
-        }
-        soloDev = micDev
-        var st = AudioDeviceCreateIOProcIDWithBlock(&soloProc, micDev, ioQueue) { _, inInput, _, _, _ in
-            if aggLive { return }
-            guard let fmt = soloFmt, let conv = soloConv else { return }
-            lastSolo = Date()
-            soloCallbacks += 1
-            let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInput))
-            if soloCallbacks == 1 {
-                warn("mic alone: callback 1: \(abl.count) buffers: " + abl.map { b in
-                    "\(b.mNumberChannels) ch \(b.mDataByteSize) B" }.joined(separator: ", "))
-            }
-            guard abl.count >= 1, let mp = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return }
-            let ch = max(1, Int(abl[0].mNumberChannels))
-            convert(conv, fmt, UnsafePointer(mp), ch, Int(abl[0].mDataByteSize) / (4 * ch), &micPeak, &micQ)
-            if refQ.count < micQ.count {
-                refQ.append(contentsOf: [Int16](repeating: 0, count: micQ.count - refQ.count))
-            }
-            if !emit() {
-                cleanup()
-                exit(0)
-            }
-        }
-        guard st == noErr, soloProc != nil else {
-            warn("mic alone: IO proc failed: OSStatus \(st)")
-            soloProc = nil
-            return false
-        }
-        st = AudioDeviceStart(micDev, soloProc)
-        guard st == noErr else {
-            warn("mic alone: start failed: OSStatus \(st)")
-            stopSolo()
-            return false
-        }
-        return true
-    }
-
-    let code = buildAggregate()
-    if code != 0 {
-        cleanup()
-        exit(code)
-    }
+    // 4. Watchdog: the mic must keep delivering (the tap may rest while nothing plays)
     let started = Date()
-    var soloOn = false
-    var outSince: Date? = nil
-    var lastBuild = Date()
-    var backoff: Double = 15
     while true {
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.25))
-        let (live, la, ls) = ioQueue.sync { (aggLive, lastAgg, lastSolo) }
-        let now = Date()
-        if live {
-            if soloOn {
-                stopSolo()
-                soloOn = false
-                backoff = 15
-                warn("the Mac's sound joined: mic + tap from now on")
-            }
-            if now.timeIntervalSince(la) > 4 {  // it ran and stopped: the mic alone, rebuilt when the Mac plays
-                warn("the mic + tap device stopped — the mic alone until it can be rebuilt")
-                ioQueue.sync { aggLive = false }
-                destroyAggregate()
-                guard startSolo() else {
-                    warn("no audio callbacks for 4 s — giving up (dd uses the plain mic)")
-                    cleanup()
-                    exit(8)
-                }
-                soloOn = true
-                lastBuild = now
-            }
-            continue
-        }
-        if !soloOn {
-            // nothing from the mic + tap device yet: after 3 s, the mic alone meanwhile (macOS may also be showing
-            // the System Audio Recording prompt)
-            if now.timeIntervalSince(started) > 3 {
-                if startSolo() {
-                    soloOn = true
-                    lastBuild = now
-                    warn("waiting for the first audio of mic + tap (nothing playing, or macOS asks about System Audio " +
-                         "Recording for dd: Allow) — the mic alone meanwhile; the Mac's sound joins when it can")
-                } else if now.timeIntervalSince(started) > 90 {
-                    warn("no audio callbacks for 90 s — giving up (dd uses the plain mic)")
-                    cleanup()
-                    exit(8)
-                }
-            }
-            continue
-        }
-        if now.timeIntervalSince(ls) > 4 {
-            warn("no audio callbacks for 4 s — giving up (dd uses the plain mic)")
+        let (n, last) = ioQueue.sync { (micCallbacks, lastMic) }
+        let limit: Double = n == 0 ? 10 : 4
+        if Date().timeIntervalSince(n == 0 ? started : last) > limit {
+            warn("no audio callbacks for \(Int(limit)) s — giving up (dd uses the plain mic)")
             cleanup()
             exit(8)
-        }
-        // the Mac plays (its output device runs) and the mic + tap device still delivers nothing: build a fresh one
-        let od = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
-        if od != 0 && runningSomewhere(od) {
-            if outSince == nil { outSince = now }
-            if now.timeIntervalSince(outSince ?? now) > 5 && now.timeIntervalSince(lastBuild) > backoff {
-                lastBuild = now
-                backoff = min(backoff * 2, 600)
-                destroyAggregate()
-                let c = buildAggregate()
-                warn(c == 0 ? "the Mac is playing: mic + tap rebuilt (next try in \(Int(backoff)) s if it stays silent)"
-                            : "mic + tap rebuild failed (code \(c)) — the mic alone")
-            }
-        } else {
-            outSince = nil
         }
     }
 }
