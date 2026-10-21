@@ -50,65 +50,99 @@ func defaultInputName() -> String {
     return cf as String
 }
 
-// 3. The engine. Voice processing is one IO unit for both directions, so the output side is kept alive
-//    (a silent mixer) — that is the echo canceller's reference signal.
-let engine = AVAudioEngine()
-let input = engine.inputNode
+// 3. The engine. Three attempts, most capable first:
+//    a) voice processing + a silent mixer on the output (the echo canceller's reference signal)
+//    b) voice processing, input only (some Macs refuse (a) with -10875 on the output unit)
+//    c) plain microphone (no echo cancellation; dd's own silence check still applies)
 let aec = !CommandLine.arguments.contains("--no-aec")
-if aec {
-    do { try input.setVoiceProcessingEnabled(true) } catch { warn("voice processing unavailable: \(error)") }
-}
-if aec && input.isVoiceProcessingEnabled {
-    engine.mainMixerNode.outputVolume = 0  // touching mainMixerNode connects it to the output node
-}
-engine.prepare()
-var inFmt = input.outputFormat(forBus: 0)
-if inFmt.sampleRate == 0 || inFmt.channelCount == 0 { inFmt = input.inputFormat(forBus: 0) }
-guard inFmt.sampleRate > 0, inFmt.channelCount > 0 else {
-    warn("no input format — Microphone permission for dd? (System Settings → Privacy & Security → Microphone)")
-    exit(3)
-}
-guard let outFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true),
-      let conv = AVAudioConverter(from: inFmt, to: outFmt) else {
-    warn("audio converter failed for \(inFmt)")
-    exit(2)
-}
-warn("input '\(defaultInputName())' \(Int(inFmt.sampleRate)) Hz x\(inFmt.channelCount) -> 16000 Hz mono, "
-     + "voice processing \(input.isVoiceProcessingEnabled ? "ON" : "off")")
-
 var zeroSamples = 0
 var silenceReported = false
-input.installTap(onBus: 0, bufferSize: 2048, format: inFmt) { buf, _ in
-    let cap = AVAudioFrameCount(Double(buf.frameLength) * outFmt.sampleRate / inFmt.sampleRate) + 32
-    guard let ob = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return }
-    var consumed = false
-    var err: NSError?
-    let st = conv.convert(to: ob, error: &err) { _, status in
-        if consumed { status.pointee = .noDataNow; return nil }
-        consumed = true
-        status.pointee = .haveData
-        return buf
+var switchRequested = false  // 3 s of digital zeros in a voice-processing mode: fall through to the next mode
+
+func start(mode: Int) -> AVAudioEngine? {
+    let engine = AVAudioEngine()
+    let input = engine.inputNode
+    if aec && mode < 2 {
+        do { try input.setVoiceProcessingEnabled(true) } catch { warn("voice processing unavailable: \(error)"); return nil }
+        if mode == 0 { engine.mainMixerNode.outputVolume = 0 }  // touching mainMixerNode connects it to the output
     }
-    if st == .error { warn("convert: \(err?.localizedDescription ?? "?")"); return }
-    let n = Int(ob.frameLength)
-    guard n > 0, let ch = ob.int16ChannelData else { return }
-    var nonzero = false
-    for i in 0..<n where ch[0][i] != 0 { nonzero = true; break }
-    if nonzero {
-        zeroSamples = 0
-    } else {
-        zeroSamples += n
-        if !silenceReported && zeroSamples >= 16000 * 4 {
-            silenceReported = true
-            warn("4 s of digital silence — the default input device gives nothing (wrong device / permission); dd switches to ffmpeg")
+    engine.prepare()
+    var inFmt = input.outputFormat(forBus: 0)
+    if inFmt.sampleRate == 0 || inFmt.channelCount == 0 { inFmt = input.inputFormat(forBus: 0) }
+    guard inFmt.sampleRate > 0, inFmt.channelCount > 0 else {
+        warn("no input format — Microphone permission for dd? (System Settings → Privacy & Security → Microphone)")
+        return nil
+    }
+    guard let outFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true),
+          let conv = AVAudioConverter(from: inFmt, to: outFmt) else {
+        warn("audio converter failed for \(inFmt)")
+        return nil
+    }
+    input.installTap(onBus: 0, bufferSize: 2048, format: inFmt) { buf, _ in
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * outFmt.sampleRate / inFmt.sampleRate) + 32
+        guard let ob = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return }
+        var consumed = false
+        var err: NSError?
+        let st = conv.convert(to: ob, error: &err) { _, status in
+            if consumed { status.pointee = .noDataNow; return nil }
+            consumed = true
+            status.pointee = .haveData
+            return buf
         }
+        if st == .error { warn("convert: \(err?.localizedDescription ?? "?")"); return }
+        let n = Int(ob.frameLength)
+        guard n > 0, let ch = ob.int16ChannelData else { return }
+        var nonzero = false
+        for i in 0..<n where ch[0][i] != 0 { nonzero = true; break }
+        if nonzero {
+            zeroSamples = 0
+        } else {
+            zeroSamples += n
+            if mode < 2 && zeroSamples >= 16000 * 3 && !switchRequested {
+                switchRequested = true
+            } else if mode == 2 && !silenceReported && zeroSamples >= 16000 * 4 {
+                silenceReported = true
+                warn("4 s of digital silence — the default input device gives nothing (wrong device / permission); dd switches to ffmpeg")
+            }
+        }
+        let bytes = n * 2
+        let written = ch[0].withMemoryRebound(to: UInt8.self, capacity: bytes) { write(1, $0, bytes) }
+        if written < 0 { exit(0) }  // the listener went away
     }
-    let bytes = n * 2
-    let written = ch[0].withMemoryRebound(to: UInt8.self, capacity: bytes) { write(1, $0, bytes) }
-    if written < 0 { exit(0) }  // the listener went away
+    do { try engine.start() } catch {
+        warn("engine start failed (mode \(mode)): \(error)")
+        input.removeTap(onBus: 0)
+        return nil
+    }
+    let vp = (aec && mode < 2) ? (mode == 0 ? "ON" : "ON (input only)") : "off"
+    warn("input '\(defaultInputName())' \(Int(inFmt.sampleRate)) Hz x\(inFmt.channelCount) -> 16000 Hz mono, voice processing \(vp)")
+    return engine
 }
-do { try engine.start() } catch {
-    warn("engine start failed: \(error)")
+
+var running: AVAudioEngine? = nil
+var currentMode = 2
+
+func tryStart(from: Int) {
+    for m in from...2 {
+        if !aec && m < 2 { continue }
+        if let e = start(mode: m) { running = e; currentMode = m; return }
+    }
     exit(4)
 }
-RunLoop.main.run()
+
+tryStart(from: 0)
+while true {
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.25))
+    if switchRequested {
+        switchRequested = false
+        if currentMode < 2 {
+            warn("3 s of silence in voice-processing mode \(currentMode) — trying mode \(currentMode + 1)")
+            running?.inputNode.removeTap(onBus: 0)
+            running?.stop()
+            running = nil
+            zeroSamples = 0
+            silenceReported = false
+            tryStart(from: currentMode + 1)
+        }
+    }
+}

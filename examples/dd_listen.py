@@ -40,7 +40,7 @@ RATE = 16000
 FRAME_MS = 20
 FRAME_BYTES = RATE * 2 * FRAME_MS // 1000  # 640 bytes = 20 ms of 16-bit mono
 MAC = platform.system() == "Darwin"
-HINT = "Jarvis. dd. Chrome open pannu. Volume thirty. Innaiku weather enna? Screenshot edu. Sollu."
+HINT = "Jarvis. dd. Chrome open pannu. Volume thirty. Innaiku weather enna? Screenshot edu."  # (never dd's own replies)
 VOICE_SUFFIX = ("\n\nVOICE MODE: your reply is spoken aloud. 1-2 short sentences, no tables, no lists; "
                 "put code only when asked (it is shown, not read).")
 # How Whisper tends to write a spoken "dd" / "jarvis". Compared after lower-casing and dropping punctuation/spaces.
@@ -49,7 +49,8 @@ WAKE_FORMS = {"dd", "ddd", "d", "didi", "deedee", "dede", "dedi", "didee", "teed
 LEAD_SKIP = {"hey", "ok", "okay", "hi", "hello", "so", "yo", "the", "a", "ey", "hey,"}
 # Things Whisper invents from silence / noise — never treat as a command.
 HALLUCINATIONS = {"thank you", "thanks for watching", "thank you for watching", "you", "bye", "subtitles by",
-                  "the end", "so", "okay", "oh", "hmm", "uh", "um", "i", "a"}
+                  "the end", "so", "okay", "oh", "hmm", "uh", "um", "i", "a", "sollu", "up", "ah", "bump",
+                  "jarvis dd", "dd jarvis"}  # the last ones: prompt words Whisper echoes on noise
 
 
 def rms(frame: bytes) -> float:
@@ -184,7 +185,10 @@ def parse_wake(text: str) -> tuple[bool, str]:
 
 def blocked(text: str) -> bool:
     t = re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
-    return not re.search(r"[a-z]", t) or t in HALLUCINATIONS
+    if not re.search(r"[a-z]", t) or t in HALLUCINATIONS:
+        return True
+    words = t.split()
+    return len(words) >= 3 and len(set(words)) == 1  # "bump bump bump bump": a loop Whisper invents from noise
 
 
 def pick_mic(listing: str) -> str:
@@ -252,7 +256,7 @@ def helper_binary() -> str:
 
 
 _helper_failures = 0
-SILENCE_FALLBACK_MS = 4000  # dd-mic gave nothing but digital zeros for this long since start -> ffmpeg instead
+SILENCE_FALLBACK_MS = 8000  # dd-mic gave nothing but digital zeros for this long since start -> ffmpeg instead (the helper itself cascades through its modes within that)
 
 
 def choose_source() -> tuple[str, str | None]:
@@ -351,10 +355,18 @@ def whisper_cached(name: str, hub: Path | None = None) -> bool:
     return any((repo / "snapshots").glob("*/model.bin")) if repo.is_dir() else False
 
 
+def default_stt_model() -> str:
+    """small is clearly better for Thanglish, but on an 8 GB Mac next to Ollama it starves (10-20 s per command):
+    base there, small from 16 GB. DD_STT_MODEL overrides."""
+    return os.environ.get("DD_STT_MODEL") or ("small" if ram_gb() >= 12 else "base")
+
+
 def _load(name: str):
     from faster_whisper import WhisperModel  # pip install faster-whisper
     # already downloaded -> never touch the hub again for it (a flaky line must not stall a cached model)
-    return WhisperModel(name, device="auto", compute_type="int8", local_files_only=whisper_cached(name))
+    threads = max(2, min(4, (os.cpu_count() or 4) // 2))
+    return WhisperModel(name, device="auto", compute_type="int8", local_files_only=whisper_cached(name),
+                        cpu_threads=threads)
 
 
 def load_whisper():
@@ -365,7 +377,7 @@ def load_whisper():
     with _whisper_lock:
         if _whisper is not None:
             return _whisper
-        name = os.environ.get("DD_STT_MODEL", "small")
+        name = default_stt_model()
         if name != "base" and not whisper_cached(name) and whisper_cached("base"):
             print(f"(whisper: using cached base now; '{name}' downloads in the background)", flush=True)
             _whisper = _load("base")
@@ -539,9 +551,14 @@ OWW_FILES = ("melspectrogram.onnx", "embedding_model.onnx", "hey_jarvis_v0.1.onn
 OWW_RELEASE = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/"
 
 
+OWW_BUNDLED = str(dd.ROOT / "skills" / "voice" / "assets" / "oww")  # shipped with the repo (Apache-2.0, ~3.7 MB)
+
+
 def oww_model_dir() -> str:
-    """Where the hey-jarvis ONNX files live: inside openwakeword 0.4.x (bundled) or ~/.dd/models/oww (0.5+ ships
-    no models — they are downloaded there once from the openWakeWord GitHub release)."""
+    """Where the hey-jarvis ONNX files live: the copies shipped in this repo, else inside openwakeword 0.4.x,
+    else ~/.dd/models/oww (downloaded once from the openWakeWord GitHub release)."""
+    if all(os.path.isfile(os.path.join(OWW_BUNDLED, f)) for f in OWW_FILES):
+        return OWW_BUNDLED
     import openwakeword
     pkg = os.path.join(os.path.dirname(os.path.abspath(openwakeword.__file__)), "resources", "models")
     if all(os.path.isfile(os.path.join(pkg, f)) for f in OWW_FILES):
@@ -549,12 +566,35 @@ def oww_model_dir() -> str:
     return str(Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "models" / "oww")
 
 
+def fetch(url: str, dest: str, timeout: int = 60) -> None:
+    """Download with Python's SSL (certifi's CA bundle when the python has no certificates — python.org builds on
+    macOS until 'Install Certificates.command' is run), else with curl (uses the system keychain)."""
+    import ssl
+    import urllib.request
+    ctx = None
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    try:
+        with urllib.request.urlopen(url, timeout=timeout, context=ctx) as r, open(dest, "wb") as out:
+            shutil.copyfileobj(r, out)
+        return
+    except Exception as e:
+        if not shutil.which("curl"):
+            raise
+        last = e
+    r = subprocess.run(["curl", "-fsSL", "--max-time", str(timeout * 3), "-o", dest, url], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"{last}; curl: {r.stderr.strip()[-120:]}")
+
+
 def ensure_oww_models(folder: str, log=print) -> None:
     """Download the missing wake-model files into `folder` (atomic: .part then rename)."""
     missing = [f for f in OWW_FILES if not os.path.isfile(os.path.join(folder, f))]
     if not missing:
         return
-    import urllib.request
     os.makedirs(folder, exist_ok=True)
     for i, name in enumerate(missing, 1):
         log(f"  wake model: downloading {name} ({i}/{len(missing)}, one-time)...")
@@ -562,8 +602,7 @@ def ensure_oww_models(folder: str, log=print) -> None:
         last: Exception | None = None
         for attempt in range(3):  # a flaky line must not cost the always-on wake word
             try:
-                with urllib.request.urlopen(OWW_RELEASE + name, timeout=60) as r, open(part, "wb") as out:
-                    shutil.copyfileobj(r, out)
+                fetch(OWW_RELEASE + name, part)
                 if os.path.getsize(part) < 10_000:
                     raise RuntimeError("download came back empty")
                 break
@@ -1198,6 +1237,8 @@ def selftest() -> int:
 
     # 3. hallucination filter + mic picker
     assert blocked("Thank you.") and blocked("...") and blocked("you") and not blocked("chrome open pannu")
+    assert blocked("Sollu.") and blocked("Bump. Bump. Bump. Bump.") and blocked("Jarvis. dd.") and not blocked("dd")
+    assert not blocked("open open sesame") and not blocked("Rude. Sollu.")
     listing = ("[AVFoundation indev @ 0x1] AVFoundation video devices:\n[AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n"
                "[AVFoundation indev @ 0x1] AVFoundation audio devices:\n[AVFoundation indev @ 0x1] [0] AirPods Pro\n"
                "[AVFoundation indev @ 0x1] [1] MacBook Air Microphone\n")

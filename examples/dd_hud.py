@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """dd_hud.py — dd's on-screen voice panel (Siri-style) for the Mac app.
 
-A small floating, click-through pill at the bottom of the screen. It appears the moment "hey jarvis" is heard
-and shows what dd is doing: live mic bars that move with your voice while it listens, the words it understood,
-then the spoken reply — and it fades out when the conversation is over. It never takes focus and never touches
+A small floating, click-through pill at the bottom of the screen. It appears the moment "hey jarvis" is heard:
+blue voice bars that move with your voice while it listens, a slow wave while it thinks, a quicker one while it
+speaks — and it fades out when the conversation is over. That is all it shows by default (nothing covers the
+screen); DD_HUD=full adds the words it understood and the reply. It never takes focus and never touches
 the keyboard or mouse. Pure AppKit through PyObjC (which rumps already needs); if AppKit is missing or anything
 fails, dd_app falls back to notifications + the menu-bar icon.
 
@@ -13,6 +14,7 @@ Headless-testable: HudModel decides *what* to show from the listener's state; Hu
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
 
@@ -85,14 +87,23 @@ def bar_heights(energy: float, mode: str, t: float) -> list[float]:
 
 
 class HudPanel:
-    """The AppKit panel. Construct only on macOS inside the app's main thread (rumps timer)."""
+    """The AppKit panel. Construct only on macOS inside the app's main thread (rumps timer).
+    style "bars" (default): just the small pill with the blue voice bars — nothing covers the screen.
+    style "full": bars + what dd heard + its reply (DD_HUD=full)."""
 
-    def __init__(self):
+    def __init__(self, style: str | None = None):
         import AppKit  # pyobjc-framework-Cocoa (installed with rumps)
         from Foundation import NSMakeRect
         self.AppKit, self.NSMakeRect = AppKit, NSMakeRect
+        self.style = style or ("full" if os.environ.get("DD_HUD", "bars").lower() == "full" else "bars")
+        bars_w = BARS * BAR_GAP - (BAR_GAP - BAR_W)
+        if self.style == "bars":
+            self.W, self.H, self.R = bars_w + 2 * 14, 36, 18
+        else:
+            self.W, self.H, self.R = W, H, R
+        bar_x0 = 14 if self.style == "bars" else 26
         AppKit.NSApplication.sharedApplication()  # the window server connection must exist before any window
-        rect = NSMakeRect(0, 0, W, H)
+        rect = NSMakeRect(0, 0, self.W, self.H)
         panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(rect, 1 << 7, 2, False)
         panel.setLevel_(25)                                # status-window level: above full-screen video too
         panel.setCollectionBehavior_((1 << 0) | (1 << 4) | (1 << 8))  # all spaces · stationary · full-screen aux
@@ -112,7 +123,7 @@ class HudPanel:
         fx.setState_(1)            # always active
         fx.setWantsLayer_(True)
         try:
-            fx.layer().setCornerRadius_(R)
+            fx.layer().setCornerRadius_(self.R)
             fx.layer().setMasksToBounds_(True)
         except Exception:
             pass
@@ -120,30 +131,32 @@ class HudPanel:
         tint = AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.42, 0.72, 1.0, 1.0)
         self.bars = []
         for i in range(BARS):
-            b = AppKit.NSBox.alloc().initWithFrame_(NSMakeRect(26 + i * BAR_GAP, H / 2 - 3, BAR_W, 6))
+            b = AppKit.NSBox.alloc().initWithFrame_(NSMakeRect(bar_x0 + i * BAR_GAP, self.H / 2 - 3, BAR_W, 6))
             b.setBoxType_(4)       # custom
             b.setBorderWidth_(0)
             b.setCornerRadius_(BAR_W / 2)
             b.setFillColor_(tint)
             fx.addSubview_(b)
             self.bars.append(b)
-        self.title = AppKit.NSTextField.wrappingLabelWithString_("")
-        self.title.setFrame_(NSMakeRect(TEXT_X, 30, W - TEXT_X - 20, 46))
-        self.title.setFont_(AppKit.NSFont.systemFontOfSize_weight_(15.0, 0.23))
-        self.title.setTextColor_(AppKit.NSColor.whiteColor())
-        self.title.setMaximumNumberOfLines_(2)
-        try:
-            self.title.cell().setTruncatesLastVisibleLine_(True)
-        except Exception:
-            pass
-        self.title.setSelectable_(False)
-        fx.addSubview_(self.title)
-        self.sub = AppKit.NSTextField.labelWithString_("")
-        self.sub.setFrame_(NSMakeRect(TEXT_X, 9, W - TEXT_X - 20, 18))
-        self.sub.setFont_(AppKit.NSFont.systemFontOfSize_(11.5))
-        self.sub.setTextColor_(AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.7))
-        self.sub.setLineBreakMode_(4)  # truncate tail
-        fx.addSubview_(self.sub)
+        self.title = self.sub = None
+        if self.style == "full":
+            self.title = AppKit.NSTextField.wrappingLabelWithString_("")
+            self.title.setFrame_(NSMakeRect(TEXT_X, 30, W - TEXT_X - 20, 46))
+            self.title.setFont_(AppKit.NSFont.systemFontOfSize_weight_(15.0, 0.23))
+            self.title.setTextColor_(AppKit.NSColor.whiteColor())
+            self.title.setMaximumNumberOfLines_(2)
+            try:
+                self.title.cell().setTruncatesLastVisibleLine_(True)
+            except Exception:
+                pass
+            self.title.setSelectable_(False)
+            fx.addSubview_(self.title)
+            self.sub = AppKit.NSTextField.labelWithString_("")
+            self.sub.setFrame_(NSMakeRect(TEXT_X, 9, W - TEXT_X - 20, 18))
+            self.sub.setFont_(AppKit.NSFont.systemFontOfSize_(11.5))
+            self.sub.setTextColor_(AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.7))
+            self.sub.setLineBreakMode_(4)  # truncate tail
+            fx.addSubview_(self.sub)
         self.panel, self.fx, self.tint = panel, fx, tint
         self.alpha, self.shown = 0.0, False
         self._title, self._sub, self._mode = None, None, None
@@ -153,7 +166,7 @@ class HudPanel:
         if scr is None:
             return
         vf = scr.visibleFrame()
-        x = vf.origin.x + (vf.size.width - W) / 2
+        x = vf.origin.x + (vf.size.width - self.W) / 2
         y = vf.origin.y + 28
         self.panel.setFrameOrigin_((x, y))
 
@@ -164,10 +177,10 @@ class HudPanel:
                 self.place()
                 self.panel.orderFrontRegardless()
                 self.shown = True
-            if frame["title"] != self._title:
+            if self.title is not None and frame["title"] != self._title:
                 self._title = frame["title"]
                 self.title.setStringValue_(frame["title"])
-            if frame["sub"] != self._sub:
+            if self.sub is not None and frame["sub"] != self._sub:
                 self._sub = frame["sub"]
                 self.sub.setStringValue_(frame["sub"])
             if frame["mode"] != self._mode:
@@ -175,9 +188,11 @@ class HudPanel:
                 red = self.AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.45, 0.4, 1.0)
                 for b in self.bars:
                     b.setFillColor_(red if frame["mode"] == "error" else self.tint)
+            scale = (self.H * 0.6) / (H * 0.5) if self.style == "bars" else 1.0  # the small pill uses its height
             for b, h in zip(self.bars, bar_heights(frame["energy"], frame["mode"], t)):
                 f = b.frame()
-                b.setFrame_(self.NSMakeRect(f.origin.x, H / 2 - h / 2, BAR_W, h))
+                hh = 4.0 + (h - 6.0) * scale if self.style == "bars" else h
+                b.setFrame_(self.NSMakeRect(f.origin.x, self.H / 2 - hh / 2, BAR_W, hh))
         step = 0.14
         self.alpha = max(0.0, min(1.0, self.alpha + max(-step, min(step, target - self.alpha))))
         self.panel.setAlphaValue_(self.alpha)

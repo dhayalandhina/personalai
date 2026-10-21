@@ -10,6 +10,8 @@ examples/dd_listen.py loads them next to the hey-jarvis model (DDHead). CPU only
   python3 wakeword_train.py voices  [--voices DIR]        # download 6 Piper voices from Hugging Face (~400 MB)
   python3 wakeword_train.py all     [--work DIR] [--out skills/voice/assets/wake_dd.npz]
   python3 wakeword_train.py gen|feats|train|export        # single stages (cached in --work)
+  python3 wakeword_train.py record                        # 10 clips of YOUR 'dee dee' -> ~/.dd/wake-train/my-voice
+  python3 wakeword_train.py all --pos-only                # retrain with them (negatives reused): misses on your voice gone
   python3 wakeword_train.py --selftest                    # tiny synthetic run (no Piper, no downloads)
 
 pip install piper-tts openwakeword scipy scikit-learn numpy   (all free)
@@ -214,8 +216,56 @@ def synth(voice, text: str, spk=None):
     return a
 
 
+def load_recordings(folder: Path) -> list:
+    """Your own 'dee dee' recordings (any format ffmpeg reads) -> 16 kHz float clips, trimmed."""
+    import shutil
+    import subprocess
+    np = _np()
+    out = []
+    if not folder or not folder.is_dir() or not shutil.which("ffmpeg"):
+        return out
+    for f in sorted(folder.iterdir()):
+        if f.suffix.lower() not in (".wav", ".m4a", ".mp3", ".ogg", ".flac", ".aiff", ".caf", ".webm"):
+            continue
+        try:
+            pcm = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(f), "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"],
+                                 check=True, capture_output=True, timeout=60).stdout
+        except Exception:
+            continue
+        a = np.frombuffer(pcm, dtype=np.float32).copy()
+        if len(a) < SR // 4:
+            continue
+        a = a / (np.max(np.abs(a)) + 1e-6) * 0.7
+        e = np.abs(a) > 0.02
+        if e.any():
+            i, j = int(np.argmax(e)), len(a) - int(np.argmax(e[::-1]))
+            a = a[max(0, i - 800): j + 800]
+        out.append(a[-int(SR * 1.8):])  # keep the last 1.8 s: the phrase itself
+    return out
+
+
+def record(folder: Path, n: int = 10, seconds: float = 2.0) -> int:
+    """Record n short clips of you saying 'dee dee' (terminal; ffmpeg + the default mic)."""
+    import shutil
+    import subprocess
+    if not shutil.which("ffmpeg"):
+        print("ffmpeg missing (brew install ffmpeg)")
+        return 1
+    folder.mkdir(parents=True, exist_ok=True)
+    mac = sys.platform == "darwin"
+    inp = ["-f", "avfoundation", "-i", f":{os.environ.get('DD_MIC', '0')}"] if mac else ["-f", "pulse", "-i", "default"]
+    for i in range(n):
+        input(f"[{i + 1}/{n}] Enter adichu 'dee dee' sollu ({seconds:.0f} s)...")
+        dst = folder / f"deedee-{int(time.time())}-{i + 1}.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *inp, "-t", str(seconds), "-ac", "1", "-ar", str(SR), str(dst)], check=False)
+        print(f"  saved {dst.name}")
+    print(f"done: {n} clips in {folder}. Retrain: wakeword_train.py all --my-voice {folder}")
+    return 0
+
+
 # ---------------- stages ----------------
-def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500, n_noise=600, pos_only: bool = False) -> None:
+def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500, n_noise=600, pos_only: bool = False,
+              my_voice: Path | None = None) -> None:
     np = _np()
     voices = load_voices(voices_dir)
     names = list(voices)
@@ -258,6 +308,15 @@ def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500,
             posmeta.append({"voice": name, "spk": spk, "text": text, "aug": k, "tail": tail is not None})
         if i % 300 == 0:
             print(f"pos {i}/{n_pos} {time.time() - t0:.0f}s", flush=True)
+    mine = load_recordings(my_voice) if my_voice else []
+    for a in mine:  # your real voice counts for a lot: 24 augmented copies each (speed, room, noise, level)
+        for k in range(24):
+            b = a if k == 0 else speed_perturb(a, 0.9, 1.1)
+            x = place(b, rng.uniform(0.0, 0.4))
+            pos.append(x if k == 0 else augment(x))
+            posmeta.append({"voice": "me", "spk": None, "text": "dee dee", "aug": k, "mine": True})
+    if mine:
+        print(f"your recordings: {len(mine)} clips -> {len(mine) * 24} positives", flush=True)
     if pos_only and (work / "neg.npy").is_file() and (work / "meta.json").is_file():
         old_meta = json.loads((work / "meta.json").read_text())
         (work / "meta.json").write_text(json.dumps({"pos": posmeta, "neg": old_meta["neg"]}))
@@ -429,6 +488,16 @@ def selftest() -> int:
     pp = np.array([forward(e[-T:, :]) for e in pe]); pn = np.array([forward(e[-T:, :]) for e in ne])
     assert np.mean(pp > 0.5) > 0.9 and np.mean(pn < 0.5) > 0.9 and pp.mean() > pn.mean() + 0.3, (pp.mean(), pn.mean())
     assert abs(forward(pe[1, -T:, :]) - clf.predict_proba(((pe[1, -T:, :].reshape(1, -1)) - mu) / sd)[0, 1]) < 1e-4
+    import wave
+    rec = work / "rec"
+    rec.mkdir()
+    with wave.open(str(rec / "me1.wav"), "wb") as wf:  # a 1 s tone 'recording'
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SR)
+        wf.writeframes((np.sin(2 * np.pi * 300 * np.arange(SR) / SR) * 12000).astype(np.int16).tobytes())
+    (rec / "notes.txt").write_text("ignored")
+    mine = load_recordings(rec)
+    assert len(mine) == 1 and 0.9 * SR <= len(mine[0]) <= 1.2 * SR and float(np.max(np.abs(mine[0]))) <= 0.71, [len(m) for m in mine]
+    assert load_recordings(work / "nope") == []
     try:
         import openwakeword  # noqa: F401
         have_oww = True
@@ -446,7 +515,8 @@ def main(argv: list[str]) -> int:
     if "--selftest" in argv:
         return selftest()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", choices=["voices", "gen", "feats", "train", "all"])
+    ap.add_argument("stage", choices=["voices", "record", "gen", "feats", "train", "all"])
+    ap.add_argument("--my-voice", default="", help="folder of your own 'dee dee' recordings (record stage writes it)")
     ap.add_argument("--work", default=str(Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "wake-train"))
     ap.add_argument("--voices", default=str(Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "piper-voices"))
     ap.add_argument("--out", default=str(SKILL / "assets" / "wake_dd.npz"))
@@ -455,13 +525,16 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--pos-only", action="store_true", help="regenerate positives only, keep the work dir's negatives")
     a = ap.parse_args(argv)
     work, voices, out = Path(a.work), Path(a.voices), Path(a.out)
+    mine = Path(a.my_voice) if a.my_voice else Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "wake-train" / "my-voice"
     if a.stage == "voices":
         print(json.dumps({"voices": download_voices(voices), "dir": str(voices)}))
         return 0
+    if a.stage == "record":
+        return record(mine)
     if a.stage in ("gen", "all"):
         if not glob.glob(str(voices / "*.onnx")):
             download_voices(voices)
-        stage_gen(work, voices, n_pos=a.pos, n_neg=a.neg, pos_only=a.pos_only)
+        stage_gen(work, voices, n_pos=a.pos, n_neg=a.neg, pos_only=a.pos_only, my_voice=mine if mine.is_dir() else None)
     if a.stage in ("feats", "all"):
         stage_feats(work)
     if a.stage in ("train", "all"):
