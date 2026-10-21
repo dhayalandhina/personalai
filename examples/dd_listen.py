@@ -621,6 +621,21 @@ def stt_plain(pcm: bytes) -> str:
     return stt(pcm, hint=CONFIRM_HINT)
 
 
+_confirm_whisper = None
+
+
+def load_confirm_whisper():
+    """The model that confirms wake candidates: the command model unless DD_CONFIRM_MODEL names another one."""
+    global _confirm_whisper
+    name = os.environ.get("DD_CONFIRM_MODEL", "")
+    if not name or name == default_stt_model():
+        return load_whisper()
+    with _whisper_lock:
+        if _confirm_whisper is None:
+            _confirm_whisper = _load(name)
+        return _confirm_whisper
+
+
 def stt_confirm(pcm: bytes) -> tuple[str, float, float]:
     """Whisper on a wake candidate: (text, avg log-prob, no-speech prob). The clip is first brought up to a normal
     level — a "Jarvis" said from the sofa reaches the Mac's mic at about -45 dBFS, where Whisper hears only noise —
@@ -649,8 +664,9 @@ def stt_confirm(pcm: bytes) -> tuple[str, float, float]:
             return text, lp, ns
         except Exception as e:
             print(f"(mlx confirm failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
-    model = load_whisper()
-    segs, _ = model.transcribe(audio, language=lang, beam_size=1, vad_filter=False, condition_on_previous_text=False,
+    model = load_confirm_whisper()
+    beam = int(os.environ.get("DD_CONFIRM_BEAM", "1"))
+    segs, _ = model.transcribe(audio, language=lang, beam_size=beam, vad_filter=False, condition_on_previous_text=False,
                                initial_prompt=CONFIRM_HINT, no_speech_threshold=None, log_prob_threshold=None)
     segs = list(segs)
     text = " ".join(x.text.strip() for x in segs).strip()

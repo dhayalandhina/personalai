@@ -1,18 +1,13 @@
 {
- "0.5": {
-  "recall": 0.9803,
-  "fp_rate": 0.01537
+ "trained": "2026-10-21, round 2: synthetic voices (Piper/espeak) + Dhina's 5 setup recordings (x300 augmented, also mixed into media) + real negatives hard-mined twice: Japanese anime speech (joujiboi/japanese-anime-speech), JSUT, Tamil (FLEURS ta_in), English (LibriSpeech)",
+ "held_out_media_false_candidates_per_hour": {
+  "0.7": 31.5,
+  "0.9": 21.5,
+  "0.98": 10.5,
+  "previous_head_at_0.7": 112.0
  },
- "0.8": {
-  "recall": 0.9718,
-  "fp_rate": 0.01098
- },
- "0.9": {
-  "recall": 0.9681,
-  "fp_rate": 0.00952
- },
- "0.95": {
-  "recall": 0.9634,
-  "fp_rate": 0.00732
- }
+ "dhina_leave_one_out": "5/5 recordings score 1.0 at all 8 chunk alignments, at sofa and far levels",
+ "dhina_live_clip_140658": "1.0 at 8/8 alignments (previous head: >=0.7 at 6/8)",
+ "listener_replay_quiet_room": "18/18 woke, 0 false wakes (previous head 11/18)",
+ "listener_replay_anime_+15dB": "13/18 woke, 0 false wakes, 168 Whisper checks/h (previous head 8/18, 582/h)"
 }
