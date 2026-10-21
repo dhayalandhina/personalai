@@ -878,6 +878,7 @@ CONFIRM_HINT = "Jarvis."
 CONFIRM_QUIET_MODEL = os.environ.get("DD_CONFIRM_QUIET_MODEL", "small")  # few candidates, CPU free: the better ear
 CONFIRM_FILM_MODEL = os.environ.get("DD_CONFIRM_FILM_MODEL", "base")     # a film proposes one every few seconds
 CONFIRM_MIN_WORDPROB = float(os.environ.get("DD_CONFIRM_WORDPROB", "0.03"))
+CONFIRM_SURE_WORDPROB = float(os.environ.get("DD_CONFIRM_SURE_WORDPROB", "0.15"))  # the word alone decides above this
 
 
 _small_slow_until = 0.0  # small took far longer than the audio: base until then (small is tried again after)
@@ -1822,6 +1823,7 @@ class Listener:
         self.followup_until = 0.0
         self.tail = 0            # frames still to drop after dd finished speaking (its own echo)
         self.speaking = False
+        self._own_echo = [0.0, 0.0, 0.0]  # while dd speaks: energy left, energy removed, raw mic peak (ear check)
         self.pending_wake = False  # a wake heard while dd spoke (barge-in): armed as soon as it is quiet
         self.wake_answered = True  # False between a wake and its command (false-wake learning for the dd head)
         self.recent: deque[bytes] = deque(maxlen=100)   # last 2 s of mic audio (Whisper confirms "dd" candidates)
@@ -1973,6 +1975,8 @@ class Listener:
         except Exception as e:
             self.log(f"  (could not stop speaking: {e})")
 
+    FILM_COMMAND_MS = 5000  # film mode: the command window (the film never lets the segmenter end on silence)
+
     def on_wake(self, score: float, word: str | None = None, source=None) -> None:
         """A wake phrase was detected: short sound (without pausing the mic), then the next utterance is the command.
         source: the head/soft detector that proposed it (learns from what follows), None for the instant model."""
@@ -1996,6 +2000,7 @@ class Listener:
             self.seg.pre.extend(list(self.recent)[-self.seg.pre.maxlen:])  # "hey jarvis chrome open pannu" in one go
         self.tentative_until = 0.0
         self.armed_until = self.clock() + self.followup_s
+        self.seg.max_ms = self.FILM_COMMAND_MS if self.film_mode() else 8000
         self.set_state("recording")
 
     def _ensure_handle(self):
@@ -2038,6 +2043,12 @@ class Listener:
         text = self.stt(utt).strip()
         secs = self.clock() - t0
         self._last_activity = self.clock()
+        if text and ts < self.armed_until and prompt_echo(text):
+            # right after a confirmed wake the first sentence is his command even when it is also a prompt sentence
+            # ("Volume thirty." + a hallucinated "Innaiku weather enna?" on the film that followed)
+            first = re.split(r"(?<=[.?!])\s+", text, maxsplit=1)[0]
+            self.log(f"  (prompt echo after '{first}' dropped)")
+            text = first
         if not text or blocked(text):
             self.last_heard = f"(sound, no words — {audio:.1f}s)" if not text else f"(ignored: {text})"
             self.on_heard("", secs)
@@ -2114,6 +2125,18 @@ class Listener:
             return
         if self.speaking or self.tail > 0:
             self.tail = max(0, self.tail - (0 if self.speaking else 1))
+            if self.speaking and EAR_STATUS["active"] and EAR_STATS:  # dd's own voice: the echo canceller's own test
+                left, removed = EAR_STATS[-1]
+                self._own_echo[0] += left
+                self._own_echo[1] += removed
+                self._own_echo[2] = max(self._own_echo[2], math.sqrt(max(left + removed, 0.0)))  # raw mic level
+            elif not self.speaking and self._own_echo[1] > 0:
+                left, removed, peak = self._own_echo
+                self._own_echo = [0.0, 0.0, 0.0]
+                if removed > 1e4 and peak > 200:  # (it was audible in the room, and the canceller saw it)
+                    erle = 10 * math.log10((left + removed) / max(left, 1e-9))
+                    self.log(f"  ear check: dd's own voice came back through the mic at peak {peak:.0f}; "
+                             f"the echo canceller removed {erle:.1f} dB of it")
             if self.speaking and self.wake is not None and self.wake.feed(frame) \
                     and getattr(self.wake, "last_source", None) is None:  # barge-in: a sure "hey jarvis" mid-sentence
                 self.log("  wake: hey jarvis while speaking — cutting the reply")
@@ -2193,11 +2216,18 @@ class Listener:
             if score:
                 self._near_pending = None  # it was not a near miss after all
                 word, source = getattr(self.wake, "last_word", "") or "hey jarvis", getattr(self.wake, "last_source", None)
-                if source is not None and self.verify:
+                if source is not None and self.clock() < max(self.armed_until, self.followup_until):
+                    # already awake and taking the command: a head firing on "...chrome open pannu" over a film must
+                    # not restart the capture (it cut the command short) — the words are being recorded anyway
+                    if hasattr(self.wake, "cooldown"):
+                        self.wake.cooldown = 0
+                elif source is not None and self.verify:
                     self.confirm_wake(score, word, source)  # stage two: Whisper decides, on the worker thread
                 else:
                     self.on_wake(score, word, source)
-                return
+                    return
+                if self.clock() >= max(self.armed_until, self.followup_until):
+                    return
             if self.clock() >= self.armed_until and self.clock() >= self.followup_until \
                     and self.clock() >= self.tentative_until:
                 if self.state == "recording":
@@ -2272,8 +2302,8 @@ class Listener:
         if busy and not voice_over_film:
             # a check is running (or one just started): this candidate is not dropped — the best one that arrives
             # meanwhile waits its turn (its audio is kept), so his "Jarvis" 2 s after a film line is still checked
-            spacing = 2.0 if mac_busy() or small_slow() else 4.0  # (base: ~0.5 s a check; small: 2-26 s)
-            if self._verify_inflight or self.verify_pending is not None or now - self._last_verify_at < spacing:
+            # (film mode checks with base, 1.5 s of audio: ~0.5 s each — a new candidate 2 s on gets its own check)
+            if self._verify_inflight or self.verify_pending is not None or now - self._last_verify_at < 2.0:
                 if self._verify_next is None or score > self._verify_next["score"]:
                     if self._verify_next is not None:
                         self._verify_skipped += 1
@@ -2296,7 +2326,11 @@ class Listener:
         ear = list(EAR_STATS) if EAR_STATUS["active"] and EAR_STATUS["playing"] else None
         job = ("verify", pcm, score, word, source, raw, self.clock(), ear)
         if queued:  # (behind the running check; at most one waits — the newest best replaces an older one)
-            if self.inline:
+            if self.inline:  # (tests: nothing runs behind anything — check it now)
+                self._last_verify_at = self.clock()
+                self._verify_inflight = True
+                self.tentative_until = max(self.tentative_until, self.clock() + self.TENTATIVE_HOLD_S)
+                self._verify(pcm, score, word, source, raw, None, ear)
                 return
             while len(self.vqueue) > 1:
                 self.vqueue.pop()
@@ -2385,7 +2419,11 @@ class Listener:
             except Exception as e:
                 self.log(f"  (wake confirmation failed: {e})")
             word_ok = wp < 0 or wp >= CONFIRM_MIN_WORDPROB  # (the prompt alone wrote "Jarvis." over film speech)
-            if text and confirms(word, text) and lp >= CONFIRM_MIN_LOGPROB and ns <= CONFIRM_MAX_NOSPEECH and word_ok:
+            # a clearly heard word counts even when film speech before it drags the segment's log-prob down
+            # ("Thank you very much for your time, Jarvis." lp -1.39 word p 0.3: his Jarvis after a film line)
+            sure_word = wp >= CONFIRM_SURE_WORDPROB and ns <= 0.8
+            if text and confirms(word, text) and ((lp >= CONFIRM_MIN_LOGPROB and ns <= CONFIRM_MAX_NOSPEECH and word_ok)
+                                                 or sure_word):
                 how = "whisper"
             elif text and confirms(word, text):
                 how = f"unsure: log-prob {lp:.2f}, no-speech {ns:.2f}" + ("" if word_ok else f", word p {wp:.2f}")
@@ -3248,6 +3286,19 @@ def selftest() -> int:
     os.environ["DD_MIC_BIN"] = "/nonexistent/dd-mic"
     assert choose_source()[0] == "ffmpeg"
     os.environ.pop("DD_MIC_BIN")
+
+    # 4a2. right after a confirmed wake, a prompt-sentence echo behind the command is dropped, not the command
+    e_handled, e_logs = [], []
+    le = Listener(source=lambda: iter([]), stt_fn=lambda b: "Volume thirty. Innaiku weather enna?", speak=lambda t: None,
+                  handle=lambda c: (e_handled.append(c), "ok")[1], followup_s=8.0, clock=lambda: now["t"],
+                  log=e_logs.append, inline=True, wake=None)
+    le.armed_until = now["t"] + 5
+    le.process(b"\x00\x00" * 16000, now["t"])
+    assert e_handled == ["Volume thirty."] and any("prompt echo after" in m for m in e_logs), (e_handled, e_logs[-2:])
+    le.armed_until = 0.0
+    le.followup_until = now["t"] + 5  # (a follow-up window: the echo rule stays as before — ignored)
+    le.process(b"\x00\x00" * 16000, now["t"])
+    assert e_handled == ["Volume thirty."], e_handled
 
     # 4b2. Whisper model choice: small while the Mac is quiet; base while it plays sound, in film mode, or for
     # 10 min after small crawled (13-27 s per command on the 8 GB M1 with a film on)

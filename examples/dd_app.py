@@ -468,8 +468,10 @@ def run_diag(listener=None, out: Path | None = None) -> str:
         except Exception as e:
             add(f"screen recording: ? ({type(e).__name__})")
         try:
-            from ApplicationServices import AXIsProcessTrusted
-            add(f"accessibility: {'OK' if AXIsProcessTrusted() else 'NOT allowed (type-text / keys will fail)'}")
+            import ctypes
+            ax = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+            ax.AXIsProcessTrusted.restype = ctypes.c_bool
+            add(f"accessibility: {'OK' if ax.AXIsProcessTrusted() else 'NOT allowed (type-text / keys will fail)'}")
         except Exception as e:
             add(f"accessibility: ? ({type(e).__name__})")
         r = _sh(["osascript", "-e", 'tell application "System Events" to get name of first process'], 15)
@@ -523,6 +525,18 @@ def run_diag(listener=None, out: Path | None = None) -> str:
         add("load: " + _sh(["sysctl", "-n", "vm.loadavg"], 5))
         top = _sh(["ps", "-Ao", "pcpu=,rss=,comm=", "-r"], 10).splitlines()[:8]
         add("top cpu: " + "; ".join(" ".join(x.split(None, 2)[i] for i in (0, 2)).rsplit("/", 1)[-1][:40] for x in top if len(x.split(None, 2)) == 3))
+        # dd's own threads: which ones burn CPU while idle (ps -M: one line per thread, %CPU is the 3rd-to-last column)
+        rows = []
+        for line in _sh(["ps", "-M", "-p", str(os.getpid())], 10).splitlines()[1:]:
+            cols = line.split()
+            try:
+                rows.append(float(cols[-3]))
+            except (ValueError, IndexError):
+                pass
+        rows.sort(reverse=True)
+        add(f"dd threads: {len(rows)}, cpu% of the busiest: {rows[:8]}, total {sum(rows):.0f}%; "
+            f"python threads: {', '.join(sorted(t.name for t in threading.enumerate()))[:300]}")
+        add("thread env: " + ", ".join(f"{k}={os.environ.get(k, '-')}" for k in ("OMP_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_NUM_THREADS")))
         # ---- apps the router can open
         try:
             import importlib.util
