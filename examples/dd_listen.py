@@ -1069,6 +1069,7 @@ class VoicePrint:
         self.threshold = self.base_threshold = float(z["detect"])
         self.gate = float(z["gate"])
         self.clips = int(z["clips"])
+        self.need = 2  # two chunks in a row (the voice print proposes, Whisper confirms)
         self.streak = 0
         self.last_score = 0.0
         self.recent: deque[float] = deque(maxlen=8)  # ~0.6 s of similarities
@@ -1179,6 +1180,8 @@ class WakeDetector:
         self.last_word = ""
         self.last_source = None
         self.soft_enabled = True   # the listener turns this off when Whisper confirmation is off
+        self.log = log
+        self.failed: set[str] = set()
 
         def load(given, word, path, default="1"):
             if given is not None:
@@ -1212,6 +1215,11 @@ class WakeDetector:
     def heads(self) -> list:
         return [h for h in (self.dd, self.jarvis) if h is not None]
 
+    def _scorer_failed(self, what: str, e: Exception) -> None:
+        if what not in self.failed:  # once per scorer: loud enough to notice, quiet enough for a 12/s loop
+            self.failed.add(what)
+            self.log(f"  (wake: {what} failed: {type(e).__name__}: {str(e)[:120]} — the other detectors keep going)")
+
     def _fire(self, word: str, source, score: float) -> float:
         self.last_word, self.last_source = word, source
         self.model.reset()
@@ -1234,17 +1242,25 @@ class WakeDetector:
         hits, vhit = [], None
         users = self.heads + ([self.voice] if self.voice is not None else [])
         if users:
+            feats = None
             try:
                 feats = np.asarray(self.model.preprocessor.get_features(max(u.T for u in users))).reshape(-1, 96)
-                for h in self.heads:
-                    r = h.step(feats[-h.T:])
-                    if r is not None:
-                        hits.append((r, h))
+            except Exception as e:
+                self._scorer_failed("features", e)
+            if feats is not None:
+                for h in self.heads:  # each scorer on its own: a broken voice print once silenced the jarvis head
+                    try:
+                        r = h.step(feats[-h.T:])
+                        if r is not None:
+                            hits.append((r, h))
+                    except Exception as e:
+                        self._scorer_failed(h.word + " head", e)
                 if self.voice is not None:
-                    v = self.voice.step(feats[-self.voice.T:])
-                    vhit = (v, self.voice) if v is not None else None
-            except Exception:
-                hits, vhit = [], None
+                    try:
+                        v = self.voice.step(feats[-self.voice.T:])
+                        vhit = (v, self.voice) if v is not None else None
+                    except Exception as e:
+                        self._scorer_failed("voice print", e)
         soft = self.soft.step(s) if self.soft_enabled else None
         if self.cooldown > 0:
             self.cooldown -= 1
@@ -2222,6 +2238,29 @@ def selftest() -> int:
         assert all(isinstance(h, WakeHead) for h in real.heads) and real.soft.hard == real.threshold
         assert real.dd is None or os.environ.get("DD_WAKE_DD") == "1", "dee dee is opt-in"
         assert not any(real.feed(b"\x00" * FRAME_BYTES) for _ in range(150))
+        # head + voice print together (the setup Dhina actually runs): the voice print must step without error and
+        # a head hit must still fire — a missing VoicePrint.need once raised on every chunk and dropped every hit
+        vp.step(_npv.zeros((vp.T, 96), _npv.float32))
+
+        class _AlwaysHead:
+            word, T, threshold, need, streak, last_score = "jarvis", 16, 0.7, 1, 0, 0.0
+
+            def step(self, feats):
+                self.last_score = 0.95
+                return 0.95
+        both = WakeDetector(log=lambda *a: None, jarvis_head=_AlwaysHead())
+        both.voice = vp
+        fired = [both.feed(b"\x00" * FRAME_BYTES) for _ in range(40)]
+        assert any(fired) and both.last_source is both.jarvis and not both.failed, (both.failed, fired)
+
+        class _BrokenPrint(VoicePrint):
+            def step(self, feats):
+                raise RuntimeError("broken")
+        logged = []
+        both = WakeDetector(log=logged.append, jarvis_head=_AlwaysHead())
+        both.voice = _BrokenPrint(vfile)
+        fired = [both.feed(b"\x00" * FRAME_BYTES) for _ in range(40)]
+        assert any(fired) and both.failed == {"voice print"} and len(logged) == 1, (both.failed, logged)
 
     # barge-in: "hey jarvis" while dd is talking cuts the sentence, then arms as soon as it is quiet
     stops = []
