@@ -92,6 +92,7 @@ let modeNames = ["voice processing ON (player + mixer)", "voice processing ON (m
 var zeroSamples = 0
 var silenceReported = false
 var switchRequested = false
+var lastTap = Date()
 var keepPlayer: AVAudioPlayerNode? = nil
 var keepBuffer: AVAudioPCMBuffer? = nil
 
@@ -158,6 +159,7 @@ func start(mode: Int) -> AVAudioEngine? {
     var taps = 0
     var useChannel = -1
     input.installTap(onBus: 0, bufferSize: 2048, format: inFmt) { buf, _ in
+        lastTap = Date()
         let frames = Int(buf.frameLength)
         let chs = Int(buf.format.channelCount)
         var source: AVAudioPCMBuffer = buf
@@ -249,8 +251,13 @@ func tryStart(from: Int) {
 }
 
 tryStart(from: aec ? startMode : 4)
+lastTap = Date()
 while true {
     RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.25))
+    if Date().timeIntervalSince(lastTap) > 4 {
+        warn("no audio callbacks for 4 s in mode \(currentMode) — giving up (dd uses ffmpeg)")
+        exit(8)
+    }
     if switchRequested && currentMode < 4 {
         warn("silent in mode \(currentMode) — dd relaunches with --mode \(currentMode + 1)")
         exit(7)

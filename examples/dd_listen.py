@@ -301,6 +301,7 @@ def helper_binary() -> str:
 
 
 _helper_failures = 0
+HELPER_STALL_S = 6.0  # no bytes at all from dd-mic for this long -> it is stuck: ffmpeg instead
 SILENCE_FALLBACK_MS = 8000  # dd-mic gave nothing but digital zeros for this long since start -> ffmpeg instead (the helper itself cascades through its modes within that)
 
 
@@ -365,11 +366,28 @@ def helper_source(binary: str, log=print, mode: int = 0):
     said: list[str] = []
     relay = threading.Thread(target=_relay_stderr, args=(p, "dd-mic", said, log), daemon=True)
     relay.start()
+    import queue as _queue
+    frames_q: _queue.Queue = _queue.Queue(maxsize=500)
+
+    def pump():  # blocking pipe reads on their own thread, so a helper that hangs cannot freeze the listener
+        try:
+            while True:
+                b = p.stdout.read(FRAME_BYTES)
+                frames_q.put(b)
+                if len(b) < FRAME_BYTES:
+                    return
+        except Exception:
+            frames_q.put(b"")
+    threading.Thread(target=pump, daemon=True, name="dd-mic-pump").start()
     got = zeros = 0
-    silent = saved = False
+    silent = saved = stalled = False
     try:
         while True:
-            frame = p.stdout.read(FRAME_BYTES)
+            try:
+                frame = frames_q.get(timeout=HELPER_STALL_S)
+            except _queue.Empty:
+                stalled = True  # started but no audio callbacks at all (seen after voice-processing attempts)
+                break
             if len(frame) < FRAME_BYTES:
                 break
             got += 1
@@ -399,6 +417,9 @@ def helper_source(binary: str, log=print, mode: int = 0):
     if code == 7:
         m = next((int(x.group(1)) for line in said if (x := re.search(r"silent in mode (\d)", line))), mode)
         raise HelperSilent(m)
+    if stalled or code == 8:  # (8: the helper's own watchdog — no audio callbacks)
+        _helper_failures = 2  # give the helper up for this run: ffmpeg takes over at once
+        raise RuntimeError(f"dd-mic delivered no audio for {HELPER_STALL_S:.0f} s")
     if silent:
         _helper_failures = 2
         raise RuntimeError("dd-mic hears nothing (digital silence since start — input device / permission)")
@@ -425,6 +446,8 @@ def mic_source(log=print):
             if _helper_failures < 2:
                 raise  # it worked and then died: the listener restarts the stream
             log(f"  mic: {e} -> ffmpeg avfoundation instead (no echo cancellation)")
+            if "no audio" in str(e):
+                save_mic_mode(4)
     else:
         log("  mic: ffmpeg avfoundation (no echo cancellation — build dd-mic for playback-proof listening)")
     yield from ffmpeg_source()
@@ -2067,6 +2090,20 @@ def selftest() -> int:
     assert any("mode 0 silent on this Mac -> mode 1" in m for m in seen) and load_mic_mode() == 1, seen
     assert len(got_modal) == 2, len(got_modal)  # mode 1's two frames
     os.environ["DD_HOME"] = os.environ.pop("DD_HOME_SAVED2") or os.environ["DD_HOME"]
+    # a helper that starts and then delivers nothing at all (stuck audio unit) is given up after HELPER_STALL_S
+    hang = fake.parent / "dd-mic-hang"
+    hang.write_text("#!/bin/sh\necho 'input x3 [mode 4]' >&2\nexec sleep 30\n")
+    hang.chmod(hang.stat().st_mode | _stat.S_IEXEC)
+    global HELPER_STALL_S
+    real_stall, HELPER_STALL_S = HELPER_STALL_S, 0.5
+    _helper_failures = 0
+    t0h = time.monotonic()
+    try:
+        list(helper_source(str(hang), log=lambda *_: None))
+        raise AssertionError("a stuck helper must raise")
+    except RuntimeError as e:
+        assert "no audio" in str(e) and _helper_failures == 2 and time.monotonic() - t0h < 5, (e, _helper_failures)
+    HELPER_STALL_S = real_stall
     # a helper that streams nothing but digital zeros (wrong device / no permission) is given up within
     # SILENCE_FALLBACK_MS and mic_source() carries on with ffmpeg in the same run — no restart, no notification
     _helper_failures = 0
