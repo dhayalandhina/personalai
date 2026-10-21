@@ -212,9 +212,16 @@ class AppCore:
         return False, f"already latest ({after})"
 
     def relaunch(self) -> None:
-        """Quit and reopen (macOS): a detached shell reopens the app after we exit."""
-        subprocess.Popen(["/bin/sh", "-c", "sleep 2; open -a dd || open -a /Applications/dd.app || true"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        """Quit and reopen (macOS): a detached shell waits until this process has really exited, then reopens the
+        app. (A fixed 2 s sleep lost the race once: the old dd was still shutting down, `open` just activated it,
+        and then nothing was running.)"""
+        pid = os.getpid()
+        script = (f"for i in $(seq 1 120); do kill -0 {pid} 2>/dev/null || break; sleep 0.5; done; "
+                  # then the dd applet itself (it lives until its launcher returns): `open` must start a new one
+                  "for i in $(seq 1 40); do pgrep -f 'dd.app/Contents/MacOS/' >/dev/null || break; sleep 0.5; done; "
+                  "sleep 0.5; open -a dd || open -a /Applications/dd.app || open -a \"$HOME/Applications/dd.app\" || true")
+        subprocess.Popen(["/bin/sh", "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
 
     def menu_labels(self) -> list[str]:
         return [self.listening_label(), self.last_label(), TEACH, "Mic test (3 s)", "Open chat", "Status", "Update dd", "Quit dd"]
