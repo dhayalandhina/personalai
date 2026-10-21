@@ -66,7 +66,7 @@ class AutoGain:
     sound arrives (so the first syllable of "Jarvis" is never clipped — the old smooth attack distorted it after a
     quiet minute), rises slowly in quiet (~6 s to double), stays within 1x..MAX_GAIN, and a limiter keeps every
     frame below full scale."""
-    TARGET, MAX_GAIN, PEAK = 2000.0, 8.0, 28000.0
+    TARGET, MAX_GAIN, PEAK = 2000.0, 12.0, 28000.0
 
     def __init__(self, enabled: bool | None = None):
         self.enabled = (os.environ.get("DD_AUTOGAIN", "1") != "0") if enabled is None else enabled
@@ -316,10 +316,10 @@ SILENCE_FALLBACK_MS = 8000  # dd-mic gave nothing but digital zeros for this lon
 
 def choose_source() -> tuple[str, str | None]:
     """('helper', path) when the echo-cancelling dd-mic helper is built and allowed, else ('ffmpeg', None).
-    mic_mode 5 = this Mac's helper gave no audio at all last time: ffmpeg straight away (reset on a rebuild)."""
+    mic_mode 4 (no voice processing here) or 5 (the helper gave no audio): ffmpeg (reset when dd-mic is rebuilt)."""
     b = helper_binary()
     if os.environ.get("DD_AEC", "1") != "0" and _helper_failures < 2 and os.access(b, os.X_OK) \
-            and load_mic_mode() != 5:
+            and load_mic_mode() < 4:  # 4 = no voice processing on this Mac: ffmpeg is the same mic, better tested
         return "helper", b
     return "ffmpeg", None
 
@@ -606,10 +606,37 @@ def _mlx_transcribe(audio, prompt: str | None = HINT) -> str:
     return (r.get("text") or "").strip()
 
 
+CONFIRM_HINT = "Jarvis."
+
+
 def stt_plain(pcm: bytes) -> str:
-    """stt() without the vocabulary prompt: used to *confirm* a wake word, so a 'Jarvis' in the text came from
-    the audio and not from Whisper repeating its prompt on noise."""
-    return stt(pcm, hint="")
+    """stt() for *confirming* a wake word: the only prompt is the wake word itself. Dhina's real "Jarvis"
+    recordings came out as "Janis / Damage / Don't miss" with no prompt (1 of 5) and as "Jarvis." with it (5 of
+    5), while other speech kept its own words ("Venom", "Vanakkam") — so the prompt helps the word without
+    inventing it. Echoes of the prompt on near-silence are stopped by speech_in() before Whisper runs."""
+    return stt(pcm, hint=CONFIRM_HINT)
+
+
+def speech_in(pcm: bytes, floor: float = 0.0, min_rms: float = 250.0) -> bool:
+    """True when the buffer holds a voice at all: some 20 ms frame clearly above the room floor."""
+    if len(pcm) < FRAME_BYTES:
+        return False
+    peak = max(rms(pcm[i:i + FRAME_BYTES]) for i in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES))
+    return peak >= max(min_rms, 2.5 * floor)
+
+
+JARVIS_LIKE = {"jarvis", "jarvi", "jervis", "javis", "jarves", "jarviz", "jarvice", "jarvies", "jalvis", "charvis",
+               "garvis", "harvis", "jaravis", "jarwis", "jarbis", "jarvees"}
+
+
+def confirms(word: str, text: str) -> bool:
+    """Does Whisper's text contain the wake word that was proposed? (jarvis: a jarvis-like token; dd: dd forms)"""
+    if word == "dd":
+        return parse_wake(text)[0] or spelled_dd(text)
+    for tok in re.findall(r"[a-z']+", text.lower())[:8]:
+        if tok in JARVIS_LIKE or (len(tok) >= 4 and difflib.SequenceMatcher(None, tok, "jarvis").ratio() >= 0.72):
+            return True
+    return False
 
 
 def stt(pcm: bytes, hint: str | None = None) -> str:
@@ -1575,16 +1602,21 @@ class Listener:
 
     def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None) -> None:
         t0 = self.clock()
-        try:
-            text = self.verify_stt(pcm).strip()
-        except Exception as e:
-            text = ""
-            self.log(f"  (wake confirmation failed: {e})")
-        woke, _cmd = parse_wake(text) if text else (False, "")
-        if not woke and text and word == "dd" and spelled_dd(text):
-            woke = True
-        if woke:
-            self.log(f"  wake: {word} confirmed by whisper ({text!r}, {self.clock() - t0:.1f}s)")
+        text, how = "", ""
+        voice = getattr(self.wake, "voice", None) if self.wake is not None else None
+        if not speech_in(pcm, self.seg.floor):
+            how = "no voice in it"
+        else:
+            try:
+                text = self.verify_stt(pcm).strip()
+            except Exception as e:
+                self.log(f"  (wake confirmation failed: {e})")
+            if text and confirms(word, text):
+                how = "whisper"
+            elif voice is not None and voice.recent_max() >= voice.gate + 0.1:
+                how = f"your voice {voice.recent_max():.2f}"  # sounds like your own recorded 'Jarvis'
+        if how in ("whisper",) or how.startswith("your voice"):
+            self.log(f"  wake: {word} confirmed by {how} ({text!r}, {self.clock() - t0:.1f}s)")
             self.on_wake(score, word, source)
         else:
             self.tentative_until = 0.0
@@ -1595,7 +1627,8 @@ class Listener:
             if source is not None:
                 source.rejected(self.clock())
             thr = f"; threshold {source.threshold:.2f}" if source is not None else ""
-            self.log(f"  wake: {word} candidate rejected ({text!r}, {self.clock() - t0:.1f}s{thr})")
+            why = f"{how}; " if how else ""
+            self.log(f"  wake: {word} candidate rejected ({why}{text!r}, {self.clock() - t0:.1f}s{thr})")
 
     def _idle_state(self) -> str:
         """'recording' while a wake/follow-up window is open (the next words are a command), else 'listening'."""
@@ -1781,6 +1814,13 @@ def selftest() -> int:
     assert blocked("Innaiku weather enna. Screenshot edu.") and blocked("Volume thirty. Innaiku weather enna.")
     assert not blocked("Innaiku weather enna?") and not blocked("Innaiku weather enna, screenshot edu, then chrome open pannu")
     assert not blocked("Jarvis. Chrome open pannu.") and not blocked("dd. Screenshot edu.")
+    for t in ("Jarvis.", "Jalvis", "Hey Jarvis, chrome open pannu", "Jaravis!", "Charvis"):
+        assert confirms("jarvis", t), t
+    for t in ("Venom.", "Vanakkam.", "Damage", "Travis", "That is", "", "dd", "service"):
+        assert not confirms("jarvis", t), t
+    assert confirms("dd", "D.D.") and not confirms("dd", "Daddy")
+    assert speech_in(b"".join(_tone(300, amp=3000))) and not speech_in(b"".join(_quiet(500, amp=60)))
+    assert not speech_in(b"".join(_tone(300, amp=600)), floor=400), "a voice must stand out from the room"
     assert not blocked("open open sesame") and not blocked("Rude. Sollu.")
     listing = ("[AVFoundation indev @ 0x1] AVFoundation video devices:\n[AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n"
                "[AVFoundation indev @ 0x1] AVFoundation audio devices:\n[AVFoundation indev @ 0x1] [0] AirPods Pro\n"
@@ -1990,6 +2030,13 @@ def selftest() -> int:
     assert lg.state == "listening" and fw.dd.calls[-1][0] == "rejected" and lg.tentative_until == 0.0, (lg.state, fw.dd.calls)
     lg.stt = lg.verify_stt = lambda b: "D.D."
     fw.dd.calls.clear()
+    fw.fire_in = 1
+    for f in _quiet((Listener.VERIFY_DELAY_FRAMES + 1) * FRAME_MS):  # a silent buffer: never sent to Whisper
+        lg.feed(f)
+    assert lg.state == "listening" and fw.dd.calls[-1][0] == "rejected", "no voice in the buffer: rejected"
+    fw.dd.calls.clear()
+    for f in _tone(400):  # the word itself
+        lg.feed(f)
     fw.fire_in = 1
     for f in _quiet((Listener.VERIFY_DELAY_FRAMES + 1) * FRAME_MS):
         lg.feed(f)
