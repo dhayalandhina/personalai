@@ -571,6 +571,9 @@ def ear_source(binary: str, log=print):
                         told = True
                         log("  dd-ear: waiting for you to Allow the Microphone in the macOS prompt")
                     continue
+                if got == 0 and any(("listening:" in line or "waiting for the first audio" in line) for line in said) \
+                        and time.monotonic() - started < 100 and p.poll() is None:
+                    continue  # (started; macOS may be asking about System Audio Recording — dd-ear gives it 90 s)
                 stalled = True
                 break
             if len(b) < stereo:

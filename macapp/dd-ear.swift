@@ -222,16 +222,27 @@ func runEar() {
     }
 
     let ioQueue = DispatchQueue(label: "dd-ear.io", qos: .userInteractive)
+    var callbacks = 0
     st = AudioDeviceCreateIOProcIDWithBlock(&procID, aggID, ioQueue) { _, inInput, _, _, _ in
         lastCallback = Date()
+        callbacks += 1
         let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInput))
-        guard abl.count >= 2 else { return }
+        if callbacks == 1 || callbacks == 200 {  // (diagnostics: what the first callbacks carry)
+            warn("callback \(callbacks): \(abl.count) buffers: " + abl.map { b in
+                "\(b.mNumberChannels) ch \(b.mDataByteSize) B\(b.mData == nil ? " (no data)" : "")" }.joined(separator: ", "))
+        }
+        guard abl.count >= 1, let mp = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return }
         let mb = abl[0]
+        let mFrames = Int(mb.mDataByteSize) / (4 * micCh)
+        convert(micConv, UnsafePointer(mp), micCh, mFrames, &micPeak, &micQ)
+        // the Mac's sound: absent until System Audio Recording is allowed (or while the tap is rebuilt) — then the
+        // mic still goes out, paired with silence
         let tb = abl[abl.count - 1]
-        guard let mp = mb.mData?.assumingMemoryBound(to: Float.self),
-              let tp = tb.mData?.assumingMemoryBound(to: Float.self) else { return }
-        convert(micConv, UnsafePointer(mp), micCh, Int(mb.mDataByteSize) / (4 * micCh), &micPeak, &micQ)
-        convert(refConv, UnsafePointer(tp), tapCh, Int(tb.mDataByteSize) / (4 * tapCh), &refPeak, &refQ)
+        if abl.count >= 2, let tp = tb.mData?.assumingMemoryBound(to: Float.self), tb.mDataByteSize > 0 {
+            convert(refConv, UnsafePointer(tp), tapCh, Int(tb.mDataByteSize) / (4 * tapCh), &refPeak, &refQ)
+        } else if refQ.count < micQ.count {
+            refQ.append(contentsOf: [Int16](repeating: 0, count: micQ.count - refQ.count))
+        }
         // pair them up; one stream that stalls must never hold the other back
         if refQ.isEmpty && micQ.count > 3200 { refQ = [Int16](repeating: 0, count: micQ.count) }
         if micQ.isEmpty && refQ.count > 3200 { refQ.removeAll() }
@@ -281,10 +292,18 @@ func runEar() {
     warn("listening: mic + this Mac's sound (tap) at \(Int(rate)) Hz -> 16000 Hz stereo [mic, playback]; " +
          "streams \(micCh) ch mic, \(tapCh) ch tap")
     lastCallback = Date()
+    let started = Date()
+    var toldWaiting = false
     while true {
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.25))
-        if Date().timeIntervalSince(lastCallback) > 4 {
-            warn("no audio callbacks for 4 s — giving up (dd uses the plain mic)")
+        // before the first callback macOS may be showing the System Audio Recording prompt: give it 90 s
+        let limit: Double = callbacks == 0 ? 90 : 4
+        if callbacks == 0 && !toldWaiting && Date().timeIntervalSince(started) > 5 {
+            toldWaiting = true
+            warn("waiting for the first audio — if macOS asks about System Audio Recording for dd: Allow")
+        }
+        if Date().timeIntervalSince(lastCallback) > limit {
+            warn("no audio callbacks for \(Int(limit)) s — giving up (dd uses the plain mic)")
             cleanup()
             exit(8)
         }
