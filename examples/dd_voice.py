@@ -203,6 +203,28 @@ def edge_synth(text: str, voice: str, rate: str, path: str, timeout: float = 5.0
     return False
 
 
+def selfcheck(voice: str | None = None, timeout: float = 20.0) -> tuple[bool, float, str]:
+    """One short phrase through the chosen online voice, outside the reply path: (ok, seconds, error). A success
+    also clears an earlier failure (the start-up greeting often times out while the Mac is busy loading models)."""
+    global _edge_down_until, _edge_ok_once
+    v = VOICES[voice or current()]
+    if not edge_ready():
+        return False, 0.0, "edge-tts not installed"
+    path = os.path.join(tempfile.mkdtemp(prefix="dd-voice-check-"), "check.mp3")
+    t0 = time.monotonic()
+    try:
+        ok = _edge_synth(dd_thanglish.to_tamil("Vanakkam") if v["tamil"] else "Hello", v["edge"], "+0%", path, timeout)
+        err = "" if ok else "no audio"
+    except Exception as e:
+        ok, err = False, f"{type(e).__name__}: {str(e)[:160]}"
+    secs = time.monotonic() - t0
+    if ok:
+        with _edge_lock:
+            _edge_ok_once, _edge_down_until = True, 0.0
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+    return ok, secs, err
+
+
 _mac_tamil: str | None = None
 
 

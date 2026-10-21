@@ -477,6 +477,9 @@ def run_app() -> int:
             if dd_voice.setup(log=lambda m: print(m, flush=True)):
                 # (Kokoro is only the offline fallback now: loaded when first needed, not held in RAM — 8 GB Macs)
                 tamil = dd_voice.mac_tamil_voice()
+                ok, secs, err = dd_voice.selfcheck()  # is Microsoft's voice reachable from this Mac at all?
+                print(f"voice check: online voice {'OK' if ok else 'FAILED'} in {secs:.1f}s" + (f" — {err}" if err else ""),
+                      flush=True)
                 print(f"voice: {dd_voice.VOICES[dd_voice.current()]['label']} ({dd_voice.current_speed()} speed) ready"
                       f"; offline: {('Mac ' + tamil) if tamil else ''}{' + ' if tamil and dd_voice.kokoro_ready() else ''}"
                       f"{'Kokoro' if dd_voice.kokoro_ready() else ('' if tamil else 'Mac voice')}", flush=True)
