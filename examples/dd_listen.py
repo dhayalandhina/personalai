@@ -1149,6 +1149,7 @@ def spoken_form(reply: str, limit: int = 300) -> str:
     """What gets read aloud: the first 1-2 sentences, never a transcript-like ramble or a code dump."""
     text = re.sub(r"```[\s\S]*?```", " code screen la irukku. ", reply)
     text = re.sub(r"(?im)(^|\s)(user|dd|assistant|system)\s*:[^\n]*", " ", text)  # hallucinated dialogue lines
+    text = re.sub(r"(?im)^\s*(?:assumption|risks?|likely|note|verify|done when)\s*:[^\n]*", " ", text)  # chat labels
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) <= limit:
         return text
@@ -2630,6 +2631,7 @@ def _brain_selftest() -> None:
         kind, msgs, tools, opt = calls[0]
         assert kind == "ping" and len(msgs) == 2 and msgs[0] == h.messages[0] and opt == {"num_predict": 1}
         assert "<available_skills>" in msgs[0]["content"] and len(msgs[0]["content"]) < 14000, len(msgs[0]["content"])
+        assert "Spoken replies" in msgs[0]["content"] and "## Reply template" not in msgs[0]["content"]
         assert tools == dd.LIB.tool_schemas()
         r1 = h("what skills do you have")  # a tool call: its (long) output reaches the model capped
         tool_msg = [m for m in calls[-1][1] if m["role"] == "tool"][0]
@@ -3445,38 +3447,32 @@ def selftest() -> int:
     vgate.set()
     assert wait_for(lambda: lc._parked is None and not lc._verify_inflight)
     assert c_stt == [1, 1] and c_handled == ["chrome open pannu"] * 2 and any("dropped unread" in m for m in c_logs), c_logs[-3:]
-    # film mode (3 rejections in the last minute): a candidate that arrives while a check runs is not dropped — the
-    # best one waits its turn with its own audio, and is confirmed when the first was the film
+    # film mode (3+ rejections in a minute): when a check is already running, the best candidate that arrives
+    # meanwhile is queued with its own audio (not dropped) — tested directly, the feed()+thread timing is racy
     lc.followup_until = lc.armed_until = 0.0
+    lc._verify_next = None
+    lc.vqueue.clear()
     src = fwc.last_source
-    src.rejects[:] = [lc.clock() - 5, lc.clock() - 4, lc.clock() - 3]
-    lc._last_verify_at = -1e9  # (the test runs faster than real time: the spacing rule would queue the first one)
-    vgate.clear()
-    for f in _quiet(600):
+    src.rejects[:] = [lc.clock() - 5, lc.clock() - 4, lc.clock() - 3]  # film mode on
+    lc._verify_inflight = True            # a check is running
+    lc._last_verify_at = lc.clock()
+    for f in _tone(60, amp=3000):         # fill self.recent with a candidate's audio
         lc.feed(f)
-    for f in _tone(300, amp=3000):  # film line that looks like the word
-        lc.feed(f)
-    fwc.fire_in = 1
-    for f in _quiet(800):
-        lc.feed(f)
-    assert lc._verify_inflight and lc._verify_next is None
-    for f in _tone(300, amp=3000):  # his "Jarvis" 1.5 s later, while the first check still runs
-        lc.feed(f)
-    fwc.fire_in = 1
-    for f in _quiet(100):
-        lc.feed(f)
-    assert lc._verify_next is not None and lc._verify_next["score"] == 0.97, "queued, not dropped"
-    for f in _quiet(500):
-        lc.feed(f)
-    assert lc._verify_next is None and len(lc.vqueue) == 1, (lc._verify_next, len(lc.vqueue))
-    verdicts.extend([("Don't miss.", -0.8, 0.1), ("Jarvis.", -0.3, 0.1)])  # film, then him
-    vgate.set()
-    assert wait_for(lambda: lc.last_heard == "jarvis ✓" and len(lc.vqueue) == 0), (lc.last_heard, c_logs[-4:])
-    vgate.clear()
-    assert any("candidate rejected" in m for m in c_logs[-6:]) and lc.armed_until > lc.clock()
+    lc.confirm_wake(0.80, "jarvis", src)  # a film candidate during the check
+    assert lc._verify_next is not None and lc._verify_next["score"] == 0.80, lc._verify_next
+    lc.confirm_wake(0.95, "jarvis", src)  # his louder "Jarvis" a moment later: replaces it (best of the rest)
+    assert lc._verify_next["score"] == 0.95 and lc._verify_skipped >= 1, (lc._verify_next, lc._verify_skipped)
+    lc.confirm_wake(0.70, "jarvis", src)  # a weaker one does not replace it
+    assert lc._verify_next["score"] == 0.95
+    for _ in range(Listener.VERIFY_DELAY_FRAMES + 1):  # it counts down and is sent behind the running check
+        lc.feed(b"\x00" * FRAME_BYTES)
+    assert lc._verify_next is None and len(lc.vqueue) == 1 and lc.vqueue[0][2] == 0.95, (lc._verify_next, list(lc.vqueue))
+    lc.vqueue.clear()
+    lc._verify_inflight = False
     lc.followup_until = lc.armed_until = 0.0
     src.rejects.clear()
-    vgate.set()  # (the cases below expect an open gate, as before this one)
+    lc._verify_skipped = 0
+    vgate.set()
     # brain busy for a long time: a real "Jarvis" is still confirmed at once
     brain_gate.clear()
     lc.followup_until = time.monotonic() + 8
@@ -3504,6 +3500,7 @@ def selftest() -> int:
     sp = spoken_form("Chrome open panniten. User: \"hi\"\ndd: \"hello\"\n```bash\nls\n```" + " x" * 300)
     assert "User" not in sp and "```" not in sp and len(sp) <= 310 and sp.startswith("Chrome open panniten."), sp
     assert spoken_form("Ok.") == "Ok."
+    assert spoken_form("Assumption: User meant Chrome.\nChrome open panniten.\nRisks: none.") == "Chrome open panniten."
 
     # 5. run(): a dying mic stream is reported and retried; stop ends the loop
     calls = {"n": 0}

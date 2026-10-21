@@ -107,6 +107,33 @@ def voice_index(limit: int = 100) -> str:
     return "\n".join(lines)
 
 
+VOICE_REPLY_GUIDE = """## Spoken replies (voice mode)
+Dhina is talking to you; your reply is read aloud. One or two short Thanglish sentences, the answer first. No labels
+("Assumption:", "Risks:", "Likely:"), no lists, no headings, no code unless he asks for code. If a detail is missing,
+pick the sensible default silently.
+
+## Examples
+User: "ippo mani enna" -> "Ippo mani 9:40."
+User: "innaiku weather enna" -> (mac_action weather) "Coimbatore la ippo 24 degrees, light rain, max 30."
+User: "word open pannu" -> (mac_action open-any ["word"]) "Microsoft Word open panniten."
+User: "whatsapp la last message enna" -> (mac_action whatsapp-read) say who wrote what, in one sentence.
+User: "resume pdf open pannu" -> (mac_action open-file ["resume", "pdf"]) "Resume open panniten."
+User: "oru joke sollu" -> one short joke in Thanglish.
+User: "python la list reverse epdi" -> "`lst[::-1]` or `lst.reverse()` — first one new list, second one in place."
+User: words that are not for you (film or TV talk: "I will leave you") -> "Puriyala, thirumba sollu."
+"""
+
+
+def voice_identity(identity: str) -> str:
+    """The identity text for spoken commands: its written-chat reply template and examples (labels, numbered steps,
+    paste-ready code) are replaced by the spoken ones — the local model copied 'Assumption: User meant ...' aloud."""
+    cut = identity.find("## Reply template")
+    end = identity.rfind("</skill>")
+    if cut < 0 or end < cut:
+        return identity
+    return identity[:cut] + VOICE_REPLY_GUIDE + identity[end:]
+
+
 def boot_system_prompt(voice: bool = False) -> str:
     """voice=True: the compact variant for spoken commands (short skill index; identity, security and the locked
     owner rules stay whole)."""
@@ -117,6 +144,8 @@ def boot_system_prompt(voice: bool = False) -> str:
         sys.exit(1)
     rules = run_script("rules-guard", "rules_guard.py", ["show"])["stdout"]
     identity = LIB.load("dd-core-identity")
+    if voice:
+        identity = voice_identity(identity)
     security = LIB.load("security-privacy")
     if SERVER:
         where = "You are dd, Dhina's personal AI assistant, running 24/7 on his own cloud server and talking to him on Telegram."
