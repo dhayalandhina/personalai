@@ -183,9 +183,23 @@ def parse_wake(text: str) -> tuple[bool, str]:
     return False, text.strip()
 
 
+def _norm_sentences(text: str) -> list[str]:
+    return [re.sub(r"[^a-z0-9 ]", "", p.lower()).strip() for p in re.split(r"[.?!,;]+", text) if p.strip()]
+
+
+HINT_SENTENCES = set(_norm_sentences(HINT))
+
+
+def prompt_echo(text: str) -> bool:
+    """Whisper repeats its initial prompt on noise/music ('Innaiku weather enna. Screenshot edu.'): a transcript made
+    only of prompt sentences is an echo, not a command (a real 'innaiku weather enna' alone is still accepted)."""
+    parts = [p for p in _norm_sentences(text) if p]
+    return len(parts) >= 2 and all(p in HINT_SENTENCES for p in parts)
+
+
 def blocked(text: str) -> bool:
     t = re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
-    if not re.search(r"[a-z]", t) or t in HALLUCINATIONS:
+    if not re.search(r"[a-z]", t) or t in HALLUCINATIONS or prompt_echo(text):
         return True
     words = t.split()
     return len(words) >= 3 and len(set(words)) == 1  # "bump bump bump bump": a loop Whisper invents from noise
@@ -1238,6 +1252,8 @@ def selftest() -> int:
     # 3. hallucination filter + mic picker
     assert blocked("Thank you.") and blocked("...") and blocked("you") and not blocked("chrome open pannu")
     assert blocked("Sollu.") and blocked("Bump. Bump. Bump. Bump.") and blocked("Jarvis. dd.") and not blocked("dd")
+    assert blocked("Innaiku weather enna. Screenshot edu.") and blocked("Volume thirty. Innaiku weather enna.")
+    assert not blocked("Innaiku weather enna?") and not blocked("Innaiku weather enna, screenshot edu, then chrome open pannu")
     assert not blocked("open open sesame") and not blocked("Rude. Sollu.")
     listing = ("[AVFoundation indev @ 0x1] AVFoundation video devices:\n[AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n"
                "[AVFoundation indev @ 0x1] AVFoundation audio devices:\n[AVFoundation indev @ 0x1] [0] AirPods Pro\n"
