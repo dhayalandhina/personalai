@@ -256,15 +256,21 @@ class SkillLibrary:
                                "properties": {"command": {"type": "string"}}}}},
             {"type": "function", "function": {
                 "name": "mac_action",
-                "description": "Do something on the Mac: open-app/quit-app (args: [app name]), open-url ([url]), "
-                               "search-web ([query]), volume ([0-100|up|down|mute|unmute]), media ([play|pause|next|previous]), "
-                               "notify ([text]), time, battery, wifi, apps, screenshot, read-screen (returns the text on screen), "
-                               "lock, dark-mode ([on|off|toggle]), "
-                               "clipboard ([get] or [set, text]), type-text ([text] — types into the focused field/app), "
-                               "press-key ([enter|tab|escape|cmd+s|...]).",
+                "description": "Do something on the Mac: open-any ([app or website name] — any installed app, fuzzy; "
+                               "else the site), close-any ([app]), open-url ([url]), open-file / find-file ([name words, "
+                               "optional pdf|doc|excel|ppt|photo|video]), search-web ([query]), youtube-play ([query] — "
+                               "plays the top video), youtube-search ([query]), whatsapp-read (latest WhatsApp messages), "
+                               "volume ([0-100|up|down|mute|unmute]), brightness ([up|down|max|min]), media ([play|pause|"
+                               "next|previous]), open-settings ([bluetooth|wifi|sound|display|battery|privacy|...]), "
+                               "sysinfo ([disk|ram|ip]), calc ([expression]), notify ([text]), time, date, weather, news, "
+                               "battery, wifi, apps, screenshot, read-screen (returns the text on screen), lock, "
+                               "dark-mode ([on|off|toggle]), clipboard ([get] or [set, text]), "
+                               "type-text ([text] — types into the focused field/app), press-key ([enter|tab|cmd+s|...]).",
                 "parameters": {"type": "object", "required": ["action"],
                                "properties": {"action": {"type": "string", "enum": [
-                                   "open-app", "quit-app", "open-url", "search-web", "volume", "media", "notify", "time",
+                                   "open-any", "close-any", "open-app", "quit-app", "open-url", "open-file", "find-file",
+                                   "search-web", "youtube-play", "youtube-search", "whatsapp-read", "volume", "brightness",
+                                   "media", "open-settings", "sysinfo", "calc", "notify", "time", "date", "weather", "news",
                                    "battery", "wifi", "apps", "screenshot", "read-screen", "lock", "dark-mode", "clipboard",
                                    "type-text", "press-key"]},
                                    "args": {"type": "array", "items": {"type": "string"}}}}}},

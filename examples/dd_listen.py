@@ -49,7 +49,9 @@ VOICE_SUFFIX = ("\n\nVOICE MODE: your reply is spoken aloud. 1-2 short sentences
                 "you get Whisper's romanised reading of it, so read it by sound (\"Ippo mani enna\" and \"Abhi kitne "
                 "baje hai\" both ask the time). Reply in Thanglish unless he asks for another language. Just the answer: "
                 "no 'Assumption:'/'Likely:' labels, never repeat or quote what he said, never write dialogue lines. If "
-                "the words are not a request to you (overheard film or TV talk), reply only: Puriyala, thirumba sollu.")
+                "the words are not a request to you (overheard film or TV talk), reply only: Puriyala, thirumba sollu. "
+                "On the Mac: mac_action open-any opens any app or website by name, whatsapp-read reads his latest "
+                "WhatsApp messages, open-file / find-file finds files — call it, never say you cannot.")
 # How Whisper tends to write a spoken "dd" / "jarvis". Compared after lower-casing and dropping punctuation/spaces.
 WAKE_FORMS = {"dd", "ddd", "d", "didi", "deedee", "dede", "dedi", "didee", "teedee", "jarvis", "jarviz", "jarvi",
               "jarvice", "jarvies", "jervis", "jarves", "javis"}
@@ -878,11 +880,67 @@ CONFIRM_FILM_MODEL = os.environ.get("DD_CONFIRM_FILM_MODEL", "base")     # a fil
 CONFIRM_MIN_WORDPROB = float(os.environ.get("DD_CONFIRM_WORDPROB", "0.03"))
 
 
+_small_slow_until = 0.0  # small took far longer than the audio: base until then (small is tried again after)
+_film_seen_at = -1e9     # last wake check in film mode (a film / TV keeps proposing candidates)
+_slow_diag_at = -1e9
+
+
+def mac_busy() -> bool:
+    """The Mac is playing sound (dd-ear hears its playback) or a film kept proposing wake candidates in the last
+    minute. Whisper small then took 12-27 s per command and 12-16 s per wake check on the 8 GB M1 (21 Oct log:
+    'Open WhatsApp.' 4 s of audio, stt 13.1 s) — base is ~3x lighter."""
+    return bool(EAR_STATUS.get("active") and EAR_STATUS.get("playing")) or time.monotonic() - _film_seen_at < 60
+
+
+def small_slow() -> bool:
+    return time.monotonic() < _small_slow_until
+
+
+def slow_check() -> None:
+    """What the Mac is busy with when Whisper crawls (logged at most every 10 min): free memory, swap, top CPU."""
+    global _slow_diag_at
+    if not MAC or time.monotonic() - _slow_diag_at < 600:
+        return
+    _slow_diag_at = time.monotonic()
+
+    def job():
+        try:
+            mem = subprocess.run(["memory_pressure", "-Q"], capture_output=True, text=True, timeout=10).stdout
+            swap = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=5).stdout
+            top = subprocess.run(["ps", "-Ao", "pcpu=,rss=,comm=", "-r"], capture_output=True, text=True, timeout=5).stdout
+            free = re.search(r"(\d+)%", mem or "")
+            used = re.search(r"used = ([\d.]+[MG])", swap or "")
+            procs = []
+            for line in (top or "").splitlines()[:5]:
+                parts = line.split(None, 2)
+                if len(parts) == 3:
+                    procs.append(f"{parts[2].rsplit('/', 1)[-1][:24]} {float(parts[0]):.0f}% {int(parts[1]) // 1024}MB")
+            print(f"(slow check: memory free {free.group(1) + '%' if free else '?'}, swap used "
+                  f"{used.group(1) if used else '?'}; top CPU: {', '.join(procs)})", flush=True)
+        except Exception as e:
+            print(f"(slow check failed: {type(e).__name__})", flush=True)
+    threading.Thread(target=job, daemon=True, name="dd-slow-check").start()
+
+
+def note_decode(name: str, took: float, audio_s: float) -> None:
+    """A decode far slower than its audio (small next to a film on the 8 GB M1: 13-27 s for a 1-4 s command):
+    base for the next 10 minutes, plus one look at what the Mac is busy with."""
+    global _small_slow_until
+    if took < max(6.0, 2.5 * audio_s + 2.0):
+        return
+    if name and name != "base":
+        if not small_slow():
+            print(f"(whisper {name} took {took:.0f}s for {audio_s:.1f}s of audio — base for 10 min)", flush=True)
+        _small_slow_until = time.monotonic() + 600
+    slow_check()
+
+
 def confirm_model(film: bool = False):
     """Whisper for a wake check: small in a quiet room (his soft "Jarvis" at sofa level: 15/15 vs base 6/15;
-    over a fan 10/10), base while a film keeps proposing candidates (cheap; the 8 GB Mac took 5-10 s per check
-    then). DD_CONFIRM_MODEL forces one."""
-    want = os.environ.get("DD_CONFIRM_MODEL") or (CONFIRM_FILM_MODEL if film else CONFIRM_QUIET_MODEL)
+    over a fan 10/10); base while a film keeps proposing candidates, while the Mac itself plays sound, or after
+    small crawled (the 8 GB Mac took 12-16 s per small check with a film playing). DD_CONFIRM_MODEL forces one."""
+    busy = film or mac_busy() or small_slow()
+    want = os.environ.get("DD_CONFIRM_MODEL") or (CONFIRM_FILM_MODEL if busy else CONFIRM_QUIET_MODEL)
     cmd = load_whisper()
     if getattr(cmd, "_dd_name", "") == want or want == default_stt_model():
         return cmd  # (the command model is it — or becomes it once its background download is done)
@@ -950,10 +1008,12 @@ def stt_confirm(pcm: bytes, film: bool = False) -> tuple[str, float, float, floa
             print(f"(mlx confirm failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
     model = confirm_model(film) if not os.environ.get("DD_CONFIRM_LEGACY") else load_confirm_whisper()
     beam = int(os.environ.get("DD_CONFIRM_BEAM", "5"))  # beam 5: +13% of his "Jarvis" over anime, same cost
+    t0 = time.monotonic()
     segs, _ = model.transcribe(audio, language=lang, beam_size=beam, vad_filter=False, condition_on_previous_text=False,
                                initial_prompt=CONFIRM_HINT, no_speech_threshold=None, log_prob_threshold=None,
                                word_timestamps=True)
     segs = list(segs)
+    note_decode(getattr(model, "_dd_name", ""), time.monotonic() - t0, len(a) / RATE)
     text = " ".join(x.text.strip() for x in segs).strip()
     lp = max((float(x.avg_logprob) for x in segs), default=-9.0)
     ns = min((float(x.no_speech_prob) for x in segs), default=1.0)
@@ -1015,10 +1075,6 @@ def confirms(word: str, text: str) -> bool:
     return False
 
 
-_slow_streak = 0
-_small_too_slow = False
-
-
 def stt(pcm: bytes, hint: str | None = None) -> str:
     """16 kHz mono PCM -> text (mlx-whisper when ready, else faster-whisper int8). Short utterances are padded so
     Whisper hears them whole. hint: initial prompt (default HINT; "" = none)."""
@@ -1032,10 +1088,9 @@ def stt(pcm: bytes, hint: str | None = None) -> str:
             return _mlx_transcribe(audio, prompt)
         except Exception as e:
             print(f"(mlx stt failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
-    global _slow_streak, _small_too_slow
     model = load_whisper()
-    if _small_too_slow:
-        model = model_named("base") or model
+    if getattr(model, "_dd_name", "") != "base" and (mac_busy() or small_slow()):
+        model = model_named("base") or model  # (the Mac plays sound / small crawled: base answers in a few s)
     # English decoding: Thanglish comes out as written Thanglish; spoken Tamil / Hindi as readable romanised words
     # ("Ippo mani enna?", "Abhi kitne baje hai?"). Auto language detection on a 2 s command wandered (Japanese,
     # Korean, Arabic...) and translation garbled half of them — tested 16 utterances, 4 languages.
@@ -1045,11 +1100,7 @@ def stt(pcm: bytes, hint: str | None = None) -> str:
                                beam_size=1, vad_filter=False, condition_on_previous_text=False,
                                initial_prompt=prompt, no_speech_threshold=0.6)
     text = " ".join(s.text.strip() for s in segs).strip()
-    if getattr(model, "_dd_name", "") == "small" and len(pcm) < RATE * 2 * 8:
-        _slow_streak = _slow_streak + 1 if time.monotonic() - t0 > 8.0 else 0
-        if _slow_streak >= 2 and not _small_too_slow:
-            _small_too_slow = True
-            print("(whisper small is too slow on this Mac right now — commands use base)", flush=True)
+    note_decode(getattr(model, "_dd_name", ""), time.monotonic() - t0, len(pcm) / (RATE * 2))
     return text
 
 
@@ -2223,6 +2274,9 @@ class Listener:
         voice = getattr(self.wake, "voice", None) if self.wake is not None else None
         rej = getattr(source, "rejects", None)
         film = rej is not None and len([t for t in rej if t0 - t < 60]) >= 3  # a film keeps proposing candidates
+        if film:
+            global _film_seen_at
+            _film_seen_at = time.monotonic()  # (commands use base for the next minute too)
         clip = raw if raw else pcm
         n_crop = int(BUSY_CROP_S * RATE) * 2
         if film and len(clip) > n_crop:  # (his "Jarvis" mixed into his room's film: 61% heard on the last 1.5 s
@@ -2359,6 +2413,8 @@ class Listener:
 def warm_stt() -> None:
     try:
         stt(b"\x00\x00" * (RATE // 2))  # loads the Whisper model so the first command isn't slow
+        if default_stt_model() != "base":
+            model_named("base")  # (background: ready the moment the Mac plays sound or small crawls)
     except Exception as e:
         print(f"(whisper not ready: {e})")
 
@@ -3112,6 +3168,50 @@ def selftest() -> int:
     os.environ["DD_MIC_BIN"] = "/nonexistent/dd-mic"
     assert choose_source()[0] == "ffmpeg"
     os.environ.pop("DD_MIC_BIN")
+
+    # 4b2. Whisper model choice: small while the Mac is quiet; base while it plays sound, in film mode, or for
+    # 10 min after small crawled (13-27 s per command on the 8 GB M1 with a film on)
+    global _whisper, _small_slow_until, _film_seen_at
+
+    class FakeModel:
+        def __init__(self, name):
+            self._dd_name, self.calls = name, 0
+
+        def transcribe(self, audio, **kw):
+            self.calls += 1
+            return iter([]), None
+    saved_w, saved_m = _whisper, dict(_models)
+    fs, fb = FakeModel("small"), FakeModel("base")
+    _whisper, _models["base"] = fs, fb
+    os.environ["DD_STT_MODEL"] = "small"
+    try:
+        stt(b"\x00\x00" * 1600)
+        assert (fs.calls, fb.calls) == (1, 0), "quiet Mac: small"
+        EAR_STATUS["active"] = EAR_STATUS["playing"] = True
+        stt(b"\x00\x00" * 1600)
+        assert (fs.calls, fb.calls) == (1, 1), "the Mac plays sound: base"
+        assert confirm_model(False) is fb and confirm_model(True) is fb
+        EAR_STATUS["active"] = EAR_STATUS["playing"] = False
+        assert confirm_model(False) is fs and confirm_model(True) is fb
+        _film_seen_at = time.monotonic()
+        stt(b"\x00\x00" * 1600)
+        assert fb.calls == 2, "film mode a moment ago: base"
+        _film_seen_at = -1e9
+        note_decode("small", 4.0, 1.0)
+        assert not small_slow(), "4 s for 1 s of audio is fine"
+        note_decode("small", 13.1, 4.1)
+        assert small_slow(), "13 s for 4 s of audio: base for a while"
+        stt(b"\x00\x00" * 1600)
+        assert fb.calls == 3
+        _small_slow_until = 0.0
+        stt(b"\x00\x00" * 1600)
+        assert fs.calls == 2, "after the window: small again"
+    finally:
+        _whisper, _small_slow_until, _film_seen_at = saved_w, 0.0, -1e9
+        _models.clear()
+        _models.update(saved_m)
+        EAR_STATUS["active"] = EAR_STATUS["playing"] = False
+        os.environ.pop("DD_STT_MODEL", None)
 
     # 4c. worker mode: feed() returns at once; the brain thread transcribes and answers; the queue keeps the newest two
     slow_calls = []

@@ -1,9 +1,9 @@
 ---
 name: mac-control
-description: Control Dhina's Mac like JARVIS — open/quit apps, open websites, volume, music play/pause/next, notifications, time, battery, Wi-Fi, screenshot, lock screen, clipboard, dark mode, running apps. Plus a fast intent router so common spoken/typed commands ("chrome open pannu", "volume 30", "mani enna") run instantly without waiting for the LLM. Use for any request to do something on the computer itself.
-triggers: [open, quit, close app, volume, sound, mute, play, pause, next song, music, spotify, screenshot, lock, battery, wifi, time, mani, clipboard, dark mode, notification, chrome, safari, vscode]
+description: Control Dhina's Mac like JARVIS — open/close ANY installed app (fuzzy names) or website, open/find files, YouTube play, read the latest WhatsApp messages, volume, brightness, music, settings panes, tabs/windows/keys, disk/RAM/IP, quick math, timers, screenshot, read the screen, lock, clipboard, dark mode. A fast intent router runs common spoken/typed commands ("word open pannu", "whatsapp la last message enna", "volume 30", "mani enna") instantly without the LLM. Use for any request to do something on the computer itself.
+triggers: [open, quit, close app, volume, sound, mute, play, pause, next song, music, spotify, screenshot, lock, battery, wifi, time, mani, clipboard, dark mode, notification, chrome, safari, vscode, whatsapp, file, brightness, bluetooth, youtube, tab, storage, ram]
 metadata:
-  version: "1.2"
+  version: "1.3"
   owner: dhina
 ---
 
@@ -15,6 +15,13 @@ All actions use built-in macOS tools (`open`, `osascript`, `screencapture`, `pms
 
 ## Commands
 ```bash
+python3 scripts/mac.py open-any "word"                           # any installed app (fuzzy), else the website
+python3 scripts/mac.py close-any "teams"                         # quits it if running (never launches it to quit)
+python3 scripts/mac.py open-file "resume" pdf | find-file "aadhar"   # Spotlight in ~, newest match
+python3 scripts/mac.py youtube-play "ilayaraja songs"            # opens the top video (it plays)
+python3 scripts/mac.py whatsapp-read                             # latest WhatsApp messages + unread counts
+python3 scripts/mac.py brightness up|down|max|min | open-settings bluetooth|wifi|sound|display|battery|privacy
+python3 scripts/mac.py sysinfo disk|ram|ip | calc "1500 * 12"
 python3 scripts/mac.py open-app "Google Chrome"
 python3 scripts/mac.py quit-app "Spotify"
 python3 scripts/mac.py open-url "https://github.com"
@@ -41,6 +48,11 @@ Examples it understands: "chrome open pannu", "downloads folder", "volume 30", "
 Weather/news/reminder routes only fire on clear phrasing, so coding requests like "news feed component fix pannu" still go to the LLM.
 "screen la enna irukku" / "read my screen" / "idha padi" → `read-screen`: a screenshot is OCR'd with Apple Vision through built-in JXA (tesseract as fallback), the text comes back for dd to summarise or act on (needs Screen Recording permission for dd once).
 Spelled-out numbers from voice transcripts work too ("remind me in ten minutes …", "twenty five minutes", "an hour").
+**Any app / site**: "X open pannu" / "open X" finds X among every installed app (/Applications and its vendor folders, the system apps, ~/Applications with Chrome web apps): exact, prefix ("android" → Android Studio), every word ("word" → Microsoft Word), or a close spelling. Not an app → a known site, a domain ("flipkart dot com"), or the name's first web result ("open zerodha"). Film lines like "Open the gate!" / "Open fire!" open nothing (the LLM decides). "switch to X" = apps only.
+**Files**: "resume pdf open pannu", "open my invoice file", "aadhar file enga irukku" → Spotlight (`mdfind`) in the home folder, every word in the name, newest first.
+**WhatsApp**: "whatsapp la last message enna" → WhatsApp's own database (`~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite`, read from a copy — needs **Full Disk Access** for dd: System Settings → Privacy & Security → Full Disk Access). Without it: WhatsApp is brought up and its chat list is read off the screen (Screen Recording). Sending is not a fast action.
+**Keys by phrase**: new tab, close tab, new window, minimize, full screen, refresh, go back, save, copy, paste, undo, redo, select all, scroll down/up, switch app.
+The dd process imports `mac.py` once (the router answers in ms); `DD_FAST_INPROC=0` runs it as a subprocess per command instead.
 On the cloud server (`DD_HOST=server`) this skill is hidden from the model and `do` only handles time / weather / news / remind — dd says it can't control the Mac from there.
 
 Reminders fire from the dd loop and JARVIS mode (checked every 30 s): Mac notification + printed + spoken in JARVIS mode.

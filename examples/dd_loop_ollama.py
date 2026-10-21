@@ -39,6 +39,27 @@ def _load_env() -> None:
             os.environ.setdefault(k.strip(), v.strip().strip('"\''))
 
 
+def _ssl_certs() -> None:
+    """python.org's Python has no root certificates until its 'Install Certificates.command' runs — every https
+    fetch then fails with CERTIFICATE_VERIFY_FAILED (Dhina's Mac, 21 Oct: 'innaiku weather enna' -> URLError). Point
+    OpenSSL at certifi's bundle, for this process and every skill script it starts."""
+    if os.environ.get("SSL_CERT_FILE"):
+        return
+    try:
+        import ssl
+        if ssl.create_default_context().cert_store_stats().get("x509_ca", 0) > 0:
+            return
+    except Exception:
+        pass
+    try:
+        import certifi
+        bundle = certifi.where()
+    except Exception:
+        bundle = "/etc/ssl/cert.pem"  # (macOS's own root list)
+    if os.path.isfile(bundle):
+        os.environ["SSL_CERT_FILE"] = bundle
+
+
 def _self_heal_exec_bits() -> None:
     """Files that arrive through a synced folder can lose their executable flag, and macOS refuses to open
     dd.app without it. Whenever dd's own code runs on the Mac, put the flag back on dd's own launchers."""
@@ -54,6 +75,7 @@ def _self_heal_exec_bits() -> None:
 
 
 _load_env()
+_ssl_certs()
 _self_heal_exec_bits()
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 MODEL = os.environ.get("DD_MODEL", "qwen2.5-coder:7b-instruct-q4_K_M")
@@ -284,10 +306,36 @@ def warm() -> bool:
         return ok
 
 
+_mac_mod = None
+_mac_lock = threading.Lock()
+
+
+def _mac_module():
+    """mac-control's mac.py imported once into this process: the fast router answers in milliseconds instead of a
+    Python start-up per command (0.3-1.5 s on the busy 8 GB Mac)."""
+    global _mac_mod
+    with _mac_lock:
+        if _mac_mod is None:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("dd_mac_control",
+                                                          LIB.skills["mac-control"].path / "scripts" / "mac.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _mac_mod = mod
+        return _mac_mod
+
+
 def fast_action(user_text: str) -> str | None:
-    """JARVIS-style instant commands (open app, volume, music, time...) — no LLM round trip."""
+    """JARVIS-style instant commands (open any app / site / file, volume, music, WhatsApp, time...) — no LLM round
+    trip. In-process (DD_FAST_INPROC=0: a mac.py subprocess per command, as before)."""
     if os.environ.get("DD_FAST_ROUTER", "1") != "1" or "mac-control" not in LIB.skills:
         return None
+    if os.environ.get("DD_FAST_INPROC", "1") == "1":
+        try:
+            res = _mac_module().do(user_text)
+            return res.get("say") if res.get("handled") else None
+        except Exception as e:  # (a router bug must not cost the command: the subprocess path below)
+            print(f"(fast router failed in-process: {type(e).__name__}: {str(e)[:120]})", flush=True)
     r = run_script("mac-control", "mac.py", ["do", user_text])
     try:
         res = json.loads(r["stdout"] or "{}")
