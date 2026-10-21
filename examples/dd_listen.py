@@ -659,7 +659,7 @@ def stt_confirm(pcm: bytes) -> tuple[str, float, float]:
     return text, lp, ns
 
 
-def speech_in(pcm: bytes, floor: float = 0.0, min_rms: float = 250.0) -> bool:
+def speech_in(pcm: bytes, floor: float = 0.0, min_rms: float = 150.0) -> bool:
     """True when the buffer holds a voice at all: some 20 ms frame clearly above the room floor."""
     if len(pcm) < FRAME_BYTES:
         return False
@@ -984,8 +984,8 @@ def save_clip(pcm: bytes, name: str, keep: int = 80) -> str | None:
             wf.setsampwidth(2)
             wf.setframerate(RATE)
             wf.writeframes(pcm)
-        old = sorted(d.glob("*.wav"), key=lambda f: f.stat().st_mtime)
-        for f in old[:-keep]:
+        old = sorted((f for f in d.glob("*.wav") if not f.name.startswith("setup-")), key=lambda f: f.stat().st_mtime)
+        for f in old[:-keep]:  # (the voice-setup recordings are never rotated out)
             f.unlink()
         return str(p)
     except Exception:
@@ -1576,6 +1576,13 @@ class Listener:
                 self._send_verify(vp["score"], vp["word"], vp["source"])
         if self._near_pending is not None:
             self._near_pending[0] -= 1
+            w = self.wake
+            if w is not None:  # the peak over the rest of the word, not the score where it began
+                self._near_pending[1] = max(self._near_pending[1], float(getattr(w, "last_score", 0.0) or 0.0))
+                if getattr(w, "jarvis", None) is not None:
+                    self._near_pending[2] = max(self._near_pending[2], float(w.jarvis.last_score))
+                if getattr(w, "voice", None) is not None:
+                    self._near_pending[3] = max(self._near_pending[3], float(w.voice.last_score))
             if self._near_pending[0] <= 0:
                 _, hj, jh, vp = self._near_pending
                 self._near_pending = None
@@ -1595,6 +1602,7 @@ class Listener:
                     self._near_at = self.clock()
                     self._near_pending = [20, hj, jh, vp]  # save 400 ms later: the whole word
             if score:
+                self._near_pending = None  # it was not a near miss after all
                 word, source = getattr(self.wake, "last_word", "") or "hey jarvis", getattr(self.wake, "last_source", None)
                 if source is not None and self.verify:
                     self.confirm_wake(score, word, source)  # stage two: Whisper decides, on the worker thread
@@ -1648,11 +1656,11 @@ class Listener:
     def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None) -> None:
         t0 = self.clock()
         text, how = "", ""
+        lp, ns = 0.0, 0.0
         voice = getattr(self.wake, "voice", None) if self.wake is not None else None
         if not speech_in(pcm, self.seg.floor):
             how = "no voice in it"
         else:
-            lp, ns = 0.0, 0.0
             try:
                 res = self.verify_stt(pcm)
                 text, lp, ns = (res, 0.0, 0.0) if isinstance(res, str) else res
@@ -1665,8 +1673,9 @@ class Listener:
                 how = f"unsure: log-prob {lp:.2f}, no-speech {ns:.2f}"
             if not how.startswith("whisper") and voice is not None and voice.recent_max() >= voice.gate + 0.1:
                 how = f"your voice {voice.recent_max():.2f}"  # sounds like your own recorded 'Jarvis'
+        conf = f", log-prob {lp:.2f} no-speech {ns:.2f}" if text else ""
         if how == "whisper" or how.startswith("your voice"):
-            self.log(f"  wake: {word} confirmed by {how} ({text!r}, {self.clock() - t0:.1f}s)")
+            self.log(f"  wake: {word} confirmed by {how} ({text!r}{conf}, {self.clock() - t0:.1f}s)")
             self.on_wake(score, word, source)
         else:
             self.tentative_until = 0.0
@@ -1677,8 +1686,10 @@ class Listener:
             if source is not None:
                 source.rejected(self.clock())
             thr = f"; threshold {source.threshold:.2f}" if source is not None else ""
-            why = f"{how}; " if how else ""
-            self.log(f"  wake: {word} candidate rejected ({why}{text!r}, {self.clock() - t0:.1f}s{thr})")
+            why = f"{how}; " if how and not how.startswith("unsure") else ""
+            if self.diag and how != "no voice in it":  # rejected candidates: the data that shows a missed "Jarvis"
+                save_clip(pcm, time.strftime("cand-%H%M%S") + f"-{word}-{score:.2f}-rej-lp{lp:.2f}")
+            self.log(f"  wake: {word} candidate rejected ({why}{text!r}{conf}, {self.clock() - t0:.1f}s{thr})")
 
     def _idle_state(self) -> str:
         """'recording' while a wake/follow-up window is open (the next words are a command), else 'listening'."""

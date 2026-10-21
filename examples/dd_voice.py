@@ -174,21 +174,26 @@ def _edge_synth(text: str, voice: str, rate: str, path: str, timeout: float) -> 
     return asyncio.run(asyncio.wait_for(run(), timeout))
 
 
-def edge_synth(text: str, voice: str, rate: str, path: str, timeout: float = 8.0) -> bool:
-    """One sentence -> mp3 via Microsoft's online voices. Retries once; after a failure the online voices are skipped
-    for 30 s (no internet: every sentence would otherwise wait for a timeout)."""
+def edge_synth(text: str, voice: str, rate: str, path: str, timeout: float = 5.0) -> bool:
+    """One sentence -> mp3 via Microsoft's online voices. A quick failure (a dropped connection) is retried once; a
+    slow one is not (waiting longer than ~5 s for a voice is worse than the offline one). After a failure the online
+    voices are skipped for 30 s, so with no internet every sentence does not wait for its own timeout."""
     global _edge_down_until
     if time.monotonic() < _edge_down_until or not edge_ready():
         return False
+    err = ""
     for attempt in range(2):
+        t0 = time.monotonic()
         try:
             if _edge_synth(text, voice, rate, path, timeout) and os.path.getsize(path) > 0:
                 return True
+            err = "no audio"
         except Exception as e:
             err = f"{type(e).__name__}: {str(e)[:80]}"
-            if attempt:
-                print(f"(voice: online voice failed — {err}; offline voice for now)", flush=True)
+        if time.monotonic() - t0 > 1.5:
+            break
         time.sleep(0.2)
+    print(f"(voice: online voice failed — {err}; offline voice for 30 s)", flush=True)
     with _edge_lock:
         _edge_down_until = time.monotonic() + 30
     return False
