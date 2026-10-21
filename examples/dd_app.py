@@ -411,8 +411,9 @@ def ensure_mic_helper() -> None:
             pass
 
 
-def ensure_python_deps(mods=(("openwakeword", "openwakeword"), ("faster_whisper", "faster-whisper"))) -> None:
-    """Install missing voice deps into this python once (hey-jarvis wake model, Whisper)."""
+def ensure_python_deps(mods=(("openwakeword", "openwakeword"), ("faster_whisper", "faster-whisper"),
+                              ("edge_tts", "edge-tts"))) -> None:
+    """Install missing voice deps into this python once (hey-jarvis wake model, Whisper, the Tamil voices)."""
     missing = []
     for mod, pkg in mods:
         try:
