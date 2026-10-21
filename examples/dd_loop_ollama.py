@@ -113,7 +113,17 @@ def ollama_chat(messages: list[dict], tools: list[dict], **options) -> dict:
     body = json.dumps(req_body).encode()
     req = urllib.request.Request(f"{OLLAMA}/api/chat", data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
-        return json.loads(r.read().decode())["message"]
+        data = json.loads(r.read().decode())
+    if os.environ.get("DD_BRAIN_TIMING", "1") != "0":  # where the seconds go: prompt reading vs writing the reply
+        try:
+            pe, pd = int(data.get("prompt_eval_count") or 0), float(data.get("prompt_eval_duration") or 0) / 1e9
+            ec, ed = int(data.get("eval_count") or 0), float(data.get("eval_duration") or 0) / 1e9
+            ld = float(data.get("load_duration") or 0) / 1e9
+            print(f"  (brain timing: read {pe} prompt tokens in {pd:.1f}s, wrote {ec} in {ed:.1f}s"
+                  + (f", model load {ld:.1f}s" if ld > 0.5 else "") + ")", flush=True)
+        except Exception:
+            pass
+    return data["message"]
 
 
 # ---- the brain: local Ollama by default; a free cloud tier (OpenAI-compatible) when its key is in ~/.dd/.env ----
