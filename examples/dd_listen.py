@@ -306,9 +306,11 @@ SILENCE_FALLBACK_MS = 8000  # dd-mic gave nothing but digital zeros for this lon
 
 
 def choose_source() -> tuple[str, str | None]:
-    """('helper', path) when the echo-cancelling dd-mic helper is built and allowed, else ('ffmpeg', None)."""
+    """('helper', path) when the echo-cancelling dd-mic helper is built and allowed, else ('ffmpeg', None).
+    mic_mode 5 = this Mac's helper gave no audio at all last time: ffmpeg straight away (reset on a rebuild)."""
     b = helper_binary()
-    if os.environ.get("DD_AEC", "1") != "0" and _helper_failures < 2 and os.access(b, os.X_OK):
+    if os.environ.get("DD_AEC", "1") != "0" and _helper_failures < 2 and os.access(b, os.X_OK) \
+            and load_mic_mode() != 5:
         return "helper", b
     return "ffmpeg", None
 
@@ -340,7 +342,7 @@ def mic_mode_file() -> Path:
 
 def load_mic_mode() -> int:
     try:
-        return max(0, min(4, int(mic_mode_file().read_text().strip())))
+        return max(0, min(5, int(mic_mode_file().read_text().strip())))
     except (OSError, ValueError):
         return 0
 
@@ -431,7 +433,7 @@ def helper_source(binary: str, log=print, mode: int = 0):
 def mic_source(log=print):
     kind, path = choose_source()
     if kind == "helper":
-        mode = load_mic_mode()
+        mode = min(4, load_mic_mode())
         log(f"  mic: dd-mic helper (echo cancellation) {path} — mode {mode}")
         try:
             while True:
@@ -447,7 +449,7 @@ def mic_source(log=print):
                 raise  # it worked and then died: the listener restarts the stream
             log(f"  mic: {e} -> ffmpeg avfoundation instead (no echo cancellation)")
             if "no audio" in str(e):
-                save_mic_mode(4)
+                save_mic_mode(5)  # next start: ffmpeg straight away
     else:
         log("  mic: ffmpeg avfoundation (no echo cancellation — build dd-mic for playback-proof listening)")
     yield from ffmpeg_source()
