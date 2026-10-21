@@ -13,6 +13,8 @@ irreversible actions still ask first. dd.app (install_app.sh) launches this; it 
 from __future__ import annotations
 
 import os
+import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -146,6 +148,25 @@ class AppCore:
         self._watch = threading.Thread(target=loop, daemon=True, name="dd-update-watch")
         self._watch.start()
 
+    def ear_restart_due(self) -> bool:
+        """dd-ear's tap stayed silent while the Mac played, even after a rebuild: restart dd (once an hour at most,
+        when idle) — macOS applies a newly granted System Audio Recording permission to a fresh app only."""
+        if not dd_listen.EAR_STATUS.get("relaunch"):
+            return False
+        lis = self.listener
+        if lis.state not in ("listening", "paused") or lis.clock() - getattr(lis, "_last_activity", 0.0) < 60:
+            return False
+        marker = Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "ear_restarted"
+        try:
+            if marker.exists() and time.time() - marker.stat().st_mtime < 3600:
+                dd_listen.EAR_STATUS["relaunch"] = False
+                return False
+            marker.write_text(f"{time.time():.0f}")
+        except OSError:
+            return False
+        dd_listen.EAR_STATUS["relaunch"] = False
+        return True
+
     def update_due(self) -> bool:
         """True once when newer code is waiting and dd is idle: listening, nothing heard for 2 min, no window open."""
         lis = self.listener
@@ -247,16 +268,7 @@ class AppCore:
         return False, f"already latest ({after})"
 
     def relaunch(self) -> None:
-        """Quit and reopen (macOS): a detached shell waits until this process has really exited, then reopens the
-        app. (A fixed 2 s sleep lost the race once: the old dd was still shutting down, `open` just activated it,
-        and then nothing was running.)"""
-        pid = os.getpid()
-        script = (f"for i in $(seq 1 120); do kill -0 {pid} 2>/dev/null || break; sleep 0.5; done; "
-                  # then the dd applet itself (it lives until its launcher returns): `open` must start a new one
-                  "for i in $(seq 1 40); do pgrep -f 'dd.app/Contents/MacOS/' >/dev/null || break; sleep 0.5; done; "
-                  "sleep 0.5; open -a dd || open -a /Applications/dd.app || open -a \"$HOME/Applications/dd.app\" || true")
-        subprocess.Popen(["/bin/sh", "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        relaunch_app()
 
     def menu_labels(self) -> list[str]:
         return [self.listening_label(), self.last_label(), TEACH, "Mic test (3 s)", "Open chat", "Status", "Update dd", "Quit dd"]
@@ -354,6 +366,13 @@ def run_menu_bar(core: AppCore) -> int:
                 rumps.alert("dd voice setup", text)
             if core.update_requested() or core.update_due():
                 self.do_update(quiet=True)
+            elif core.ear_restart_due():
+                print("ear: restarting dd once so macOS applies the System Audio Recording permission", flush=True)
+                quiet_start_mark()
+                core.relaunch()
+                core.stop()
+                threading.Timer(2.0, lambda: os._exit(0)).start()
+                rumps.quit_application()
 
         def do_update(self, quiet: bool = False) -> None:
             changed, msg = core.update()
@@ -403,6 +422,79 @@ def run_menu_bar(core: AppCore) -> int:
 
 
 RUNNING_COMMIT = ""  # the commit this process started from (auto_update sets it)
+
+
+def relaunch_app() -> None:
+    """Quit and reopen (macOS): a detached shell waits until this process has really exited, then reopens the
+    app. (A fixed 2 s sleep lost the race once: the old dd was still shutting down, `open` just activated it,
+    and then nothing was running.)"""
+    pid = os.getpid()
+    script = (f"for i in $(seq 1 120); do kill -0 {pid} 2>/dev/null || break; sleep 0.5; done; "
+              # then the dd applet itself (it lives until its launcher returns): `open` must start a new one
+              "for i in $(seq 1 40); do pgrep -f 'dd.app/Contents/MacOS/' >/dev/null || break; sleep 0.5; done; "
+              "sleep 0.5; open -a dd || open -a /Applications/dd.app || open -a \"$HOME/Applications/dd.app\" || true")
+    subprocess.Popen(["/bin/sh", "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+CAPTURE_TEXT = ("dd hears what this Mac is playing (a film, music, its own voice) and takes it out of the microphone "
+                "sound, so it still hears you say Jarvis. Nothing is recorded or sent anywhere.")
+
+
+def app_bundle() -> Path | None:
+    """The dd.app this process runs under (the applet that started the launcher), else the installed one."""
+    try:
+        out = subprocess.run(["pgrep", "-lf", "dd.app/Contents/MacOS/"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        m = re.search(r"(/\S.*?/dd\.app)/Contents/MacOS/", line)
+        if m:
+            return Path(m.group(1))
+    for p in (Path.home() / "Applications" / "dd.app", Path("/Applications/dd.app")):
+        if p.is_dir():
+            return p
+    return None
+
+
+def ensure_audio_capture_text(app: Path | None = None, codesign: str = "codesign", force: bool = False) -> bool:
+    """dd-ear's system-audio tap gives only silence unless the app that launched it — dd.app — carries
+    NSAudioCaptureUsageDescription (macOS then denies quietly: every buffer zeros, every call 'OK'). Adds it once
+    and re-signs the bundle ad hoc, as install_app.sh does. True = the bundle changed: dd must start again so
+    macOS sees the new signature (it then asks once for the Microphone and for System Audio Recording)."""
+    if not force and (not dd_listen.MAC or not dd_listen.ear_wanted()):
+        return False
+    app = app or app_bundle()
+    if app is None:
+        return False
+    plist = app / "Contents" / "Info.plist"
+    marker = Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "capture_text_added"
+    try:
+        original = plist.read_bytes()
+        d = plistlib.loads(original)
+    except Exception as e:
+        print(f"(dd.app Info.plist unreadable: {e})", flush=True)
+        return False
+    if d.get("NSAudioCaptureUsageDescription") or marker.exists():  # (never twice: no restart loop)
+        return False
+    d["NSAudioCaptureUsageDescription"] = CAPTURE_TEXT
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{time.time():.0f} {app}")
+        plist.write_bytes(plistlib.dumps(d))
+        r = subprocess.run([codesign, "--force", "--deep", "--sign", "-", str(app)], capture_output=True, text=True,
+                           timeout=120)
+    except Exception as e:
+        r = None
+        err = str(e)
+    if r is None or r.returncode != 0:
+        plist.write_bytes(original)  # the original again: its signature is valid as it was
+        print(f"(dd.app not re-signed — Info.plist restored: {(r.stderr.strip()[-200:] if r else err)})", flush=True)
+        return False
+    print(f"dd.app: added the System Audio Recording text and re-signed {app}", flush=True)
+    return True
+
+
 UPDATE_CHECK_S = float(os.environ.get("DD_UPDATE_EVERY_MIN", "15")) * 60
 
 
@@ -519,6 +611,15 @@ def run_app() -> int:
         ensure_mic_helper()
     except Exception as e:
         print(f"(mic helper skipped: {e})", flush=True)
+    try:  # once: without this text in dd.app the film-cancelling ear hears only silence from the Mac
+        if ensure_audio_capture_text():
+            print("restarting once so macOS uses the new signature (Allow: Microphone + System Audio Recording)",
+                  flush=True)
+            notify("dd restart aagudhu — Microphone, System Audio Recording kekkum: rendukkum Allow kudu.")
+            relaunch_app()
+            return 0
+    except Exception as e:
+        print(f"(system audio permission text skipped: {e})", flush=True)
     problem = dd.preflight()
     if problem:
         notify(f"Brain ready illa: {problem}")
@@ -668,6 +769,29 @@ def selftest() -> int:
     assert core.update_due() is False, "not right after something was heard"
     lis._last_activity = lis.clock() - 200
     assert core.update_due() is True and core.update_due() is False and core._newer is False
+    # dd.app gets the System Audio Recording text once and is re-signed; a failing codesign restores the original
+    import plistlib as _pl
+    fake_app = Path(tempfile.mkdtemp(prefix="dd-bundle-")) / "dd.app"
+    (fake_app / "Contents").mkdir(parents=True)
+    (fake_app / "Contents" / "Info.plist").write_bytes(_pl.dumps({"CFBundleIdentifier": "com.dhina.dd"}))
+    ok_sign, bad_sign = Path(tempfile.mkdtemp()) / "cs_ok", Path(tempfile.mkdtemp()) / "cs_bad"
+    ok_sign.write_text("#!/bin/sh\nexit 0\n"); bad_sign.write_text("#!/bin/sh\necho nope >&2; exit 1\n")
+    ok_sign.chmod(0o755); bad_sign.chmod(0o755)
+    assert ensure_audio_capture_text(fake_app, str(bad_sign), force=True) is False
+    assert "NSAudioCaptureUsageDescription" not in _pl.loads((fake_app / "Contents" / "Info.plist").read_bytes())
+    (Path(os.environ["DD_HOME"]) / "capture_text_added").unlink()
+    assert ensure_audio_capture_text(fake_app, str(ok_sign), force=True) is True
+    assert _pl.loads((fake_app / "Contents" / "Info.plist").read_bytes())["NSAudioCaptureUsageDescription"] == CAPTURE_TEXT
+    assert ensure_audio_capture_text(fake_app, str(ok_sign), force=True) is False, "only once"
+    assert ensure_audio_capture_text(fake_app, str(ok_sign)) is False, "never off the Mac"
+    # a silent system-audio tap (after a rebuild) restarts dd once an hour at most, only when idle
+    dd_listen.EAR_STATUS["relaunch"] = True
+    lis.state, lis._last_activity = "recording", lis.clock()
+    assert core.ear_restart_due() is False
+    lis.state, lis._last_activity = "listening", lis.clock() - 120
+    assert core.ear_restart_due() is True and core.ear_restart_due() is False
+    dd_listen.EAR_STATUS["relaunch"] = True
+    assert core.ear_restart_due() is False and dd_listen.EAR_STATUS["relaunch"] is False, "once an hour"
     # an automatic update restart skips the spoken greeting (once)
     quiet_start_mark()
     assert quiet_start() is True and quiet_start() is False

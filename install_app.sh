@@ -80,6 +80,8 @@ d.update({
     "LSUIElement": True,                      # menu-bar app: no Dock icon (the 🤖 comes from dd_app.py)
     "NSHighResolutionCapable": True,
     "NSMicrophoneUsageDescription": "dd listens for your voice commands (\"dd, chrome open pannu\").",
+    # dd-ear: what this Mac plays (a film) is taken out of the mic sound — without this text macOS gives silence
+    "NSAudioCaptureUsageDescription": "dd hears what this Mac is playing (a film, music, its own voice) and takes it out of the microphone sound, so it still hears you say Jarvis. Nothing is recorded or sent anywhere.",
     "NSAppleEventsUsageDescription": "dd opens apps and sets volume/music for you.",
 })
 plistlib.dump(d, open(p, "wb"))

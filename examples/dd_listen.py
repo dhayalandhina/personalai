@@ -40,9 +40,16 @@ RATE = 16000
 FRAME_MS = 20
 FRAME_BYTES = RATE * 2 * FRAME_MS // 1000  # 640 bytes = 20 ms of 16-bit mono
 MAC = platform.system() == "Darwin"
-HINT = "Jarvis. dd. Chrome open pannu. Volume thirty. Innaiku weather enna? Screenshot edu."  # (never dd's own replies)
+# Whisper's prompt for commands: dd's common Thanglish commands (never dd's own replies). With the last four added
+# a spoken "time enna" stopped coming out as "Dine inna" (8 TTS commands x fan/quiet/film: 8/8 instead of 7/8)
+HINT = ("Jarvis. dd. Chrome open pannu. Volume thirty. Innaiku weather enna? Screenshot edu. Time enna? "
+        "YouTube open pannu. Next song podu. Battery evvalavu?")
 VOICE_SUFFIX = ("\n\nVOICE MODE: your reply is spoken aloud. 1-2 short sentences, no tables, no lists; "
-                "put code only when asked (it is shown, not read).")
+                "put code only when asked (it is shown, not read). Dhina may speak Tamil, English, Hindi or a mix: "
+                "you get Whisper's romanised reading of it, so read it by sound (\"Ippo mani enna\" and \"Abhi kitne "
+                "baje hai\" both ask the time). Reply in Thanglish unless he asks for another language. Just the answer: "
+                "no 'Assumption:'/'Likely:' labels, never repeat or quote what he said, never write dialogue lines. If "
+                "the words are not a request to you (overheard film or TV talk), reply only: Puriyala, thirumba sollu.")
 # How Whisper tends to write a spoken "dd" / "jarvis". Compared after lower-casing and dropping punctuation/spaces.
 WAKE_FORMS = {"dd", "ddd", "d", "didi", "deedee", "dede", "dedi", "didee", "teedee", "jarvis", "jarviz", "jarvi",
               "jarvice", "jarvies", "jervis", "jarves", "javis"}
@@ -167,17 +174,19 @@ class Segmenter:
     eager = False
 
     def threshold(self) -> float:  # speech starts above this
-        if self.eager:
-            return max(self.min_start, self.floor * 2.0, self.p90 * 1.2)
+        if self.eager:  # (a command 8 dB over a loud room started too seldom at floor x2: 1 of 6 in the e2e test)
+            return max(self.min_start, self.floor * 1.6, self.p90 * 1.1)
         return max(self.min_start, self.floor * 3.0, self.p90 * 1.4)
 
     def end_threshold(self) -> float:  # ... and has stopped when it stays below this
         if self.eager:
-            return max(self.floor * 1.4, self.threshold() * 0.5)
+            return max(self.floor * 1.4, self.threshold() * 0.55)
         return max(self.floor * 1.5, self.threshold() * 0.4)
 
-    def feed(self, frame: bytes) -> bytes | None:
-        e = rms(frame)
+    def feed(self, frame: bytes, e: float | None = None) -> bytes | None:
+        """e: the level to decide on (the listener passes the raw mic level: the AutoGain moves by itself, and a
+        floor learned at one gain was wrong at the next — a command 10 dB over a fan never started)."""
+        e = rms(frame) if e is None else e
         thr = self.threshold()
         if not self.speaking:
             if e < thr:
@@ -193,8 +202,13 @@ class Segmenter:
         self.frames.append(frame)
         self.energy_sum += e
         self.energies.append(e)
+        # end of speech on the level smoothed over 100 ms: in a loud, uneven room single frames above the line kept
+        # resetting the 600 ms of silence, and a finished command ran on to the 8 s limit
+        smooth = sum(self.energies[-5:]) / min(5, len(self.energies))
         if e >= self.end_threshold():
-            self.silence, self.speech_frames = 0, self.speech_frames + 1
+            self.speech_frames += 1
+        if smooth >= self.end_threshold():
+            self.silence = 0
         else:
             self.silence += 1
         forced = len(self.frames) * FRAME_MS >= self.max_ms
@@ -488,12 +502,27 @@ _ear_failures = 0
 EAR_FATAL = {3: "no input device", 5: "system-audio tap unavailable (macOS 14.2+)", 6: "mic permission denied",
              9: "aggregate device failed", 10: "audio start failed", 11: "unexpected stream layout"}
 EAR_STATUS = {"active": False, "playing": False, "erle": 0.0}  # what the echo canceller is doing (log / HUD)
+EAR_RECENT: deque = deque(maxlen=100)  # the last 2 s as dd-ear delivered it (stereo: mic, Mac sound) — saved with
+#                                       wake candidates, the data to tune the echo canceller on his real room
+EAR_STATS: deque = deque(maxlen=100)   # per 20 ms frame: (energy left after the canceller, energy it removed)
+EAR_NEAR_MIN = float(os.environ.get("DD_EAR_NEAR_MIN", "0.05"))  # below this the film itself proposed the wake
+EAR_NEAR_SURE = 0.5  # above this a voice in the room spoke over the Mac's sound: always worth a Whisper check
+EAR_TAP_CHECK_S = 60.0                 # the tap gave only zeros this long while the room is loud: is the Mac playing?
+_ear_tap_restart_at = -1e9
 
 
 def ear_wanted() -> bool:
-    """dd-ear (the mic + this Mac's own sound on one clock; the film is subtracted from the mic): DD_EAR=1 turns
-    it on — off by default until it has proven itself on Dhina's Mac (permission: System Audio Recording)."""
-    return os.environ.get("DD_EAR", "0") == "1" and _ear_failures < 2 and os.access(ear_binary(), os.X_OK)
+    """dd-ear: the mic + this Mac's own sound on one clock; the echo canceller subtracts the film from the mic.
+    On by default (21 Oct: the film in Dhina's room plays on this Mac's speakers, from Chrome — pmset); DD_EAR=0
+    turns it off. Needs the System Audio Recording permission for dd, else the tap is silent (plain mic)."""
+    return os.environ.get("DD_EAR", "1") == "1" and _ear_failures < 2 and os.access(ear_binary(), os.X_OK)
+
+
+def mac_is_playing(report: str | None = None) -> bool:
+    """pmset says some app (not dd's own speech) plays through this Mac's speakers/headphones right now."""
+    rep = playback_report() if report is None else report
+    return any("audio-out" in part and not any(x in part for x in ("corespeechd", "afplay", "dd-ear", "dd-mic"))
+               for part in rep.split("; "))
 
 
 def ear_source(binary: str, log=print):
@@ -525,7 +554,9 @@ def ear_source(binary: str, log=print):
     aec = dd_aec.EchoCanceller()
     half = FRAME_BYTES // 4  # samples in 10 ms
     got = zeros = 0
-    stalled = silent = False
+    stalled = silent = tap_dead = False
+    ref_zero = loud = 0  # frames: Mac sound all-zero in a row / of those, how many with a loud room
+    global _ear_tap_restart_at
     EAR_STATUS["active"] = True
     try:
         while True:
@@ -546,7 +577,31 @@ def ear_source(binary: str, log=print):
                     break
             else:
                 zeros = 0
+            EAR_RECENT.append(b)
+            if ref.any():
+                ref_zero = loud = 0
+            else:
+                ref_zero += 1
+                loud += float(np.sqrt((mic ** 2).mean())) > 300
+                if ref_zero * FRAME_MS >= EAR_TAP_CHECK_S * 1000:
+                    room_loud = loud * 2 >= ref_zero  # the room was loud for at least half of that minute
+                    ref_zero = loud = 0
+                    if room_loud and time.monotonic() - _ear_tap_restart_at <= 900 and not EAR_STATUS.get("relaunch") \
+                            and mac_is_playing():  # rebuilt already, still silent: macOS wants dd itself restarted
+                        EAR_STATUS["relaunch"] = True  # (dd_app restarts quietly once, when idle)
+                        log("  dd-ear: still silent after the rebuild — dd restarts once so macOS applies the "
+                            "System Audio Recording permission")
+                    if room_loud and time.monotonic() - _ear_tap_restart_at > 900 and mac_is_playing():
+                        # the room is loud, the Mac IS playing, yet the tap gives zeros: permission still pending, or
+                        # the macOS 26 tap that stays silent until it is rebuilt — a fresh dd-ear builds a new one
+                        _ear_tap_restart_at = time.monotonic()
+                        log("  dd-ear: this Mac is playing but its sound reaches dd as silence — rebuilding the tap "
+                            "(if this repeats: System Settings → Privacy & Security → Screen & System Audio "
+                            "Recording → dd ON)")
+                        tap_dead = True
+                        break
             out = np.concatenate([aec.process(mic[:half], ref[:half]), aec.process(mic[half:], ref[half:])])
+            EAR_STATS.append((float((out ** 2).mean()), float(((mic - out) ** 2).mean())))
             EAR_STATUS["playing"] = aec.ref_power > 1e-5
             EAR_STATUS["erle"] = aec.erle
             yield out.astype(np.int16).tobytes()
@@ -559,6 +614,8 @@ def ear_source(binary: str, log=print):
             p.kill()
             code = None
         relay.join(timeout=1)
+    if tap_dead:
+        raise RuntimeError("dd-ear: silent tap rebuilt")  # (not a failure: the listener restarts the stream)
     if code in EAR_FATAL:
         _ear_failures = 2
         raise RuntimeError(f"dd-ear: {EAR_FATAL[code]}")
@@ -568,6 +625,24 @@ def ear_source(binary: str, log=print):
     if time.monotonic() - started < 3 or got == 0:
         _ear_failures += 1
     raise RuntimeError(f"dd-ear ended: {' | '.join(said[-2:]) or 'no output'}")
+
+
+def near_end(stats) -> float:
+    """How much of the candidate window is NOT the Mac's own sound: the highest ratio, over 300 ms stretches (a word
+    is at least that long; a film transient that slips past the canceller is not), of what the echo canceller left
+    to what it removed. Film alone stays at the canceller's residual (~0.003-0.04); Dhina's "Jarvis" over the film
+    is ~0.1 said softly, >1 said normally. inf = the Mac played nothing in the window."""
+    blocks = []
+    for i in range(0, len(stats) - 4, 5):
+        blocks.append((sum(a for a, _ in stats[i:i + 5]), sum(b for _, b in stats[i:i + 5])))
+    best, played = 0.0, False
+    for i in range(len(blocks) - 2):
+        left = sum(a for a, _ in blocks[i:i + 3])
+        removed = sum(b for _, b in blocks[i:i + 3])
+        if removed > 3e3:  # (the Mac played in this stretch)
+            played = True
+            best = max(best, left / removed)
+    return best if played else float("inf")
 
 
 def mic_source(log=print):
@@ -622,17 +697,57 @@ def whisper_cached(name: str, hub: Path | None = None) -> bool:
 
 
 def default_stt_model() -> str:
-    """small is clearly better for Thanglish, but on an 8 GB Mac next to Ollama it starves (10-20 s per command):
-    base there, small from 16 GB. DD_STT_MODEL overrides."""
-    return os.environ.get("DD_STT_MODEL") or ("small" if ram_gb() >= 12 else "base")
+    """small: Tamil / Hindi / English / Thanglish all come out readable (base turned spoken Tamil into "Now what?"
+    and Hindi into "Today is Morsam"), and it hears a soft voice (his quiet "Jarvis": 15/15 vs 6/15). On the 8 GB
+    Mac it starved next to Ollama once (10-20 s a command) — when films were transcribed non-stop and every first
+    command re-read 5,400 prompt tokens; both are gone. If small is still too slow there, stt() falls back to base
+    by itself (two commands > 8 s). Below 7.5 GB: base. DD_STT_MODEL overrides."""
+    return os.environ.get("DD_STT_MODEL") or ("small" if ram_gb() >= 7.5 else "base")
 
 
 def _load(name: str):
     from faster_whisper import WhisperModel  # pip install faster-whisper
     # already downloaded -> never touch the hub again for it (a flaky line must not stall a cached model)
     threads = max(2, min(4, (os.cpu_count() or 4) // 2))
-    return WhisperModel(name, device="auto", compute_type="int8", local_files_only=whisper_cached(name),
-                        cpu_threads=threads)
+    m = WhisperModel(name, device="auto", compute_type="int8", local_files_only=whisper_cached(name),
+                     cpu_threads=threads)
+    m._dd_name = name
+    return m
+
+
+_models: dict = {}       # extra Whisper models by name (the wake check uses base in film mode, small when quiet)
+_loading: set = set()
+_load_failed: dict = {}  # name -> when it last failed (no retry storm on a flaky line)
+
+
+def _bg_load(name: str) -> None:
+    try:
+        m = _load(name)
+        with _whisper_lock:
+            _models[name] = m
+        print(f"(whisper '{name}' ready)", flush=True)
+    except Exception as e:
+        _load_failed[name] = time.monotonic()
+        print(f"(whisper '{name}' unavailable: {str(e)[:100]})", flush=True)
+    finally:
+        with _whisper_lock:
+            _loading.discard(name)
+
+
+def model_named(name: str):
+    """The faster-whisper model `name`, loaded once in the background (a one-time download when it is not cached);
+    None until it is ready — the caller uses the command model meanwhile."""
+    with _whisper_lock:
+        if _whisper is not None and getattr(_whisper, "_dd_name", "") == name:
+            return _whisper
+        m = _models.get(name)
+        if m is not None:
+            return m
+        if name in _loading or time.monotonic() - _load_failed.get(name, -1e9) < 600:
+            return None
+        _loading.add(name)
+    threading.Thread(target=_bg_load, args=(name,), daemon=True, name=f"dd-whisper-{name}").start()
+    return None
 
 
 def load_whisper():
@@ -747,6 +862,20 @@ def _mlx_transcribe(audio, prompt: str | None = HINT) -> str:
 
 
 CONFIRM_HINT = "Jarvis."
+CONFIRM_QUIET_MODEL = os.environ.get("DD_CONFIRM_QUIET_MODEL", "small")  # few candidates, CPU free: the better ear
+CONFIRM_FILM_MODEL = os.environ.get("DD_CONFIRM_FILM_MODEL", "base")     # a film proposes one every few seconds
+CONFIRM_MIN_WORDPROB = float(os.environ.get("DD_CONFIRM_WORDPROB", "0.03"))
+
+
+def confirm_model(film: bool = False):
+    """Whisper for a wake check: small in a quiet room (his soft "Jarvis" at sofa level: 15/15 vs base 6/15;
+    over a fan 10/10), base while a film keeps proposing candidates (cheap; the 8 GB Mac took 5-10 s per check
+    then). DD_CONFIRM_MODEL forces one."""
+    want = os.environ.get("DD_CONFIRM_MODEL") or (CONFIRM_FILM_MODEL if film else CONFIRM_QUIET_MODEL)
+    cmd = load_whisper()
+    if getattr(cmd, "_dd_name", "") == want or want == default_stt_model():
+        return cmd  # (the command model is it — or becomes it once its background download is done)
+    return model_named(want) or cmd
 
 
 CONFIRM_MIN_LOGPROB = float(os.environ.get("DD_CONFIRM_LOGPROB", "-1.0"))
@@ -777,12 +906,15 @@ def load_confirm_whisper():
         return _confirm_whisper
 
 
-def stt_confirm(pcm: bytes) -> tuple[str, float, float]:
+def stt_confirm(pcm: bytes, film: bool = False) -> tuple[str, float, float, float]:
     """Whisper on a wake candidate: (text, avg log-prob, no-speech prob). The clip is first brought up to a normal
     level — a "Jarvis" said from the sofa reaches the Mac's mic at about -45 dBFS, where Whisper hears only noise —
     and decoded with the wake word as the only prompt. The two confidences tell a real word from a prompt echo:
     Dhina's own "Jarvis" decodes at log-prob -0.33..-0.58 / no-speech <= 0.34; anime, YouTube and room noise
-    never came out as "Jarvis", and what they did come out as sat at -0.8..-2.2 / 0.35..0.86."""
+    never came out as "Jarvis", and what they did come out as sat at -0.8..-2.2 / 0.35..0.86.
+    The 4th value is the probability of the "Jarvis" word itself, read without the prompt (word timestamps): a
+    real one ~0.05-0.5, one the prompt alone made out of film speech ~0.01 (small did that on 2 of 63 film clips).
+    -1 = no such word; 1.0 when the engine gives no word probabilities."""
     import numpy as np
     a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     peak = float(np.abs(a).max()) if a.size else 0.0
@@ -802,18 +934,20 @@ def stt_confirm(pcm: bytes) -> tuple[str, float, float]:
             text = (r.get("text") or "").strip()
             lp = max((float(x.get("avg_logprob", -9)) for x in segs), default=-9.0)
             ns = min((float(x.get("no_speech_prob", 1)) for x in segs), default=1.0)
-            return text, lp, ns
+            return text, lp, ns, 1.0
         except Exception as e:
             print(f"(mlx confirm failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
-    model = load_confirm_whisper()
+    model = confirm_model(film) if not os.environ.get("DD_CONFIRM_LEGACY") else load_confirm_whisper()
     beam = int(os.environ.get("DD_CONFIRM_BEAM", "5"))  # beam 5: +13% of his "Jarvis" over anime, same cost
     segs, _ = model.transcribe(audio, language=lang, beam_size=beam, vad_filter=False, condition_on_previous_text=False,
-                               initial_prompt=CONFIRM_HINT, no_speech_threshold=None, log_prob_threshold=None)
+                               initial_prompt=CONFIRM_HINT, no_speech_threshold=None, log_prob_threshold=None,
+                               word_timestamps=True)
     segs = list(segs)
     text = " ".join(x.text.strip() for x in segs).strip()
     lp = max((float(x.avg_logprob) for x in segs), default=-9.0)
     ns = min((float(x.no_speech_prob) for x in segs), default=1.0)
-    return text, lp, ns
+    wps = [float(w.probability) for x in segs for w in (getattr(x, "words", None) or []) if confirms("jarvis", w.word)]
+    return text, lp, ns, (max(wps) if wps else -1.0)
 
 
 def playback_report() -> str:
@@ -848,12 +982,12 @@ def playback_report() -> str:
     return "; ".join(dict.fromkeys(found))[:600]
 
 
-def speech_in(pcm: bytes, floor: float = 0.0, min_rms: float = 150.0) -> bool:
+def speech_in(pcm: bytes, floor: float = 0.0, min_rms: float = 150.0, factor: float = 2.5) -> bool:
     """True when the buffer holds a voice at all: some 20 ms frame clearly above the room floor."""
     if len(pcm) < FRAME_BYTES:
         return False
     peak = max(rms(pcm[i:i + FRAME_BYTES]) for i in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES))
-    return peak >= max(min_rms, 2.5 * floor)
+    return peak >= max(min_rms, factor * floor)
 
 
 JARVIS_LIKE = {"jarvis", "jarvi", "jervis", "javis", "jarves", "jarviz", "jarvice", "jarvies", "jalvis", "charvis",
@@ -870,6 +1004,10 @@ def confirms(word: str, text: str) -> bool:
     return False
 
 
+_slow_streak = 0
+_small_too_slow = False
+
+
 def stt(pcm: bytes, hint: str | None = None) -> str:
     """16 kHz mono PCM -> text (mlx-whisper when ready, else faster-whisper int8). Short utterances are padded so
     Whisper hears them whole. hint: initial prompt (default HINT; "" = none)."""
@@ -883,12 +1021,25 @@ def stt(pcm: bytes, hint: str | None = None) -> str:
             return _mlx_transcribe(audio, prompt)
         except Exception as e:
             print(f"(mlx stt failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
+    global _slow_streak, _small_too_slow
     model = load_whisper()
-    lang = os.environ.get("DD_STT_LANG", "en")  # English decoding reads romanised Tamil best; "auto" wanders
+    if _small_too_slow:
+        model = model_named("base") or model
+    # English decoding: Thanglish comes out as written Thanglish; spoken Tamil / Hindi as readable romanised words
+    # ("Ippo mani enna?", "Abhi kitne baje hai?"). Auto language detection on a 2 s command wandered (Japanese,
+    # Korean, Arabic...) and translation garbled half of them — tested 16 utterances, 4 languages.
+    lang = os.environ.get("DD_STT_LANG", "en")
+    t0 = time.monotonic()
     segs, _ = model.transcribe(audio, language=None if lang == "auto" else lang,
                                beam_size=1, vad_filter=False, condition_on_previous_text=False,
                                initial_prompt=prompt, no_speech_threshold=0.6)
-    return " ".join(s.text.strip() for s in segs).strip()
+    text = " ".join(s.text.strip() for s in segs).strip()
+    if getattr(model, "_dd_name", "") == "small" and len(pcm) < RATE * 2 * 8:
+        _slow_streak = _slow_streak + 1 if time.monotonic() - t0 > 8.0 else 0
+        if _slow_streak >= 2 and not _small_too_slow:
+            _small_too_slow = True
+            print("(whisper small is too slow on this Mac right now — commands use base)", flush=True)
+    return text
 
 
 def spoken_form(reply: str, limit: int = 300) -> str:
@@ -943,7 +1094,7 @@ def make_handle():
         with lock:
             start = len(messages)
             try:
-                reply = dd.turn(messages, text, model, tool_chars=VOICE_TOOL_CHARS)
+                reply = dd.turn(messages, text, model, tool_chars=VOICE_TOOL_CHARS, employees=False)
             except BaseException:
                 del messages[start:]
                 raise
@@ -1232,15 +1383,15 @@ def diag_dir() -> Path:
     return dd.ROOT / "logs" / "voice"
 
 
-def save_clip(pcm: bytes, name: str, keep: int = 80) -> str | None:
-    """16 kHz mono int16 -> logs/voice/<name>.wav, keeping only the newest `keep` clips. Best effort."""
+def save_clip(pcm: bytes, name: str, keep: int = 80, channels: int = 1) -> str | None:
+    """16 kHz int16 (mono, or interleaved stereo) -> logs/voice/<name>.wav, keeping only the newest `keep` clips."""
     import wave
     try:
         d = diag_dir()
         d.mkdir(parents=True, exist_ok=True)
         p = d / f"{name}.wav"
         with wave.open(str(p), "wb") as wf:
-            wf.setnchannels(1)
+            wf.setnchannels(channels)
             wf.setsampwidth(2)
             wf.setframerate(RATE)
             wf.writeframes(pcm)
@@ -1557,7 +1708,9 @@ class Listener:
         self.on_problem = on_problem or (lambda msg: None)
         self.followup_s = float(os.environ.get("DD_FOLLOWUP", "8")) if followup_s is None else followup_s
         self.clock, self.log = clock, log
-        self.seg = Segmenter()
+        # the segmenter decides on the raw mic level (before the AutoGain): its floor and thresholds stay true while
+        # the gain moves; the AutoGained frames are what it hands to Whisper. DD_VAD_START: minimum raw RMS of speech
+        self.seg = Segmenter(min_start=float(os.environ.get("DD_VAD_START", "60")))
         self.seg.eager = self.wake is not None  # with a wake model it only segments right after a wake / a reply
         self.stop = threading.Event()
         self.paused = False
@@ -1675,8 +1828,9 @@ class Listener:
     def _finish_test(self) -> None:
         t, self.test = self.test, None
         pcm = b"".join(t["frames"])
-        peak = max((rms(f) for f in t["frames"]), default=0.0)
-        avg = sum(rms(f) for f in t["frames"]) / max(1, len(t["frames"]))
+        levels = t.get("raw") or [rms(f) for f in t["frames"]]  # raw mic levels (what the threshold is in)
+        peak = max(levels, default=0.0)
+        avg = sum(levels) / max(1, len(levels))
         try:
             text = self.stt(pcm).strip()
         except Exception as e:
@@ -1725,7 +1879,10 @@ class Listener:
         self.wake_answered = False
         self.wake_source = source
         if self.diag:  # real wakes are kept too: with the near misses they are the data to tune for your voice
-            save_clip(b"".join(self.recent), time.strftime("wake-%H%M%S") + f"-{word.replace(' ', '_')}-{score:.2f}")
+            name = time.strftime("wake-%H%M%S") + f"-{word.replace(' ', '_')}-{score:.2f}"
+            save_clip(b"".join(self.recent), name)
+            if EAR_STATUS["active"] and EAR_RECENT:
+                save_clip(b"".join(EAR_RECENT), name + "-st", channels=2)
         self.on_heard(word, 0.0)
         self.ack(sound_only=True)
         if self.clock() >= self.tentative_until:  # (a confirmed candidate keeps what it captured meanwhile)
@@ -1818,13 +1975,16 @@ class Listener:
         self.last_timing = f"stt {secs:.1f}s · brain {brain_s:.1f}s"
         self.log(f"  you> {command}\n  dd> {reply}  ({brain_s:.1f}s; {self.last_timing})")
         self.say(spoken_form(reply))
-        self.followup_until = self.clock() + self.followup_s
+        # no follow-up window while a film keeps proposing candidates: it only captured the film, answered as a
+        # command — say "Jarvis" again instead
+        self.followup_until = 0.0 if self.film_mode() else self.clock() + self.followup_s
 
     def feed(self, frame: bytes) -> None:
         """One 20 ms frame from the mic."""
         raw = frame
         frame = self.agc.feed(frame, learn=not (self.speaking or self.tail > 0))  # dd's own voice must not set it
         e = rms(frame)
+        e_raw = rms(raw) if frame is not raw else e
         self._level_win.append(e)
         self.level = max(self._level_win)
         self._frames += 1
@@ -1832,13 +1992,14 @@ class Listener:
             self.wake_peak = max(self.wake_peak, getattr(self.wake, "last_score", 0.0))
         if self.test is not None:  # mic test: just collect
             self.test["frames"].append(frame)
+            self.test.setdefault("raw", []).append(e_raw)
             self.test["left"] -= 1
             if self.test["left"] <= 0:
                 self._finish_test()
             return
         if self._frames % 750 == 0 and self.clock() - self._last_activity > 15:  # idle: a level line every 15 s
-            self.log(f"  mic level: peak {self.level:.0f} (room floor {self.seg.floor:.0f}/p90 {self.seg.p90:.0f}; "
-                     f"speech starts above {self.seg.threshold():.0f}, ends below {self.seg.end_threshold():.0f}; "
+            self.log(f"  mic level: peak {self.level:.0f} (raw room floor {self.seg.floor:.0f}/p90 {self.seg.p90:.0f}; "
+                     f"speech starts above {self.seg.threshold():.0f} raw, ends below {self.seg.end_threshold():.0f}; "
                      f"gain {self.agc.gain:.1f}x; wake max {self.wake_peak:.2f}"
                      + ((f"; Mac sound playing, {EAR_STATUS['erle']:.0f} dB of it removed" if EAR_STATUS["playing"]
                          else "; Mac silent") if EAR_STATUS["active"] else "") + ") — nothing heard yet")
@@ -1855,7 +2016,7 @@ class Listener:
                 self.pending_wake = True
             return
         if self.capture is not None:  # voice setup: the segmenter alone decides what one recording is
-            utt = self.seg.feed(frame)
+            utt = self.seg.feed(frame, e_raw)
             if utt:
                 self.capture["utt"] = utt
                 self.capture["event"].set()
@@ -1877,6 +2038,10 @@ class Listener:
                 self.problem_sent = True
                 self.on_problem("Mic la onnum varala (digital silence). System Settings → Privacy & Security → "
                                 "Microphone la dd/Terminal ku ON pannu.")
+            if self.zero_run % 1500 == 0 and not self.inline:  # 30 s: a permission answered since? fresh stream
+                global _ear_failures
+                _ear_failures = 0
+                raise RuntimeError("the mic gives digital silence for 30 s — starting the mic stream again")
         else:
             self.zero_run = 0
         self.recent.append(frame)
@@ -1932,12 +2097,12 @@ class Listener:
                     if src is not None and not self.verify:  # unconfirmed wakes only; confirmed ones were real
                         src.false_wake(self.clock())
                         self.log(f"  ({src.word} wake with no command — threshold now {src.threshold:.2f})")
-                self.seg.room_level(e)  # waiting for the wake word: every frame is room sound
+                self.seg.room_level(e_raw)  # waiting for the wake word: every frame is room sound
                 self.seg.reset()
                 self.seg.pre.clear()
                 return
         was = self.seg.speaking
-        utt = self.seg.feed(frame)
+        utt = self.seg.feed(frame, e_raw)
         if not was and self.seg.speaking:
             self._utt_started = self.clock()
         if utt:
@@ -1984,7 +2149,11 @@ class Listener:
             threading.Thread(target=lambda: self.log("  media check: " + (playback_report() or (
                 "nothing plays on this Mac — the sound comes from the room (TV / phone / people)"))),
                 daemon=True, name="dd-media-check").start()
-        if busy and (self._verify_inflight or now - self._last_verify_at < 4.0):
+        # someone in the room clearly spoke over the Mac's own film (echo canceller: most of it is NOT the Mac's
+        # sound) -> never skipped; the skip below once dropped Dhina's real "Jarvis" 1.6 s after a film candidate
+        ear_on = EAR_STATUS["active"] and EAR_STATUS["playing"]
+        voice_over_film = ear_on and near_end(list(EAR_STATS)) >= EAR_NEAR_SURE
+        if busy and not voice_over_film and (self._verify_inflight or now - self._last_verify_at < 4.0):
             self._verify_skipped += 1
             return
         self._last_verify_at = now
@@ -1998,10 +2167,11 @@ class Listener:
     def _send_verify(self, score: float, word: str, source) -> None:
         pcm = b"".join(self.recent)
         raw = b"".join(self.recent_raw) if len(self.recent_raw) == len(self.recent) else None
-        job = ("verify", pcm, score, word, source, raw, self.clock())
+        ear = list(EAR_STATS) if EAR_STATUS["active"] and EAR_STATUS["playing"] else None
+        job = ("verify", pcm, score, word, source, raw, self.clock(), ear)
         self._verify_inflight = True
         if self.inline:
-            self._verify(pcm, score, word, source, raw)
+            self._verify(pcm, score, word, source, raw, None, ear)
             return
         if self.vworker is None or not self.vworker.is_alive():
             self.vworker = threading.Thread(target=self._verify_worker, daemon=True, name="dd-verify")
@@ -2022,15 +2192,15 @@ class Listener:
                 self.log(f"  (wake check failed: {type(e).__name__}: {e})")
 
     def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None, raw: bytes | None = None,
-                queued_at: float | None = None) -> None:
+                queued_at: float | None = None, ear: list | None = None) -> None:
         ok = False
         try:
-            ok = self._verify_one(pcm, score, word, source, raw, queued_at)
+            ok = self._verify_one(pcm, score, word, source, raw, queued_at, ear)
         finally:
             self._release_parked(bool(ok))
 
     def _verify_one(self, pcm: bytes, score: float, word: str, source, raw: bytes | None,
-                    queued_at: float | None) -> bool:
+                    queued_at: float | None, ear: list | None = None) -> bool:
         t0 = self.clock()
         if queued_at is not None and t0 - queued_at > 4.0:  # the machine was busy: a wake this late only confuses
             self.log(f"  wake: {word} candidate dropped (waited {t0 - queued_at:.1f}s for Whisper)")
@@ -2038,7 +2208,7 @@ class Listener:
                 self.wake.cooldown = 0
             return False
         text, how = "", ""
-        lp, ns = 0.0, 0.0
+        lp, ns, wp = 0.0, 0.0, -1.0
         voice = getattr(self.wake, "voice", None) if self.wake is not None else None
         rej = getattr(source, "rejects", None)
         film = rej is not None and len([t for t in rej if t0 - t < 60]) >= 3  # a film keeps proposing candidates
@@ -2046,22 +2216,40 @@ class Listener:
         n_crop = int(BUSY_CROP_S * RATE) * 2
         if film and len(clip) > n_crop:  # (his "Jarvis" mixed into his room's film: 61% heard on the last 1.5 s
             clip = clip[-n_crop:]       #  vs 51% on all 2 s — less film speech before the word to read instead)
-        if not speech_in(pcm, self.seg.floor):
+        near = near_end(ear) if ear else float("inf")
+        if near < EAR_NEAR_MIN:  # the Mac's own sound (the film) proposed it: no Whisper, no "film mode" count
+            self.log(f"  wake: {word} candidate rejected (the Mac's own sound — film/music on this Mac; near-end "
+                     f"{near:.3f}, 0.0s)")
+            self.tentative_until = 0.0
+            self.seg.reset()
+            self.seg.pre.clear()
+            if self.wake is not None and hasattr(self.wake, "cooldown"):
+                self.wake.cooldown = 0
+            return False
+        if not (speech_in(raw, self.seg.floor, min_rms=40.0, factor=1.8) if raw else
+                speech_in(pcm, self.seg.floor * self.agc.gain, min_rms=40.0 * self.agc.gain, factor=1.8)):
             how = "no voice in it"
         else:
             try:
-                res = self.verify_stt(clip)
-                text, lp, ns = (res, 0.0, 0.0) if isinstance(res, str) else res
+                res = self.verify_stt(clip, film=film) if self.verify_stt is stt_confirm else self.verify_stt(clip)
+                if isinstance(res, str):
+                    text = res
+                else:
+                    text, lp, ns = res[:3]
+                    wp = float(res[3]) if len(res) > 3 else -1.0
                 text = (text or "").strip()
             except Exception as e:
                 self.log(f"  (wake confirmation failed: {e})")
-            if text and confirms(word, text) and lp >= CONFIRM_MIN_LOGPROB and ns <= CONFIRM_MAX_NOSPEECH:
+            word_ok = wp < 0 or wp >= CONFIRM_MIN_WORDPROB  # (the prompt alone wrote "Jarvis." over film speech)
+            if text and confirms(word, text) and lp >= CONFIRM_MIN_LOGPROB and ns <= CONFIRM_MAX_NOSPEECH and word_ok:
                 how = "whisper"
             elif text and confirms(word, text):
-                how = f"unsure: log-prob {lp:.2f}, no-speech {ns:.2f}"
+                how = f"unsure: log-prob {lp:.2f}, no-speech {ns:.2f}" + ("" if word_ok else f", word p {wp:.2f}")
             if not how.startswith("whisper") and voice is not None and voice.recent_max() >= voice.gate + 0.1:
                 how = f"your voice {voice.recent_max():.2f}"  # sounds like your own recorded 'Jarvis'
         conf = f", log-prob {lp:.2f} no-speech {ns:.2f}" if text else ""
+        if text and wp >= 0:
+            conf += f" word p {wp:.2f}"
         if film and clip is not (raw if raw else pcm):
             conf += f"; film mode: last {BUSY_CROP_S:.1f}s"
         if how == "whisper" or how.startswith("your voice"):
@@ -2082,9 +2270,19 @@ class Listener:
                 self._verify_skipped = 0
             why = f"{how}; " if how and not how.startswith("unsure") else ""
             if self.diag and how != "no voice in it":  # rejected candidates: the data that shows a missed "Jarvis"
-                save_clip(pcm, time.strftime("cand-%H%M%S") + f"-{word}-{score:.2f}-rej-lp{lp:.2f}")
+                name = time.strftime("cand-%H%M%S") + f"-{word}-{score:.2f}-rej-lp{lp:.2f}"
+                save_clip(pcm, name)
+                if EAR_STATUS["active"] and EAR_RECENT:  # (+ mic and Mac sound as dd-ear gave them)
+                    save_clip(b"".join(EAR_RECENT), name + "-st", channels=2)
             self.log(f"  wake: {word} candidate rejected ({why}{text!r}{conf}, {self.clock() - t0:.1f}s{thr})")
             return False
+
+    def film_mode(self) -> bool:
+        """A film (or TV) keeps proposing wake candidates: 3+ rejected in the last minute."""
+        src = getattr(self.wake, "jarvis", None) if self.wake is not None else None
+        rej = getattr(src, "rejects", None)
+        now = self.clock()
+        return bool(rej) and len([t for t in rej if now - t < 60]) >= 3
 
     def _idle_state(self) -> str:
         """'recording' while a wake/follow-up window is open (the next words are a command), else 'listening'."""
@@ -2866,8 +3064,20 @@ def selftest() -> int:
     assert not ear_wanted(), "a fatal dd-ear failure keeps it off for this run"
     _ear_failures = 0
     assert ear_wanted()
+    # the film itself proposing a wake (the canceller left ~1% of what it removed) vs his voice over the film
+    film_only = [(0.01 * 3.6e5, 3.6e5)] * 100
+    film_only[40:45] = [(0.1 * 3.6e5, 3.6e5)] * 5  # one 100 ms transient the canceller missed
+    assert near_end(film_only) < EAR_NEAR_MIN, near_end(film_only)
+    over_film = film_only[:60] + [(0.4e5, 3.6e5)] * 20 + film_only[80:]  # a soft "Jarvis" (0.4 s) over the film
+    assert near_end(over_film) > 0.1 and near_end([(500.0, 0.0)] * 100) == float("inf")
+    os.environ["DD_EAR"] = "0"
+    assert not ear_wanted(), "DD_EAR=0 turns it off"
     os.environ.pop("DD_EAR"), os.environ.pop("DD_EAR_BIN")
-    assert not ear_wanted(), "off unless DD_EAR=1"
+    assert mac_is_playing("com.apple.audio.BuiltInSpeakerDevice.context.preventuseridlesleep <- Google Chrome Helper "
+                          "(Aperitif) [audio-in audio-out BuiltIn")
+    assert not mac_is_playing("com.apple.audio.BuiltInMicrophoneDevice.context.preventuseridlesleep <- ffmpeg [audio-in "
+                              "BuiltInMicrophoneDevice]; com.apple.audio.AVVCAggregateDevice-1.context <- corespeechd "
+                              "[audio-in audio-out BuiltInSpeakerDevice]")
     _helper_failures = 0
     os.environ["DD_AEC"] = "0"
     assert choose_source()[0] == "ffmpeg"

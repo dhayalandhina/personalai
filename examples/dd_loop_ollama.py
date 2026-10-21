@@ -392,8 +392,9 @@ def maybe_daily_learning(now: float | None = None) -> bool:
     return True
 
 
-def turn(messages: list[dict], user_text: str, model_fn=chat, tool_chars: int = 12000) -> str:
-    """One exchange. tool_chars: how much of each tool result the model reads back (voice keeps it short)."""
+def turn(messages: list[dict], user_text: str, model_fn=chat, tool_chars: int = 12000, employees: bool = True) -> str:
+    """One exchange. tool_chars: how much of each tool result the model reads back (voice keeps it short);
+    employees=False: no specialist brief (a spoken one-liner got a 'Varsha, I will set up the workflow' reply)."""
     record_feedback(user_text)
     quick = fast_action(user_text)
     if quick:
@@ -401,7 +402,7 @@ def turn(messages: list[dict], user_text: str, model_fn=chat, tool_chars: int = 
         _learn_async(["log", "--user", user_text, "--assistant", quick, "--skill", "mac-control"])
         return quick
     mem = run_script("memory", "memory.py", ["context", user_text])["stdout"].strip()
-    emp = assign_employee(user_text)
+    emp = assign_employee(user_text) if employees else ""
     content = (mem + "\n\n" if mem else "") + (emp + "\n\n" if emp else "") + user_text
     messages.append({"role": "user", "content": content})
     tools = LIB.tool_schemas()

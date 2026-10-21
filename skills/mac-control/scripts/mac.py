@@ -43,7 +43,12 @@ APPS = {
     "settings": "System Settings", "system settings": "System Settings", "android studio": "Android Studio",
     "xcode": "Xcode", "figma": "Figma", "zoom": "zoom.us", "cursor": "Cursor", "postman": "Postman",
     "calculator": "Calculator", "photos": "Photos", "preview": "Preview", "activity monitor": "Activity Monitor",
+    # how Whisper writes them when the command was said in Tamil ("குரோம் திற" -> "Gurum tire")
+    "kurom": "Google Chrome", "gurum": "Google Chrome", "krome": "Google Chrome", "crome": "Google Chrome",
+    "kroam": "Google Chrome", "spotifai": "Spotify", "whatsup": "WhatsApp", "watsapp": "WhatsApp",
 }
+SPOKEN = {"kurom": "chrome", "gurum": "chrome", "krome": "chrome", "crome": "chrome", "kroam": "chrome",
+          "spotifai": "spotify", "whatsup": "whatsapp", "watsapp": "whatsapp"}  # (for the spoken reply)
 SITES = {"youtube": "https://youtube.com", "github": "https://github.com", "gmail": "https://mail.google.com",
          "google": "https://google.com", "chatgpt": "https://chatgpt.com", "claude": "https://claude.ai",
          "linkedin": "https://linkedin.com", "upwork": "https://upwork.com"}
@@ -63,6 +68,10 @@ def build(action: str, args: list[str]) -> list[list[str]]:
     if action == "open-url":
         url = SITES.get(a0.lower(), a0)
         return [["open", url if re.match(r"^[a-z]+://", url) else f"https://{url}"]]
+    if action == "youtube-search":
+        return [["open", "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(" ".join(args).strip())]]
+    if action == "wifi-power":
+        return [["networksetup", "-setairportpower", "en0", "on" if a0 == "on" else "off"]]
     if action == "search-web":
         return [["open", "https://www.google.com/search?q=" + urllib.parse.quote_plus(" ".join(args))]]
     if action == "volume":
@@ -233,6 +242,8 @@ def run(action: str, args: list[str]) -> dict:
         return read_screen()
     if action == "time":
         return {"ok": True, "action": "time", "say": time.strftime("Ippo mani %I:%M %p, %A %d %B")}
+    if action == "date":
+        return {"ok": True, "action": "date", "say": time.strftime("Innaiku %A, %d %B %Y.").replace(" 0", " ")}
     if action in ("weather", "news", "remind"):
         return run_skill_action(action, args)
     if action == "open-folder":
@@ -255,7 +266,7 @@ def run(action: str, args: list[str]) -> dict:
 # ---------------- fast intent router (English + Thanglish) ----------------
 APP_WORDS = "|".join(sorted(map(re.escape, APPS), key=len, reverse=True))
 SITE_WORDS = "|".join(sorted(map(re.escape, SITES), key=len, reverse=True))
-OPEN = r"(?:open|thira|start|launch|run|kaattu)\w*"
+OPEN = r"(?:open|thira|thera|tira|tire|tera|thirakk|start|launch|run|kaattu)\w*"
 CLOSE = r"(?:close|quit|mooodu|moodu|kill|stop)\w*"
 FOLDER_WORDS = "|".join(sorted(map(re.escape, FOLDERS), key=len, reverse=True))
 DUR = r"(\d+)\s*(min|mins|minutes?|nimisham|nimidam|nimisam|h|hr|hrs|hours?|mani\s+neram|mani\s+nearam)"
@@ -270,11 +281,13 @@ ROUTES: list[tuple[str, str, object]] = [
     (rf"\b(?:{OPEN})\s+({SITE_WORDS})\b|\b({SITE_WORDS})\s+(?:ah\s+|a\s+)?(?:{OPEN})", "open-url", "site"),
     (rf"\b(?:{OPEN})\s+({APP_WORDS})\b|\b({APP_WORDS})\s+(?:ah\s+|a\s+|app\s+)?(?:{OPEN})", "open-app", "app"),
     (rf"\b(?:{CLOSE})\s+({APP_WORDS})\b|\b({APP_WORDS})\s+(?:ah\s+|a\s+|app\s+)?(?:{CLOSE})", "quit-app", "app"),
-    (r"\b(?:volume|sound)\b\D{0,12}(\d{1,3})", "volume", "num"),
+    (r"\b(?:volume|sound|savun|saund|soundu)\b\D{0,12}(\d{1,3})", "volume", "num"),
     (r"\bunmute\b|\bsound\s+(?:on|podu)\b", "volume", ["unmute"]),
     (r"\bmute\b|\bsound\s+(?:off|vendam|niruthu)\b", "volume", ["mute"]),
-    (r"\b(?:volume|sound)\s+(?:up|increase|jaasthi|athigam|koodu|eathu|ethu)\w*", "volume", ["up"]),
-    (r"\b(?:volume|sound)\s+(?:down|decrease|kammi|korai|kurai|eraku|iraku)\w*", "volume", ["down"]),
+    (r"\b(?:volume|sound|savun|saund|soundu)\s+(?:up|increase|jaasthi|jasthi|athigam|koodu|eathu|ethu)\w*", "volume", ["up"]),
+    (r"\b(?:volume|sound|savun|saund|soundu)\s+(?:down|decrease|kammi|kambi|korai|kurai|eraku|iraku)\w*", "volume", ["down"]),
+    (r"\b(?:youtube|yt)\s+(?:la|le|il|in|on)\s+(.+?)\s+(?:podu|pottu|play|paadu|search|thedu|kaattu|open|vai|vei)\w*\s*$"
+     r"|\bplay\s+(.+?)\s+(?:on|in)\s+youtube\b", "youtube-search", "grp"),
     (r"\b(?:next|adutha)\s+(?:song|track|paattu|pattu)\b", "media", ["next"]),
     (r"\b(?:previous|prev|munnadi)\s+(?:song|track|paattu|pattu)\b", "media", ["previous"]),
     (r"\b(?:pause|stop)\s+(?:song|music|paattu|pattu)\b|\b(?:song|music|paattu|pattu)\s+(?:pause|stop|niruthu)\w*", "media", ["pause"]),
@@ -282,10 +295,15 @@ ROUTES: list[tuple[str, str, object]] = [
     (r"\b(?:read|padi|padikka|paaru|paar|sollu)\b.{0,12}\bscreen\b|\bscreen\b.{0,16}\b(?:padi|padikka|read|enna irukku|enna iruku|la enna)\b"
      r"|\bwhat(?:'s| is) on (?:my |the )?screen\b|\bidha padi\b|\bidhai padi\b", "read-screen", []),
     (r"\bscreen\s*shot\b|\bscreenshot\b", "screenshot", []),
-    (r"\block\s+(?:the\s+)?(?:screen|mac|laptop|system)\b|\b(?:screen|mac|laptop)\s+lock\b", "lock", []),
+    (r"\block\s+(?:the\s+)?(?:screen|mac|laptop|system)\b|\b(?:screen|mac|laptop)\s+lock\b|^lock(?:\s+(?:pannu|panniru|it))?$",
+     "lock", []),
     (r"\bbattery\b|\bcharge\s+(?:evlo|enna|how much)\b", "battery", []),
+    (r"\bwi-?fi\s+(on|off)\b|\bwi-?fi\s+(?:ah\s+)?(?:anachu|anaichu|niruthu|stop)\w*", "wifi-power", "wifi"),
     (r"\bwi-?fi\b", "wifi", []),
-    (r"\b(?:time|mani)\s+(?:enna|evlo|aachu|what)\b|\bwhat(?:'s| is) the time\b|\bippo\s+mani\b", "time", []),
+    (r"\b(?:time|mani|manu|maani)\s+(?:enna|ennai|evlo|aachu|what)\b|\bwhat(?:'s| is) the time\b|\bwhat time is it\b"
+     r"|\bippo\w*\s+(?:mani|manu)\b", "time", []),
+    (r"\b(?:date|thethi|thedhi|tarikh)\s+(?:enna|what|sollu)\b|\bwhat(?:'s| is)\s+(?:the\s+|today'?s\s+)?date\b"
+     r"|\b(?:innaiku|today|inniki)\s+(?:enna\s+)?(?:date|thethi|kizhamai|day)\b|^(?:date|today'?s date)$", "date", []),
     (r"\bdark\s*mode\s+(on|off)\b", "dark-mode", "grp"),
     (r"\bdark\s*mode\b", "dark-mode", ["toggle"]),
     (r"\b(?:google|search)\s+(?:pannu\s+|for\s+)?(.+)$", "search-web", "rest"),
@@ -299,6 +317,12 @@ _NUM_WORDS = {**_ONES, "ten": 10, "eleven": 11, "twelve": 12, "fifteen": 15, "an
 for _tens, _tv in (("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50)):
     for _o, _ov in _ONES.items():
         _NUM_WORDS[f"{_tens} {_o}"] = _NUM_WORDS[f"{_tens}-{_o}"] = _tv + _ov
+_NUM_WORDS.update({"seventy": 70, "eighty": 80, "ninety": 90, "hundred": 100, "zero": 0})
+for _tens, _tv in (("sixty", 60), ("seventy", 70), ("eighty", 80), ("ninety", 90)):
+    for _o, _ov in _ONES.items():
+        _NUM_WORDS[f"{_tens} {_o}"] = _NUM_WORDS[f"{_tens}-{_o}"] = _tv + _ov
+_VOL_NUM_RE = re.compile(r"\b((?:volume|sound)\s+(?:ah\s+|a\s+|to\s+|ku\s+)?)("
+                         + "|".join(sorted((w for w in _NUM_WORDS if w not in ("a", "an")), key=len, reverse=True)) + r")\b")
 _NUM_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, _NUM_WORDS), key=len, reverse=True)) + r")"
                      r"(?=\s+(?:min|mins|minutes?|h|hr|hrs|hours?|nimisham|nimidam|nimisam)\b)")
 
@@ -314,6 +338,7 @@ def route(text: str) -> dict:
     t = re.sub(r"[^\w\s\-.']", " ", text.lower()).strip()
     t = re.sub(r"\s+", " ", t)
     t = _NUM_RE.sub(lambda m: str(_NUM_WORDS[m.group(1)]), t)
+    t = _VOL_NUM_RE.sub(lambda m: m.group(1) + str(_NUM_WORDS.get(m.group(2), 100)), t)  # "volume thirty" -> 30
     for pat, action, kind in ROUTES:
         m = re.search(pat, t)
         if not m:
@@ -327,6 +352,8 @@ def route(text: str) -> dict:
             args = [groups[0]]
         elif kind in ("app", "site", "grp"):
             args = [groups[0]]
+        elif kind == "wifi":
+            args = [groups[0] if groups else "off"]
         elif kind == "rest":
             q = re.sub(r"\b(pannu|panni|kaattu|please)\b", "", groups[0]).strip()
             if not q:
@@ -338,8 +365,39 @@ def route(text: str) -> dict:
     return {"action": None}
 
 
+def battery_say(out: str) -> str:
+    """pmset -g batt -> one spoken line ("Battery 85%, charge aagudhu.") instead of reading the raw output aloud."""
+    m = re.search(r"(\d{1,3})%", out)
+    if not m:
+        return out.strip()[:120]
+    pct = m.group(1)
+    low = out.lower()
+    if "charged" in low and "discharg" not in low:
+        state = "full charge"
+    elif "discharging" in low:
+        rem = re.search(r"(\d+):(\d{2}) remaining", out)
+        h, mins = (int(rem.group(1)), int(rem.group(2))) if rem else (0, 0)
+        left = (f"{h} mani {mins} nimisham" if h else f"{mins} nimisham") if (h or mins) else ""
+        state = "battery la odudhu" + (f", innum {left} varum" if left else "")
+    elif "charging" in low or "ac power" in low:
+        state = "charge aagudhu"
+    else:
+        state = ""
+    return f"Battery {pct}%" + (f", {state}." if state else ".")
+
+
+def wifi_say(out: str) -> str:
+    m = re.search(r"Current Wi-Fi Network:\s*(.+)", out)
+    if m:
+        return f"Wi-Fi: {m.group(1).strip()} la connect aagi irukku."
+    if "not associated" in out.lower():
+        return "Wi-Fi edhulayum connect aagala."
+    return out.strip()[:120]
+
+
 REPLIES = {"open-folder": "{0} folder open panniten.", "open-app": "{0} open panniten.", "quit-app": "{0} close panniten.", "open-url": "{0} open panniten.",
-           "search-web": "Google la '{0}' search panniten.", "volume": "Volume {0}.", "media": "Music {0}.",
+           "search-web": "Google la '{0}' search panniten.", "youtube-search": "YouTube la '{0}' search panniten.",
+           "wifi-power": "Wi-Fi {0} panniten.", "volume": "Volume {0}.", "media": "Music {0}.",
            "screenshot": "Screenshot eduthuten, Desktop la irukku.", "lock": "Screen lock panniten.",
            "read-screen": "Screen padichiten.",
            "dark-mode": "Dark mode {0}.", "notify": "Notification potten.", "type-text": "Type panniten.",
@@ -355,10 +413,15 @@ def do(text: str) -> dict:
         return {"handled": True, "ok": False, "say": f"Mudiyala: {res.get('error', 'error')}", **res}
     if "say" in res:
         say = res["say"]
-    elif res.get("output") and r["action"] in ("battery", "wifi", "apps", "clipboard"):
+    elif res.get("output") and r["action"] == "battery":
+        say = battery_say(res["output"])
+    elif res.get("output") and r["action"] == "wifi":
+        say = wifi_say(res["output"])
+    elif res.get("output") and r["action"] in ("apps", "clipboard"):
         say = res["output"][:300]
     else:
-        say = REPLIES.get(r["action"], "Done.").format(*(r["args"] or [""]))
+        args = [SPOKEN.get(a.lower(), a) if r["action"] in ("open-app", "quit-app") else a for a in (r["args"] or [""])]
+        say = REPLIES.get(r["action"], "Done.").format(*args)
     return {"handled": True, "ok": True, "say": say, **res}
 
 
@@ -391,6 +454,15 @@ def selftest() -> int:
         "Vanakkam sir nu type pannu": ("type-text", ["Vanakkam sir"]),
         "press enter": ("press-key", ["enter"]), "tab press pannu": ("press-key", ["tab"]), "cmd + s adi": ("press-key", ["cmd+s"]),
         "what type of database is best": (None, None),
+        "volume thirty vai": ("volume", ["30"]), "Volume twenty five.": ("volume", ["25"]), "sound ah fifty vai": ("volume", ["50"]),
+        "date enna": ("date", []), "innaiku date enna": ("date", []), "what's the date today": ("date", []),
+        "innaiku enna kizhamai": ("date", []),
+        "youtube la ilayaraja song podu": ("youtube-search", ["ilayaraja song"]),
+        "play arijit singh songs on youtube": ("youtube-search", ["arijit singh songs"]),
+        "lock pannu": ("lock", []), "wifi off pannu": ("wifi-power", ["off"]), "wifi on pannu": ("wifi-power", ["on"]),
+        "wifi connect aagi irukka": ("wifi", []), "paattu podu youtube la": ("media", ["play"]),
+        "Gurum tire.": ("open-app", ["gurum"]), "Savun kammi pannu.": ("volume", ["down"]),
+        "Ippon manu enna?": ("time", []), "What time is it now?": ("time", []),
     }
     for text, (action, args) in cases.items():
         r = route(text)
@@ -406,7 +478,16 @@ def selftest() -> int:
     assert do("tab press pannu")["say"] == "tab press panniten." and do("press enter")["would_run"][0][-1].endswith("key code 36")
     d = do("chrome open pannu")
     assert d["handled"] and d["say"] == "chrome open panniten." and d["dry_run"], d
-    assert do("time enna")["say"].startswith("Ippo mani")
+    assert do("Gurum tire.")["say"] == "chrome open panniten."
+    assert do("time enna")["say"].startswith("Ippo mani") and do("date enna")["say"].startswith("Innaiku ")
+    assert battery_say("Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t85%; discharging; 4:12 remaining present: true") \
+        == "Battery 85%, battery la odudhu, innum 4 mani 12 nimisham varum."
+    assert battery_say(" -InternalBattery-0 (id=1)\t9%; discharging; 0:25 remaining") == "Battery 9%, battery la odudhu, innum 25 nimisham varum."
+    assert battery_say(" -InternalBattery-0 (id=1)\t80%; discharging; (no estimate)") == "Battery 80%, battery la odudhu."
+    assert battery_say("Now drawing from 'AC Power'\n -InternalBattery-0 (id=1)\t62%; charging; 1:05 remaining") == "Battery 62%, charge aagudhu."
+    assert battery_say("Now drawing from 'AC Power'\n -InternalBattery-0 (id=1)\t100%; charged; 0:00 remaining") == "Battery 100%, full charge."
+    assert wifi_say("Current Wi-Fi Network: Dhina-5G") == "Wi-Fi: Dhina-5G la connect aagi irukku."
+    assert do("youtube la ilayaraja song podu")["would_run"] == [["open", "https://www.youtube.com/results?search_query=ilayaraja+song"]]
     assert do("write a poem") == {"handled": False}
     rs = do("screen la enna irukku")
     assert rs["handled"] and rs["dry_run"] and rs["would_run"][0][0] == "screencapture", rs
