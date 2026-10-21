@@ -816,17 +816,17 @@ class WakeDetector:
         self.last_source = None
         self.soft_enabled = True   # the listener turns this off when Whisper confirmation is off
 
-        def load(given, word, path):
+        def load(given, word, path, default="1"):
             if given is not None:
                 return given or None
-            if os.environ.get(f"DD_WAKE_{word.upper()}", "1") == "0" or not os.path.isfile(path):
+            if os.environ.get(f"DD_WAKE_{word.upper()}", default) == "0" or not os.path.isfile(path):
                 return None
             try:
                 return WakeHead(path, word=word)
             except Exception as e:
                 log(f"  ({word} wake head not loaded: {str(e)[:100]})")
                 return None
-        self.dd = load(dd_head, "dd", DD_HEAD_FILE)
+        self.dd = load(dd_head, "dd", DD_HEAD_FILE, default="0")  # opt-in (DD_WAKE_DD=1): media audio fools it
         self.jarvis = load(jarvis_head, "jarvis", JARVIS_HEAD_FILE)
         self.soft = SoftJarvis(hard=self.threshold)
 
@@ -1637,6 +1637,7 @@ def selftest() -> int:
     if have_oww:
         real = WakeDetector(log=lambda *a: None)
         assert all(isinstance(h, WakeHead) for h in real.heads) and real.soft.hard == real.threshold
+        assert real.dd is None or os.environ.get("DD_WAKE_DD") == "1", "dee dee is opt-in"
         assert not any(real.feed(b"\x00" * FRAME_BYTES) for _ in range(150))
 
     # barge-in: "hey jarvis" while dd is talking cuts the sentence, then arms as soon as it is quiet
