@@ -325,19 +325,48 @@ def _relay_stderr(p, tag: str, sink: list, log=print) -> None:
         pass
 
 
-def helper_source(binary: str, log=print):
+class HelperSilent(RuntimeError):
+    """dd-mic exited with code 7: that voice-processing wiring only gives digital zeros on this Mac."""
+
+    def __init__(self, mode: int):
+        super().__init__(f"dd-mic mode {mode} silent")
+        self.mode = mode
+
+
+def mic_mode_file() -> Path:
+    return Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "mic_mode"
+
+
+def load_mic_mode() -> int:
+    try:
+        return max(0, min(4, int(mic_mode_file().read_text().strip())))
+    except (OSError, ValueError):
+        return 0
+
+
+def save_mic_mode(mode: int) -> None:
+    try:
+        mic_mode_file().parent.mkdir(parents=True, exist_ok=True)
+        mic_mode_file().write_text(str(mode))
+    except OSError:
+        pass
+
+
+def helper_source(binary: str, log=print, mode: int = 0):
     """Frames from dd-mic (AVAudioEngine voice processing: cancels the Mac's own playback). Same pipe protocol.
+    mode: which voice-processing wiring to start with (see dd-mic.swift); exit code 7 -> HelperSilent.
     Digital silence from the first frame on (wrong input device, no permission, voice processing muted) is
     detected within SILENCE_FALLBACK_MS and the helper is given up for this run -> ffmpeg takes over."""
     global _helper_failures
     started = time.monotonic()
-    p = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    p = subprocess.Popen([binary, "--mode", str(mode)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         stdin=subprocess.DEVNULL)
     _children.append(p)
     said: list[str] = []
     relay = threading.Thread(target=_relay_stderr, args=(p, "dd-mic", said, log), daemon=True)
     relay.start()
     got = zeros = 0
-    silent = False
+    silent = saved = False
     try:
         while True:
             frame = p.stdout.read(FRAME_BYTES)
@@ -351,14 +380,25 @@ def helper_source(binary: str, log=print):
                     break
             else:
                 zeros = 0
+                if not saved and got >= 1500:  # 30 s of real audio: this wiring works on this Mac — remember it
+                    saved = True
+                    used = next((int(m.group(1)) for line in said if (m := re.search(r"\[mode (\d)\]", line))), mode)
+                    save_mic_mode(used)
             yield frame
     finally:
+        try:
+            code = p.wait(timeout=0.3)
+        except Exception:
+            code = None
         p.kill()
         try:
             p.wait(timeout=2)
         except Exception:
             pass
         relay.join(timeout=1)
+    if code == 7:
+        m = next((int(x.group(1)) for line in said if (x := re.search(r"silent in mode (\d)", line))), mode)
+        raise HelperSilent(m)
     if silent:
         _helper_failures = 2
         raise RuntimeError("dd-mic hears nothing (digital silence since start — input device / permission)")
@@ -370,10 +410,17 @@ def helper_source(binary: str, log=print):
 def mic_source(log=print):
     kind, path = choose_source()
     if kind == "helper":
-        log(f"  mic: dd-mic helper (echo cancellation) {path}")
+        mode = load_mic_mode()
+        log(f"  mic: dd-mic helper (echo cancellation) {path} — mode {mode}")
         try:
-            yield from helper_source(path, log=log)
-            return
+            while True:
+                try:
+                    yield from helper_source(path, log=log, mode=mode)
+                    return
+                except HelperSilent as e:  # that wiring gives only zeros here: next one, in a fresh process
+                    mode = min(4, e.mode + 1)
+                    save_mic_mode(mode)
+                    log(f"  mic: dd-mic mode {e.mode} silent on this Mac -> mode {mode}")
         except RuntimeError as e:
             if _helper_failures < 2:
                 raise  # it worked and then died: the listener restarts the stream
@@ -1996,6 +2043,30 @@ def selftest() -> int:
     assert _helper_failures == 1  # it exited within 3 s
     _helper_failures = 2
     assert choose_source()[0] == "ffmpeg", "two early deaths must fall back to ffmpeg"
+    # exit code 7 = "this voice-processing wiring is silent here": mic_source relaunches with the next mode and
+    # remembers it; the mode in use comes from the helper's own "[mode N]" line
+    _helper_failures = 0
+    os.environ["DD_HOME_SAVED2"] = os.environ.get("DD_HOME", "")
+    os.environ["DD_HOME"] = _tf.mkdtemp(prefix="dd-micmode-")
+    modal = fake.parent / "dd-mic-modal"
+    modal.write_text("#!/bin/sh\n"
+                     "case \"$2\" in\n"
+                     "  0) echo 'input x5 voice processing ON [mode 0]' >&2; echo 'silent in mode 0 — relaunch' >&2; exit 7;;\n"
+                     "  *) echo \"input x1 [mode $2]\" >&2; head -c 1280 /dev/urandom;;\n"
+                     "esac\n")
+    modal.chmod(modal.stat().st_mode | _stat.S_IEXEC)
+    os.environ["DD_MIC_BIN"] = str(modal)
+    assert load_mic_mode() == 0
+    seen: list[str] = []
+    got_modal = []
+    try:
+        for f in mic_source(log=seen.append):
+            got_modal.append(f)
+    except RuntimeError:
+        pass
+    assert any("mode 0 silent on this Mac -> mode 1" in m for m in seen) and load_mic_mode() == 1, seen
+    assert len(got_modal) == 2, len(got_modal)  # mode 1's two frames
+    os.environ["DD_HOME"] = os.environ.pop("DD_HOME_SAVED2") or os.environ["DD_HOME"]
     # a helper that streams nothing but digital zeros (wrong device / no permission) is given up within
     # SILENCE_FALLBACK_MS and mic_source() carries on with ffmpeg in the same run — no restart, no notification
     _helper_failures = 0

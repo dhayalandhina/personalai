@@ -332,6 +332,11 @@ def ensure_mic_helper() -> None:
     print("building dd-mic (echo cancellation)...", flush=True)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
     print(("dd-mic built: " + note) if r.returncode == 0 else f"dd-mic build failed: {r.stderr.strip()[-400:]}", flush=True)
+    if r.returncode == 0:  # a new helper may manage voice processing where the old one could not: try all again
+        try:
+            dd_listen.mic_mode_file().unlink()
+        except OSError:
+            pass
 
 
 def ensure_python_deps(mods=(("openwakeword", "openwakeword"), ("faster_whisper", "faster-whisper"))) -> None:

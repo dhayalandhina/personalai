@@ -72,20 +72,28 @@ let outDev = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
 warn("devices: input '\(deviceName(inDev))' \(Int(deviceRate(inDev))) Hz, output '\(deviceName(outDev))' \(Int(deviceRate(outDev))) Hz")
 
 // 3. The engine. Voice processing is one IO unit for both directions: the output side must run (it is the echo
-//    canceller's reference signal). Macs differ in what they accept, so the ways to set it up are tried in turn,
-//    most capable first; a way that starts but only delivers digital zeros for 3 s is abandoned for the next:
-//    0) mixer → output connected with the output hardware's own format
-//    1) a silent player node keeping the output side running
+//    canceller's reference signal). Macs differ in what they accept, so there are several ways to set it up,
+//    most capable first. A way that fails to start falls through to the next one here; a way that starts but
+//    only delivers digital zeros exits with code 7 ("silent in mode N") — a voice-processing unit cannot be set
+//    up twice in one process, so dd relaunches the helper with --mode N+1 and remembers what works on this Mac.
+//    0) an inaudible player keeps the output rendering + mixer → output in the hardware's own format
+//    1) mixer → output in the hardware's own format
 //    2) the implicit mixer (AVAudioEngine's default wiring)
 //    3) voice processing input only
 //    4) plain microphone (no echo cancellation; dd's own software gain + silence check still apply)
 let aec = !CommandLine.arguments.contains("--no-aec")
-let modeNames = ["voice processing ON (mixer → output)", "voice processing ON (silent player)",
+var startMode = 0
+if let i = CommandLine.arguments.firstIndex(of: "--mode"), i + 1 < CommandLine.arguments.count,
+   let m = Int(CommandLine.arguments[i + 1]) {
+    startMode = max(0, min(4, m))
+}
+let modeNames = ["voice processing ON (player + mixer)", "voice processing ON (mixer → output)",
                  "voice processing ON (implicit mixer)", "voice processing ON (input only)", "voice processing off"]
 var zeroSamples = 0
 var silenceReported = false
 var switchRequested = false
 var keepPlayer: AVAudioPlayerNode? = nil
+var keepBuffer: AVAudioPCMBuffer? = nil
 
 func start(mode: Int) -> AVAudioEngine? {
     let engine = AVAudioEngine()
@@ -103,16 +111,27 @@ func start(mode: Int) -> AVAudioEngine? {
         switch mode {
         case 0:
             let hw = engine.outputNode.outputFormat(forBus: 0)
+            let rate = hw.sampleRate > 0 ? hw.sampleRate : 48000
+            if let pfmt = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1),
+               let b = AVAudioPCMBuffer(pcmFormat: pfmt, frameCapacity: AVAudioFrameCount(rate)) {
+                let player = AVAudioPlayerNode()
+                engine.attach(player)
+                engine.connect(player, to: engine.mainMixerNode, format: pfmt)
+                b.frameLength = AVAudioFrameCount(rate)
+                let p = b.floatChannelData![0]
+                for i in 0..<Int(rate) { p[i] = Float.random(in: -0.000001...0.000001) }  // inaudible, never zero
+                keepPlayer = player
+                keepBuffer = b
+            }
+            if hw.sampleRate > 0 && hw.channelCount > 0 {
+                engine.connect(engine.mainMixerNode, to: engine.outputNode, format: hw)
+            }
+        case 1:
+            let hw = engine.outputNode.outputFormat(forBus: 0)
             if hw.sampleRate > 0 && hw.channelCount > 0 {
                 engine.connect(engine.mainMixerNode, to: engine.outputNode, format: hw)
             }
             engine.mainMixerNode.outputVolume = 0
-        case 1:
-            let player = AVAudioPlayerNode()
-            engine.attach(player)
-            engine.connect(player, to: engine.mainMixerNode, format: nil)
-            engine.mainMixerNode.outputVolume = 0
-            keepPlayer = player
         case 2:
             engine.mainMixerNode.outputVolume = 0
         default:
@@ -210,7 +229,10 @@ func start(mode: Int) -> AVAudioEngine? {
         keepPlayer = nil
         return nil
     }
-    if mode == 1, let p = keepPlayer { p.play() }
+    if mode == 0, let p = keepPlayer, let b = keepBuffer {
+        p.scheduleBuffer(b, at: nil, options: .loops, completionHandler: nil)
+        p.play()
+    }
     warn("input '\(defaultInputName())' \(Int(inFmt.sampleRate)) Hz x\(inFmt.channelCount) -> 16000 Hz mono, \(modeNames[vp ? mode : 4]) [mode \(mode)]")
     return engine
 }
@@ -226,21 +248,11 @@ func tryStart(from: Int) {
     exit(4)
 }
 
-tryStart(from: 0)
+tryStart(from: aec ? startMode : 4)
 while true {
     RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.25))
-    if switchRequested {
-        switchRequested = false
-        if currentMode < 4 {
-            warn("3 s of digital silence in mode \(currentMode) — trying mode \(currentMode + 1)")
-            running?.inputNode.removeTap(onBus: 0)
-            running?.stop()
-            running = nil
-            keepPlayer = nil
-            zeroSamples = 0
-            silenceReported = false
-            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.6))  // let the old voice-processing unit go
-            tryStart(from: currentMode + 1)
-        }
+    if switchRequested && currentMode < 4 {
+        warn("silent in mode \(currentMode) — dd relaunches with --mode \(currentMode + 1)")
+        exit(7)
     }
 }
