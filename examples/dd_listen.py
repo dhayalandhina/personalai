@@ -894,11 +894,25 @@ class WakeHead:
         o = float((h @ self.w2 + self.b2)[0, 0])
         return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, o))))
 
+    # While a film / video keeps proposing candidates that Whisper rejects, the bar rises for a while and falls back
+    # by itself (half-life ~1.5 min). Capped at 0.97: Dhina's own "Jarvis" scores ~1.0 on the retrained head, so he
+    # still gets through, while dd stops running Whisper on the film every few seconds (CPU, queued checks).
+    BOOST_CAP = 0.97
+
+    @property
+    def effective_threshold(self) -> float:
+        b = getattr(self, "boost", 0.0)
+        return min(max(self.BOOST_CAP, self.threshold), self.threshold + b) if b else self.threshold
+
     def step(self, feats) -> float | None:
         """Score one chunk's embedding window; the score when it fires (`need` chunks in a row above threshold)."""
         s = self.score(feats)
         self.last_score = s
-        self.streak = self.streak + 1 if s >= self.threshold else 0
+        b = getattr(self, "boost", 0.0)
+        if b:
+            b *= 0.9994  # per 80 ms chunk
+            self.boost = b if b > 0.005 else 0.0
+        self.streak = self.streak + 1 if s >= self.effective_threshold else 0
         if self.streak >= self.need:
             self.streak = 0
             return s
@@ -917,10 +931,12 @@ class WakeHead:
         self.threshold = max(self.base_threshold, self.threshold - 0.01)
 
     def rejected(self, now: float) -> None:
-        """Whisper heard something else. Only counted: raising the threshold on rejections (as this used to) made
-        dd deaf to a quiet real "Jarvis" (head 0.96) after ten minutes of anime had pushed it to 0.985 — and
-        Whisper, not the head, is what keeps videos from waking dd."""
+        """Whisper heard something else. Three of those within a minute (a video playing) raise the bar a step for a
+        while (see BOOST_CAP); it decays by itself. (A permanent raise, as this used to do, made dd deaf to a quiet
+        real "Jarvis" after ten minutes of anime had pushed it to 0.985.)"""
         self.rejects.append(now)
+        if len([t for t in self.rejects if now - t < 60]) >= 3:
+            self.boost = min(max(0.0, self.BOOST_CAP - self.threshold), getattr(self, "boost", 0.0) + 0.06)
 
 
 DDHead = WakeHead  # (older name)
@@ -1681,7 +1697,7 @@ class Listener:
     def _send_verify(self, score: float, word: str, source) -> None:
         pcm = b"".join(self.recent)
         raw = b"".join(self.recent_raw) if len(self.recent_raw) == len(self.recent) else None
-        job = ("verify", pcm, score, word, source, raw)
+        job = ("verify", pcm, score, word, source, raw, self.clock())
         if self.inline:
             self._verify(pcm, score, word, source, raw)
             return
@@ -1691,8 +1707,14 @@ class Listener:
         self.queue.append(job)
         self.work.set()
 
-    def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None, raw: bytes | None = None) -> None:
+    def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None, raw: bytes | None = None,
+                queued_at: float | None = None) -> None:
         t0 = self.clock()
+        if queued_at is not None and t0 - queued_at > 4.0:  # the machine was busy: a wake this late only confuses
+            self.log(f"  wake: {word} candidate dropped (waited {t0 - queued_at:.1f}s for Whisper)")
+            if self.wake is not None and hasattr(self.wake, "cooldown"):
+                self.wake.cooldown = 0
+            return
         text, how = "", ""
         lp, ns = 0.0, 0.0
         voice = getattr(self.wake, "voice", None) if self.wake is not None else None
@@ -1723,7 +1745,7 @@ class Listener:
                 self.wake.cooldown = 0  # an early, wrong candidate must not block the real word that follows
             if source is not None:
                 source.rejected(self.clock())
-            thr = f"; threshold {source.threshold:.2f}" if source is not None else ""
+            thr = f"; threshold {getattr(source, 'effective_threshold', source.threshold):.2f}" if source is not None else ""
             why = f"{how}; " if how and not how.startswith("unsure") else ""
             if self.diag and how != "no voice in it":  # rejected candidates: the data that shows a missed "Jarvis"
                 save_clip(pcm, time.strftime("cand-%H%M%S") + f"-{word}-{score:.2f}-rej-lp{lp:.2f}")
@@ -2169,6 +2191,11 @@ def selftest() -> int:
     for t in range(20):
         head.rejected(1000.0 + t)
     assert head.threshold == 0.9 and len(head.rejects) == 20, head.threshold
+    # ...but a burst of rejections (a film playing) raises the bar for a while, capped, and it decays by itself
+    assert abs(head.effective_threshold - WakeHead.BOOST_CAP) < 1e-6, head.effective_threshold
+    for _ in range(6000):  # ~8 min of chunks
+        head.step(cold)
+    assert head.effective_threshold == head.threshold == 0.9, head.effective_threshold
 
     # decide(): instant hey-jarvis > your voice print > heads > soft; with a voice print, heads/soft must sound like you
     class _H:
