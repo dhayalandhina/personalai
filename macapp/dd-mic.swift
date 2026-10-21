@@ -127,20 +127,62 @@ func start(mode: Int) -> AVAudioEngine? {
         return nil
     }
     guard let outFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true),
-          let conv = AVAudioConverter(from: inFmt, to: outFmt) else {
+          let monoFmt = AVAudioFormat(standardFormatWithSampleRate: inFmt.sampleRate, channels: 1),
+          let conv = AVAudioConverter(from: monoFmt, to: outFmt),
+          let convAll = AVAudioConverter(from: inFmt, to: outFmt) else {
         warn("audio converter failed for \(inFmt)")
         return nil
     }
+    // Voice processing hands over several channels (the Mac's mic array); which one carries the processed voice
+    // differs per model. The first ~1.7 s decide: the loudest channel is used from then on (mean until then).
+    var chanPeak = [Float](repeating: 0, count: 32)
+    var taps = 0
+    var useChannel = -1
     input.installTap(onBus: 0, bufferSize: 2048, format: inFmt) { buf, _ in
-        let cap = AVAudioFrameCount(Double(buf.frameLength) * outFmt.sampleRate / inFmt.sampleRate) + 32
+        let frames = Int(buf.frameLength)
+        let chs = Int(buf.format.channelCount)
+        var source: AVAudioPCMBuffer = buf
+        var converter = convAll
+        if let fd = buf.floatChannelData, frames > 0, chs > 1,
+           let mono = AVAudioPCMBuffer(pcmFormat: monoFmt, frameCapacity: AVAudioFrameCount(frames)) {
+            if taps < 40 {
+                for c in 0..<min(chs, 32) {
+                    var p: Float = 0
+                    for i in 0..<frames { p = max(p, abs(fd[c][i])) }
+                    chanPeak[c] = max(chanPeak[c], p)
+                }
+                taps += 1
+                if taps == 40 {
+                    let peaks = Array(chanPeak.prefix(min(chs, 32)))
+                    let best = peaks.max() ?? 0
+                    useChannel = best > 0 ? (peaks.firstIndex(of: best) ?? 0) : -1
+                    warn("channels \(chs): peaks \(peaks.map { String(format: "%.4f", $0) }) -> using \(useChannel >= 0 ? "channel \(useChannel)" : "mean (all silent)")")
+                }
+            }
+            mono.frameLength = AVAudioFrameCount(frames)
+            let dst = mono.floatChannelData![0]
+            if useChannel >= 0 {
+                for i in 0..<frames { dst[i] = fd[useChannel][i] }
+            } else {
+                let k = Float(chs)
+                for i in 0..<frames {
+                    var acc: Float = 0
+                    for c in 0..<chs { acc += fd[c][i] }
+                    dst[i] = acc / k
+                }
+            }
+            source = mono
+            converter = conv
+        }
+        let cap = AVAudioFrameCount(Double(frames) * outFmt.sampleRate / inFmt.sampleRate) + 32
         guard let ob = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return }
         var consumed = false
         var err: NSError?
-        let st = conv.convert(to: ob, error: &err) { _, status in
+        let st = converter.convert(to: ob, error: &err) { _, status in
             if consumed { status.pointee = .noDataNow; return nil }
             consumed = true
             status.pointee = .haveData
-            return buf
+            return source
         }
         if st == .error { warn("convert: \(err?.localizedDescription ?? "?")"); return }
         let n = Int(ob.frameLength)
@@ -197,6 +239,7 @@ while true {
             keepPlayer = nil
             zeroSamples = 0
             silenceReported = false
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.6))  // let the old voice-processing unit go
             tryStart(from: currentMode + 1)
         }
     }
