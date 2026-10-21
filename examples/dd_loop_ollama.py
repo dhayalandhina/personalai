@@ -301,11 +301,51 @@ def feedback_signal(user_text: str) -> tuple[str, str | None] | None:
     return None
 
 
+_learn_q: list = []
+_learn_cv = threading.Condition()
+_learn_thread: threading.Thread | None = None
+
+
+def _learn_async(args: list[str]) -> None:
+    """learn.py calls that only record (log a turn): off the reply path, in order, one at a time. (Each one is a
+    Python start-up — ~0.3-1 s on a busy 8 GB Mac — that used to sit between the answer and dd saying it.)"""
+    global _learn_thread
+    with _learn_cv:
+        _learn_q.append(args)
+        _learn_cv.notify_all()
+        if _learn_thread is None:
+            _learn_thread = threading.Thread(target=_learn_worker, daemon=True, name="dd-learn-log")
+            _learn_thread.start()
+
+
+def _learn_worker() -> None:
+    global _learn_thread
+    while True:
+        with _learn_cv:
+            if not _learn_q and not _learn_cv.wait_for(lambda: bool(_learn_q), timeout=30):
+                _learn_thread = None  # (under the lock: the next _learn_async starts a fresh worker)
+                return
+            args = _learn_q[0]
+        try:
+            run_script("self-learning", "learn.py", args)
+        finally:
+            with _learn_cv:
+                _learn_q.pop(0)
+                _learn_cv.notify_all()
+
+
+def learn_flush(timeout: float = 15.0) -> bool:
+    """Wait until the queued learning-log writes are done (feedback must land on the right turn). True if done."""
+    with _learn_cv:
+        return _learn_cv.wait_for(lambda: not _learn_q, timeout=timeout)
+
+
 def record_feedback(user_text: str) -> bool:
     """Capture Dhina's reaction to the last reply in the learning log (good / bad + correction). Silent."""
     fb = feedback_signal(user_text)
     if not fb:
         return False
+    learn_flush()  # the turn it rates may still be on its way to the log
     args = ["feedback", "--last", "--rating", fb[0]] + (["--correction", fb[1]] if fb[1] else [])
     return bool(run_script("self-learning", "learn.py", args)["ok"])
 
@@ -336,7 +376,7 @@ def turn(messages: list[dict], user_text: str, model_fn=chat) -> str:
     quick = fast_action(user_text)
     if quick:
         messages += [{"role": "user", "content": user_text}, {"role": "assistant", "content": quick}]
-        run_script("self-learning", "learn.py", ["log", "--user", user_text, "--assistant", quick, "--skill", "mac-control"])
+        _learn_async(["log", "--user", user_text, "--assistant", quick, "--skill", "mac-control"])
         return quick
     mem = run_script("memory", "memory.py", ["context", user_text])["stdout"].strip()
     emp = assign_employee(user_text)
@@ -355,7 +395,7 @@ def turn(messages: list[dict], user_text: str, model_fn=chat) -> str:
                 nudged = True
                 messages.append({"role": "user", "content": "Don't describe it — call the tool now (run_shell or run_skill_script)."})
                 continue
-            run_script("self-learning", "learn.py", ["log", "--user", user_text, "--assistant", reply])
+            _learn_async(["log", "--user", user_text, "--assistant", reply])
             return reply
         for call in calls:
             fn = call.get("function", {})
