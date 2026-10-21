@@ -1,13 +1,15 @@
 {
- "trained": "2026-10-21, round 2: synthetic voices (Piper/espeak) + Dhina's 5 setup recordings (x300 augmented, also mixed into media) + real negatives hard-mined twice: Japanese anime speech (joujiboi/japanese-anime-speech), JSUT, Tamil (FLEURS ta_in), English (LibriSpeech)",
+ "trained": "2026-10-21, round 3: synthetic voices (Piper/espeak) + Dhina's 5 setup recordings (x300 augmented, also mixed into media) + real negatives hard-mined twice: Japanese anime speech (joujiboi/japanese-anime-speech), JSUT, Tamil (FLEURS ta_in), English (LibriSpeech); round 3 adds 20 film clips from Dhina's own room (candidates Whisper rejected) + 25 near misses, augmented",
  "held_out_media_false_candidates_per_hour": {
-  "0.7": 31.5,
-  "0.9": 21.5,
-  "0.98": 10.5,
+  "0.7": 15.5,
+  "0.9": 6.0,
+  "0.98": 2.5,
+  "round2_at_0.7": 31.5,
   "previous_head_at_0.7": 112.0
  },
- "dhina_leave_one_out": "5/5 recordings score 1.0 at all 8 chunk alignments, at sofa and far levels",
+ "dhina_leave_one_out": "5/5 recordings score 1.0 at all 8 chunk alignments, sofa and far levels (round 3)",
  "dhina_live_clip_140658": "1.0 at 8/8 alignments (previous head: >=0.7 at 6/8)",
  "listener_replay_quiet_room": "18/18 woke, 0 false wakes (previous head 11/18)",
- "listener_replay_anime_+15dB": "13/18 woke, 0 false wakes, 168 Whisper checks/h (previous head 8/18, 582/h)"
+ "listener_replay_anime_+15dB": "13/18 woke, 0 false wakes, 168 Whisper checks/h (previous head 8/18, 582/h)",
+ "held_out_room_film_clips_fired": "8/20 at 0.7, 4/20 at 0.97 (round 2: 18/20, 14/20)"
 }
