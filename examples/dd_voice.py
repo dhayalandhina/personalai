@@ -156,6 +156,7 @@ def setup(log=print) -> bool:
 # ---------------- engines ----------------
 _edge_down_until = 0.0
 _edge_lock = threading.Lock()
+_edge_ok_once = False  # the very first request (TLS + token, at app start next to model loading) may take longer
 
 
 def _edge_synth(text: str, voice: str, rate: str, path: str, timeout: float) -> bool:
@@ -178,14 +179,17 @@ def edge_synth(text: str, voice: str, rate: str, path: str, timeout: float = 5.0
     """One sentence -> mp3 via Microsoft's online voices. A quick failure (a dropped connection) is retried once; a
     slow one is not (waiting longer than ~5 s for a voice is worse than the offline one). After a failure the online
     voices are skipped for 30 s, so with no internet every sentence does not wait for its own timeout."""
-    global _edge_down_until
+    global _edge_down_until, _edge_ok_once
     if time.monotonic() < _edge_down_until or not edge_ready():
         return False
     err = ""
+    if not _edge_ok_once:
+        timeout = max(timeout, 12.0)
     for attempt in range(2):
         t0 = time.monotonic()
         try:
             if _edge_synth(text, voice, rate, path, timeout) and os.path.getsize(path) > 0:
+                _edge_ok_once = True
                 return True
             err = "no audio"
         except Exception as e:

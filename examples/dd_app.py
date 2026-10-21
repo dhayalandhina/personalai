@@ -468,8 +468,7 @@ def run_app() -> int:
         dd.warm()
         try:  # the Tamil Nadu voices (edge-tts, a few MB): installed once; Kokoro stays as the offline fallback
             if dd_voice.setup(log=lambda m: print(m, flush=True)):
-                if dd_voice.kokoro_ready():
-                    dd_voice.engine()
+                # (Kokoro is only the offline fallback now: loaded when first needed, not held in RAM — 8 GB Macs)
                 tamil = dd_voice.mac_tamil_voice()
                 print(f"voice: {dd_voice.VOICES[dd_voice.current()]['label']} ({dd_voice.current_speed()} speed) ready"
                       f"; offline: {('Mac ' + tamil) if tamil else ''}{' + ' if tamil and dd_voice.kokoro_ready() else ''}"
