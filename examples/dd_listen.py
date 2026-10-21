@@ -61,30 +61,39 @@ def rms(frame: bytes) -> float:
 
 
 class AutoGain:
-    """Software gain for quiet inputs. AVAudioEngine's raw microphone on some Macs delivers speech at ~150-250 RMS
-    (the wake model and the segmenter expect ~1000-4000): frames are scaled so the loudest recent sound sits near
-    TARGET — never below 1x (a loud room is left alone), never above MAX_GAIN, changed smoothly."""
-    TARGET, MAX_GAIN = 2500.0, 24.0
+    """Software gain for quiet inputs. Some Macs' raw microphone delivers speech at ~150-250 RMS (the wake model and
+    the segmenter expect ~1000-4000). The gain follows the loudest recent sound: it drops *at once* when a louder
+    sound arrives (so the first syllable of "Jarvis" is never clipped — the old smooth attack distorted it after a
+    quiet minute), rises slowly in quiet (~6 s to double), stays within 1x..MAX_GAIN, and a limiter keeps every
+    frame below full scale."""
+    TARGET, MAX_GAIN, PEAK = 2000.0, 8.0, 28000.0
 
     def __init__(self, enabled: bool | None = None):
         self.enabled = (os.environ.get("DD_AUTOGAIN", "1") != "0") if enabled is None else enabled
         self.env = 0.0    # decaying peak of the raw frame RMS (~10 s memory)
         self.gain = 1.0
+        self.limited = 0  # frames the limiter had to pull down (diagnostics)
 
     def feed(self, frame: bytes, learn: bool = True) -> bytes:
         if not self.enabled:
             return frame
         if learn:  # (while dd speaks: apply the current gain, learn nothing from its own voice)
-            self.env = max(rms(frame), self.env * 0.998)
+            e = rms(frame)
+            self.env = max(e, self.env * 0.998)
             if self.env > 40:  # only once there is a real signal to judge by
                 want = max(1.0, min(self.MAX_GAIN, self.TARGET / self.env))
-                self.gain += (want - self.gain) * 0.05
+                self.gain = want if want < self.gain else self.gain + (want - self.gain) * 0.0025
         if self.gain <= 1.02:
             return frame
         try:
             import numpy as np
-            a = np.frombuffer(frame, dtype=np.int16).astype(np.float32) * self.gain
-            return np.clip(a, -32768, 32767).astype(np.int16).tobytes()
+            a = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
+            g = self.gain
+            peak = float(np.abs(a).max()) if len(a) else 0.0
+            if peak * g > self.PEAK:  # limiter: this frame alone would clip
+                g = self.PEAK / peak
+                self.limited += 1
+            return (a * g).astype(np.int16).tobytes()
         except Exception:
             return frame
 
@@ -886,6 +895,48 @@ def print_file(word: str = "jarvis") -> Path:
     return voice_dir() / f"{word}_print.npz"
 
 
+def diag_dir() -> Path:
+    """<repo>/logs/voice: near-miss / wake / setup clips for tuning the wake word to your voice (gitignored)."""
+    return dd.ROOT / "logs" / "voice"
+
+
+def save_clip(pcm: bytes, name: str, keep: int = 80) -> str | None:
+    """16 kHz mono int16 -> logs/voice/<name>.wav, keeping only the newest `keep` clips. Best effort."""
+    import wave
+    try:
+        d = diag_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{name}.wav"
+        with wave.open(str(p), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(RATE)
+            wf.writeframes(pcm)
+        old = sorted(d.glob("*.wav"), key=lambda f: f.stat().st_mtime)
+        for f in old[:-keep]:
+            f.unlink()
+        return str(p)
+    except Exception:
+        return None
+
+
+def mirror_setup_clips() -> int:
+    """Copy the voice-setup recordings (~/.dd/voice/jarvis-*.wav) next to the logs, so they can be studied."""
+    import shutil as _sh
+    n = 0
+    try:
+        d = diag_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        for f in sorted(voice_dir().glob("jarvis-*.wav")):
+            dst = d / f"setup-{f.name}"
+            if not dst.exists():
+                _sh.copy2(f, dst)
+                n += 1
+    except Exception:
+        pass
+    return n
+
+
 def _speech_end(clip, rate: int = RATE) -> float:
     """Seconds where the spoken word ends in a clip (last 20 ms frame above 25% of the loudest)."""
     import numpy as np
@@ -1162,6 +1213,9 @@ class Listener:
         self.recent: deque[bytes] = deque(maxlen=100)   # last 2 s of mic audio (Whisper confirms "dd" candidates)
         self.agc = AutoGain()      # quiet raw mics are brought up to speech level before anything else sees them
         self.wake_peak = 0.0       # highest hey-jarvis score since the last idle log line (sensitivity check)
+        self.diag = os.environ.get("DD_WAKE_DIAG", "1") != "0"  # keep near-miss clips in logs/voice for tuning
+        self._near_at = -1e9
+        self._near_pending: list | None = None
         self.tentative_until = 0.0  # a "dd" candidate is being confirmed: keep capturing the command meanwhile
         self.verify_pending: dict | None = None  # a candidate waiting for the rest of the word before Whisper
         self.verify = os.environ.get("DD_WAKE_VERIFY", "1") != "0"
@@ -1217,6 +1271,11 @@ class Listener:
                     wf.setframerate(RATE)
                     wf.writeframes(c)
             floats = [np.frombuffer(c, dtype=np.int16).astype(np.float32) / 32768.0 for c in clips]
+            for i, f in enumerate(floats, 1):
+                clipped = float((np.abs(f) > 0.98).mean()) * 100
+                self.log(f"  voice setup: clip {i} peak {float(np.abs(f).max()):.2f}, rms {float(np.sqrt((f ** 2).mean())):.3f}, "
+                         f"clipped {clipped:.1f}%")
+            mirror_setup_clips()
             report = build(floats)
             if self.wake is not None and hasattr(self.wake, "reload_voice"):
                 self.wake.reload_voice(self.log)
@@ -1300,6 +1359,8 @@ class Listener:
         self.last_heard = f"{word} ✓"
         self.wake_answered = False
         self.wake_source = source
+        if self.diag:  # real wakes are kept too: with the near misses they are the data to tune for your voice
+            save_clip(b"".join(self.recent), time.strftime("wake-%H%M%S") + f"-{word.replace(' ', '_')}-{score:.2f}")
         self.on_heard(word, 0.0)
         self.ack(sound_only=True)
         if self.clock() >= self.tentative_until:  # (a confirmed candidate keeps what it captured meanwhile)
@@ -1441,8 +1502,26 @@ class Listener:
             if vp["left"] <= 0:
                 self.verify_pending = None
                 self._send_verify(vp["score"], vp["word"], vp["source"])
+        if self._near_pending is not None:
+            self._near_pending[0] -= 1
+            if self._near_pending[0] <= 0:
+                _, hj, jh, vp = self._near_pending
+                self._near_pending = None
+                name = time.strftime("near-%H%M%S") + f"-hj{hj:.2f}-jh{jh:.2f}-vp{vp:.2f}"
+                if save_clip(b"".join(self.recent), name):
+                    self.log(f"  near miss (no wake): hey-jarvis {hj:.2f}, jarvis head {jh:.2f}, your voice {vp:.2f} "
+                             f"-> logs/voice/{name}.wav")
         if self.wake is not None:
             score = self.wake.feed(frame)
+            if self.diag and not score and self._near_pending is None and self.clock() - self._near_at > 8:
+                hj = float(getattr(self.wake, "last_score", 0.0) or 0.0)
+                jhh = getattr(self.wake, "jarvis", None)
+                vpp = getattr(self.wake, "voice", None)
+                jh = float(jhh.last_score) if jhh is not None else 0.0
+                vp = float(vpp.last_score) if vpp is not None else 0.0
+                if hj >= 0.05 or jh >= 0.3 or vp >= 0.45:
+                    self._near_at = self.clock()
+                    self._near_pending = [20, hj, jh, vp]  # save 400 ms later: the whole word
             if score:
                 word, source = getattr(self.wake, "last_word", "") or "hey jarvis", getattr(self.wake, "last_source", None)
                 if source is not None and self.verify:
@@ -2028,11 +2107,20 @@ def selftest() -> int:
         lg.feed(f)
     assert lg.state == "listening"
 
-    # 3b. auto gain: a quiet mic (speech at ~150 RMS) is brought up towards 2500; a loud one is left alone
+    # 3b. auto gain: a quiet mic (speech at ~200 RMS) is brought up; a loud one is left alone; a loud word after a
+    #     quiet minute is never clipped (instant attack + limiter)
     ag = AutoGain(enabled=True)
     quiet_speech = _tone(2000, amp=200)
-    out = [ag.feed(f) for f in quiet_speech]
-    assert ag.gain > 8 and rms(out[-1]) > 1200, (ag.gain, rms(out[-1]))
+    for _ in range(4):
+        out = [ag.feed(f) for f in quiet_speech]
+    assert ag.gain > 4 and rms(out[-1]) > 800, (ag.gain, rms(out[-1]))  # (slow release: ~6 s to double)
+    room = AutoGain(enabled=True)
+    for f in _quiet(20000, amp=120):  # a quiet room: the gain climbs to its maximum
+        room.feed(f)
+    assert room.gain > 0.85 * AutoGain.MAX_GAIN, room.gain
+    word = [room.feed(f) for f in _tone(400, amp=4000)]  # then a loud "Jarvis"
+    assert max(max(abs(x) for x in array.array("h", f)) for f in word) <= AutoGain.PEAK + 1, "no clipping"
+    assert room.gain < 1.5, room.gain
     loud = AutoGain(enabled=True)
     for f in _tone(1000, amp=6000):
         loud.feed(f)

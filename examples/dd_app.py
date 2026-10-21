@@ -24,11 +24,23 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import dd_loop_ollama as dd  # noqa: E402  (loads ~/.dd/.env, skills, rules, agent loop)
 import dd_listen  # noqa: E402
+import dd_voice  # noqa: E402
 
 CHAT = HERE / "dd_chat.py"
 TEACH = "Teach 'Jarvis' (your voice)…"
 ICONS = {"starting": "⏳", "listening": "🤖", "recording": "🎙", "thinking": "💭", "speaking": "🔊",
-         "paused": "💤", "error": "⚠️", "stopped": "⏹"}
+         "paused": "💤", "error": "⚠️", "stopped": "⏹"}  # text fallback when the images are missing
+STATUS_DIR = HERE.parent / "macapp" / "status"  # voice-wave glyphs (examples/status_icons.py)
+COLOUR_ICONS = {"recording", "error"}  # accent images; the rest are templates macOS tints for light/dark bars
+
+
+def status_icon(state: str) -> tuple[str | None, bool]:
+    """(png path, template?) for a listener state; (None, False) when the image is missing."""
+    name = {"stopped": "paused"}.get(state, state)
+    p = STATUS_DIR / f"{name}.png"
+    if not p.is_file():
+        p = STATUS_DIR / "listening.png"
+    return (str(p), name not in COLOUR_ICONS) if p.is_file() else (None, False)
 
 
 def notify(text: str, title: str = "dd") -> None:
@@ -127,6 +139,19 @@ class AppCore:
             return f"Heard: (nothing yet) · {lvl}"
         return f"Heard: {last[:40]}" + ("…" if len(last) > 40 else "") + f" · {lvl}"
 
+    def voice_items(self) -> list[tuple[str, str, bool]]:
+        """[(voice id, menu label, chosen?)] for the Voice submenu."""
+        cur = dd_voice.current()
+        return [(vid, v["label"], vid == cur) for vid, v in dd_voice.VOICES.items()]
+
+    def pick_voice(self, vid: str) -> None:
+        """Choose a voice and let it introduce itself (on a thread: synthesis must not block the menu)."""
+        dd_voice.set_voice(vid)
+        name = dd_voice.VOICES[vid]["label"].split(" —")[0]
+        line = dd_voice.SAMPLE.format(name=name) if dd_voice.installed() else \
+            f"{name} voice download aagudhu, konjam neram la ready."
+        threading.Thread(target=self.listener.say, args=(line,), daemon=True, name="dd-voice-preview").start()
+
     def teach(self) -> bool:
         """Siri-style voice setup: dd asks for 'Jarvis' five times and learns how *you* say it. False if busy."""
         if self.listener.enrolling:
@@ -203,8 +228,18 @@ def run_menu_bar(core: AppCore) -> int:
 
     class DDBar(rumps.App):
         def __init__(self):
-            super().__init__("dd", title=core.icon(), quit_button=None)
-            self.menu = ["Pause listening", "Heard: (nothing yet)", TEACH, "Mic test (3 s)", "Open chat", "Status", "Update dd", None, "Quit dd"]
+            icon, tmpl = status_icon(core.listener.state)
+            super().__init__("dd", title=None if icon else core.icon(), icon=icon, template=tmpl, quit_button=None)
+            self._shown_state = core.listener.state
+            self.voice_menu = rumps.MenuItem("Voice")
+            self.voice_items = {}
+            for vid, label, chosen in core.voice_items():
+                item = rumps.MenuItem(label, callback=self.choose_voice)
+                item.state = int(chosen)
+                self.voice_menu.add(item)
+                self.voice_items[label] = (vid, item)
+            self.menu = ["Pause listening", "Heard: (nothing yet)", None, self.voice_menu, TEACH, "Mic test (3 s)",
+                         None, "Open chat", "Status", "Update dd", None, "Quit dd"]
             self.menu["Heard: (nothing yet)"].set_callback(None)
             self.timer = rumps.Timer(self.refresh, 0.4)
             self.timer.start()
@@ -219,12 +254,26 @@ def run_menu_bar(core: AppCore) -> int:
                 except Exception as e:
                     print(f"(hud unavailable: {type(e).__name__}: {str(e)[:120]} — notifications instead)", flush=True)
 
+        def choose_voice(self, sender):
+            vid, _item = self.voice_items[sender.title]
+            for _label, (_v, it) in self.voice_items.items():
+                it.state = int(it is sender)
+            core.pick_voice(vid)
+
         def tick_hud(self, _):
             if core.hud is not None:
                 core.hud.tick()
 
         def refresh(self, _):  # AppKit must be touched from the main thread: poll state from a timer
-            self.title = core.icon()
+            st = core.listener.state
+            if st != self._shown_state:
+                self._shown_state = st
+                icon, tmpl = status_icon(st)
+                if icon:
+                    self._template = tmpl  # (set directly: the template setter would reload the old image)
+                    self.icon = icon
+                else:
+                    self.title = core.icon()
             self.menu["Pause listening"].title = core.listening_label()
             self.menu["Heard: (nothing yet)"].title = core.last_label()
             if core.hud is None or not core.hud.ok:  # no panel: say it with notifications
@@ -375,6 +424,9 @@ def run_app() -> int:
     if problem:
         notify(f"Brain ready illa: {problem}")
     print(dd_listen.machine_info(), flush=True)
+    copied = dd_listen.mirror_setup_clips()
+    if copied:
+        print(f"voice setup clips mirrored to logs/voice ({copied})", flush=True)
     core = AppCore()
     wake = core.listener.wake
     print("wake: " + (("'hey jarvis' model (openwakeword)" + (" + 'dee dee' head" if getattr(wake, "dd", None) else "")
@@ -390,6 +442,12 @@ def run_app() -> int:
         if dd_listen.ram_gb() < 12:
             time.sleep(20)  # 8 GB Mac: let Whisper settle before the LLM load (both at once starve the mic)
         dd.warm()
+        try:  # the neural voices (Kokoro): installed + downloaded once, then loaded so the first reply is quick
+            if dd_voice.setup(log=lambda m: print(m, flush=True)):
+                dd_voice.engine()
+                print(f"voice: {dd_voice.VOICES[dd_voice.current()]['label']} (neural) ready", flush=True)
+        except Exception as e:
+            print(f"(voice setup skipped: {type(e).__name__}: {str(e)[:120]})", flush=True)
         if dd_listen.mlx_wanted():
             dd_listen.setup_mlx()
     threading.Thread(target=warm_all, daemon=True, name="dd-warm").start()
@@ -497,7 +555,19 @@ def selftest() -> int:
     assert hud.tick()["mode"] == "listen"
     lis.state = "listening"
     assert "AppKit" not in sys.modules
+    for st in ("starting", "listening", "recording", "thinking", "speaking", "paused", "error", "stopped"):
+        path, tmpl = status_icon(st)
+        assert path and Path(path).is_file(), st
+        assert tmpl is (st not in ("recording", "error")), (st, tmpl)
     assert TEACH in core.menu_labels()
+    items = core.voice_items()
+    assert len(items) == 6 and sum(1 for _, _, c in items if c) == 1 and items[0][0] == "heart"
+    said_voice = []
+    lis.speak_fn = said_voice.append
+    core.pick_voice("omega")
+    time.sleep(0.2)
+    assert dd_voice.current() == "omega" and said_voice and "Omega" in said_voice[-1], said_voice
+    dd_voice.set_voice("heart")
     core.teach_result = {"clips": 5, "detect": 0.7}
     assert "Ready" in core.teach_text() and "5 recordings" in core.teach_text()
     core.teach_result = {"error": "ValueError: not enough clear recordings"}

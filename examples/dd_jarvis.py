@@ -148,6 +148,12 @@ def pick_voice() -> str:
 
 def stop_speaking() -> bool:
     """Barge-in: cut the current sentence (you said 'hey jarvis' while dd was talking). True if something stopped."""
+    try:
+        import dd_voice
+        if dd_voice.stop():
+            return True
+    except Exception:
+        pass
     p = _speaking
     if p is not None and p.poll() is None:
         try:
@@ -171,6 +177,13 @@ def speak(text: str, mute: bool = False) -> None:
     line = for_speech(text)
     if mute or not line:
         return
+    if os.environ.get("DD_TTS", "kokoro") == "kokoro":  # the neural voice chosen in the menu (dd_voice.py)
+        try:
+            import dd_voice
+            if dd_voice.speak(line):
+                return
+        except Exception as e:
+            print(f"(voice: {type(e).__name__}: {str(e)[:100]} — Mac voice instead)", flush=True)
     if MAC and shutil.which("say"):
         cmd = ["say", "-r", os.environ.get("DD_SAY_RATE", "190")]
         if pick_voice():
