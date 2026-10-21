@@ -346,7 +346,9 @@ def run_app() -> int:
         notify(f"Brain ready illa: {problem}")
     print(dd_listen.machine_info(), flush=True)
     core = AppCore()
-    print("wake: " + ("'hey jarvis' model (openwakeword) — Whisper runs only after the wake" if core.listener.wake
+    wake = core.listener.wake
+    print("wake: " + (("'hey jarvis' model (openwakeword)" + (" + 'dee dee' head" if getattr(wake, "dd", None) else "")
+                       + " — Whisper runs only after the wake") if wake
                       else "Whisper text wake (install openwakeword for the always-on model)"), flush=True)
     print(f"brain: {dd.brain_label()}", flush=True)
 
