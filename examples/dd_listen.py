@@ -631,7 +631,7 @@ def stt_confirm(pcm: bytes) -> tuple[str, float, float]:
     a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     peak = float(np.abs(a).max()) if a.size else 0.0
     if 0.0 < peak < 0.3:
-        a = a * min(20.0, 0.3 / peak)
+        a = a * min(64.0, 0.3 / peak)  # (raw mic audio: a sofa "Jarvis" peaks near 0.006)
     pad = np.zeros(int(0.3 * RATE), dtype=np.float32)
     audio = np.concatenate([pad, a, pad])
     lang = os.environ.get("DD_STT_LANG", "en")
@@ -1283,6 +1283,9 @@ class Listener:
         self.pending_wake = False  # a wake heard while dd spoke (barge-in): armed as soon as it is quiet
         self.wake_answered = True  # False between a wake and its command (false-wake learning for the dd head)
         self.recent: deque[bytes] = deque(maxlen=100)   # last 2 s of mic audio (Whisper confirms "dd" candidates)
+        # the same 2 s before the AutoGain: Whisper confirms on this (normalised once, smoothly) — the gain's fast
+        # moves at the start of a word after a quiet minute turned Dhina's "Jarvis" into "Damis"
+        self.recent_raw: deque[bytes] = deque(maxlen=100)
         self.agc = AutoGain()      # quiet raw mics are brought up to speech level before anything else sees them
         self.wake_peak = 0.0       # highest hey-jarvis score since the last idle log line (sensitivity check)
         self.diag = os.environ.get("DD_WAKE_DIAG", "1") != "0"  # keep near-miss clips in logs/voice for tuning
@@ -1513,6 +1516,7 @@ class Listener:
 
     def feed(self, frame: bytes) -> None:
         """One 20 ms frame from the mic."""
+        raw = frame
         frame = self.agc.feed(frame, learn=not (self.speaking or self.tail > 0))  # dd's own voice must not set it
         e = rms(frame)
         self._level_win.append(e)
@@ -1568,6 +1572,7 @@ class Listener:
         else:
             self.zero_run = 0
         self.recent.append(frame)
+        self.recent_raw.append(raw)
         if self.verify_pending is not None:
             vp = self.verify_pending
             vp["left"] -= 1
@@ -1643,9 +1648,10 @@ class Listener:
 
     def _send_verify(self, score: float, word: str, source) -> None:
         pcm = b"".join(self.recent)
-        job = ("verify", pcm, score, word, source)
+        raw = b"".join(self.recent_raw) if len(self.recent_raw) == len(self.recent) else None
+        job = ("verify", pcm, score, word, source, raw)
         if self.inline:
-            self._verify(pcm, score, word, source)
+            self._verify(pcm, score, word, source, raw)
             return
         if self.worker is None or not self.worker.is_alive():
             self.worker = threading.Thread(target=self._worker, daemon=True, name="dd-brain")
@@ -1653,7 +1659,7 @@ class Listener:
         self.queue.append(job)
         self.work.set()
 
-    def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None) -> None:
+    def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None, raw: bytes | None = None) -> None:
         t0 = self.clock()
         text, how = "", ""
         lp, ns = 0.0, 0.0
@@ -1662,7 +1668,7 @@ class Listener:
             how = "no voice in it"
         else:
             try:
-                res = self.verify_stt(pcm)
+                res = self.verify_stt(raw if raw else pcm)
                 text, lp, ns = (res, 0.0, 0.0) if isinstance(res, str) else res
                 text = (text or "").strip()
             except Exception as e:
