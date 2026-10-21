@@ -32,45 +32,98 @@ default:
     exit(6)
 }
 
-// 2. Which input device the system hands us (diagnostic: a virtual/aggregate default device gives silence).
-func defaultInputName() -> String {
-    let main: AudioObjectPropertyElement = 0  // kAudioObjectPropertyElementMain / ...Master (same value)
-    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
-                                          mScope: kAudioObjectPropertyScopeGlobal, mElement: main)
+// 2. Which devices the system hands us (diagnostics: Bluetooth / HDMI outputs and virtual inputs change what
+//    voice processing can do).
+let mainElement: AudioObjectPropertyElement = 0  // kAudioObjectPropertyElementMain / ...Master (same value)
+
+func defaultDevice(_ selector: AudioObjectPropertySelector) -> AudioDeviceID {
+    var addr = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: mainElement)
     var dev = AudioDeviceID(0)
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    let sys = AudioObjectID(kAudioObjectSystemObject)
-    guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &size, &dev) == noErr, dev != 0 else { return "?" }
-    var naddr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName,
-                                           mScope: kAudioObjectPropertyScopeGlobal, mElement: main)
+    let st = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev)
+    return st == noErr ? dev : 0
+}
+
+func deviceName(_ dev: AudioDeviceID) -> String {
+    guard dev != 0 else { return "?" }
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: mainElement)
     var name: Unmanaged<CFString>? = nil
-    var nsize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-    guard AudioObjectGetPropertyData(dev, &naddr, 0, nil, &nsize, &name) == noErr,
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &name) == noErr,
           let cf = name?.takeRetainedValue() else { return "id \(dev)" }
     return cf as String
 }
 
-// 3. The engine. Three attempts, most capable first:
-//    a) voice processing + a silent mixer on the output (the echo canceller's reference signal)
-//    b) voice processing, input only (some Macs refuse (a) with -10875 on the output unit)
-//    c) plain microphone (no echo cancellation; dd's own silence check still applies)
+func deviceRate(_ dev: AudioDeviceID) -> Double {
+    guard dev != 0 else { return 0 }
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+                                          mScope: kAudioObjectPropertyScopeGlobal, mElement: mainElement)
+    var rate = Float64(0)
+    var size = UInt32(MemoryLayout<Float64>.size)
+    return AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &rate) == noErr ? rate : 0
+}
+
+func defaultInputName() -> String { deviceName(defaultDevice(kAudioHardwarePropertyDefaultInputDevice)) }
+
+let inDev = defaultDevice(kAudioHardwarePropertyDefaultInputDevice)
+let outDev = defaultDevice(kAudioHardwarePropertyDefaultOutputDevice)
+warn("devices: input '\(deviceName(inDev))' \(Int(deviceRate(inDev))) Hz, output '\(deviceName(outDev))' \(Int(deviceRate(outDev))) Hz")
+
+// 3. The engine. Voice processing is one IO unit for both directions: the output side must run (it is the echo
+//    canceller's reference signal). Macs differ in what they accept, so the ways to set it up are tried in turn,
+//    most capable first; a way that starts but only delivers digital zeros for 3 s is abandoned for the next:
+//    0) mixer → output connected with the output hardware's own format
+//    1) a silent player node keeping the output side running
+//    2) the implicit mixer (AVAudioEngine's default wiring)
+//    3) voice processing input only
+//    4) plain microphone (no echo cancellation; dd's own software gain + silence check still apply)
 let aec = !CommandLine.arguments.contains("--no-aec")
+let modeNames = ["voice processing ON (mixer → output)", "voice processing ON (silent player)",
+                 "voice processing ON (implicit mixer)", "voice processing ON (input only)", "voice processing off"]
 var zeroSamples = 0
 var silenceReported = false
-var switchRequested = false  // 3 s of digital zeros in a voice-processing mode: fall through to the next mode
+var switchRequested = false
+var keepPlayer: AVAudioPlayerNode? = nil
 
 func start(mode: Int) -> AVAudioEngine? {
     let engine = AVAudioEngine()
     let input = engine.inputNode
-    if aec && mode < 2 {
-        do { try input.setVoiceProcessingEnabled(true) } catch { warn("voice processing unavailable: \(error)"); return nil }
-        if mode == 0 { engine.mainMixerNode.outputVolume = 0 }  // touching mainMixerNode connects it to the output
+    let vp = aec && mode < 4
+    if vp {
+        do { try input.setVoiceProcessingEnabled(true) } catch {
+            warn("voice processing unavailable: \(error)")
+            return nil
+        }
+        if #available(macOS 14.0, *) {  // keep the video's volume as it is (no "other audio" ducking)
+            input.voiceProcessingOtherAudioDuckingConfiguration =
+                AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
+        }
+        switch mode {
+        case 0:
+            let hw = engine.outputNode.outputFormat(forBus: 0)
+            if hw.sampleRate > 0 && hw.channelCount > 0 {
+                engine.connect(engine.mainMixerNode, to: engine.outputNode, format: hw)
+            }
+            engine.mainMixerNode.outputVolume = 0
+        case 1:
+            let player = AVAudioPlayerNode()
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: nil)
+            engine.mainMixerNode.outputVolume = 0
+            keepPlayer = player
+        case 2:
+            engine.mainMixerNode.outputVolume = 0
+        default:
+            break
+        }
     }
     engine.prepare()
     var inFmt = input.outputFormat(forBus: 0)
     if inFmt.sampleRate == 0 || inFmt.channelCount == 0 { inFmt = input.inputFormat(forBus: 0) }
     guard inFmt.sampleRate > 0, inFmt.channelCount > 0 else {
-        warn("no input format — Microphone permission for dd? (System Settings → Privacy & Security → Microphone)")
+        warn("no input format (mode \(mode)) — Microphone permission for dd? (System Settings → Privacy & Security → Microphone)")
         return nil
     }
     guard let outFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true),
@@ -98,9 +151,9 @@ func start(mode: Int) -> AVAudioEngine? {
             zeroSamples = 0
         } else {
             zeroSamples += n
-            if mode < 2 && zeroSamples >= 16000 * 3 && !switchRequested {
+            if mode < 4 && zeroSamples >= 16000 * 3 && !switchRequested {
                 switchRequested = true
-            } else if mode == 2 && !silenceReported && zeroSamples >= 16000 * 4 {
+            } else if mode == 4 && !silenceReported && zeroSamples >= 16000 * 4 {
                 silenceReported = true
                 warn("4 s of digital silence — the default input device gives nothing (wrong device / permission); dd switches to ffmpeg")
             }
@@ -112,19 +165,20 @@ func start(mode: Int) -> AVAudioEngine? {
     do { try engine.start() } catch {
         warn("engine start failed (mode \(mode)): \(error)")
         input.removeTap(onBus: 0)
+        keepPlayer = nil
         return nil
     }
-    let vp = (aec && mode < 2) ? (mode == 0 ? "ON" : "ON (input only)") : "off"
-    warn("input '\(defaultInputName())' \(Int(inFmt.sampleRate)) Hz x\(inFmt.channelCount) -> 16000 Hz mono, voice processing \(vp)")
+    if mode == 1, let p = keepPlayer { p.play() }
+    warn("input '\(defaultInputName())' \(Int(inFmt.sampleRate)) Hz x\(inFmt.channelCount) -> 16000 Hz mono, \(modeNames[vp ? mode : 4]) [mode \(mode)]")
     return engine
 }
 
 var running: AVAudioEngine? = nil
-var currentMode = 2
+var currentMode = 4
 
 func tryStart(from: Int) {
-    for m in from...2 {
-        if !aec && m < 2 { continue }
+    for m in from...4 {
+        if !aec && m < 4 { continue }
         if let e = start(mode: m) { running = e; currentMode = m; return }
     }
     exit(4)
@@ -135,11 +189,12 @@ while true {
     RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.25))
     if switchRequested {
         switchRequested = false
-        if currentMode < 2 {
-            warn("3 s of silence in voice-processing mode \(currentMode) — trying mode \(currentMode + 1)")
+        if currentMode < 4 {
+            warn("3 s of digital silence in mode \(currentMode) — trying mode \(currentMode + 1)")
             running?.inputNode.removeTap(onBus: 0)
             running?.stop()
             running = nil
+            keepPlayer = nil
             zeroSamples = 0
             silenceReported = false
             tryStart(from: currentMode + 1)

@@ -223,6 +223,8 @@ def prompt_echo(text: str) -> bool:
     """Whisper repeats its initial prompt on noise/music ('Innaiku weather enna. Screenshot edu.'): a transcript made
     only of prompt sentences is an echo, not a command (a real 'innaiku weather enna' alone is still accepted)."""
     parts = [p for p in _norm_sentences(text) if p]
+    if any(p in ("jarvis", "dd", "hey jarvis") for p in parts):  # "Jarvis. Chrome open pannu." is a real command
+        return False
     return len(parts) >= 2 and all(p in HINT_SENTENCES for p in parts)
 
 
@@ -514,32 +516,39 @@ def setup_mlx(log=print) -> bool:
         return False
 
 
-def _mlx_transcribe(audio) -> str:
+def _mlx_transcribe(audio, prompt: str | None = HINT) -> str:
     import mlx_whisper
     lang = os.environ.get("DD_STT_LANG", "en")
     r = mlx_whisper.transcribe(audio, path_or_hf_repo=MLX_MODEL, language=None if lang == "auto" else lang,
-                               temperature=0.0, condition_on_previous_text=False, initial_prompt=HINT,
+                               temperature=0.0, condition_on_previous_text=False, initial_prompt=prompt,
                                no_speech_threshold=0.6, verbose=None)
     return (r.get("text") or "").strip()
 
 
-def stt(pcm: bytes) -> str:
+def stt_plain(pcm: bytes) -> str:
+    """stt() without the vocabulary prompt: used to *confirm* a wake word, so a 'Jarvis' in the text came from
+    the audio and not from Whisper repeating its prompt on noise."""
+    return stt(pcm, hint="")
+
+
+def stt(pcm: bytes, hint: str | None = None) -> str:
     """16 kHz mono PCM -> text (mlx-whisper when ready, else faster-whisper int8). Short utterances are padded so
-    Whisper hears them whole."""
+    Whisper hears them whole. hint: initial prompt (default HINT; "" = none)."""
     import numpy as np
     a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     pad = np.zeros(int(0.3 * RATE), dtype=np.float32)
     audio = np.concatenate([pad, a, pad])
+    prompt = HINT if hint is None else (hint or None)
     if _mlx_ready:
         try:
-            return _mlx_transcribe(audio)
+            return _mlx_transcribe(audio, prompt)
         except Exception as e:
             print(f"(mlx stt failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
     model = load_whisper()
     lang = os.environ.get("DD_STT_LANG", "en")  # English decoding reads romanised Tamil best; "auto" wanders
     segs, _ = model.transcribe(audio, language=None if lang == "auto" else lang,
                                beam_size=1, vad_filter=False, condition_on_previous_text=False,
-                               initial_prompt=HINT, no_speech_threshold=0.6)
+                               initial_prompt=prompt, no_speech_threshold=0.6)
     return " ".join(s.text.strip() for s in segs).strip()
 
 
@@ -794,6 +803,150 @@ class SoftJarvis:
         self.rejected(now)
 
 
+NORM_FILE = str(ASSETS / "oww_norm.npz")
+
+
+def voice_dir() -> Path:
+    return Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "voice"
+
+
+def print_file(word: str = "jarvis") -> Path:
+    return voice_dir() / f"{word}_print.npz"
+
+
+def _speech_end(clip, rate: int = RATE) -> float:
+    """Seconds where the spoken word ends in a clip (last 20 ms frame above 25% of the loudest)."""
+    import numpy as np
+    n = rate // 50
+    frames = clip[: len(clip) // n * n].reshape(-1, n)
+    e = np.sqrt((frames.astype(np.float64) ** 2).mean(axis=1))
+    if not len(e) or e.max() <= 0:
+        return len(clip) / rate
+    loud = np.nonzero(e >= 0.25 * e.max())[0]
+    return (loud[-1] + 1) * n / rate
+
+
+def stream_windows(clip, model=None, T: int = 16):
+    """Run a float clip (16 kHz, -1..1) through a fresh openWakeWord feature pipeline the way the live detector
+    sees audio (80 ms chunks); returns [(time_s, (T, 96) window)] after every chunk."""
+    import numpy as np
+    model = model or build_oww_model(oww_model_dir())
+    pad = np.zeros(RATE // 2, dtype=np.float32)
+    x = np.concatenate([pad, clip.astype(np.float32), pad])
+    pcm = (np.clip(x, -1, 1) * 32767).astype(np.int16)
+    out = []
+    for i in range(0, len(pcm) - 1279, 1280):
+        model.predict(pcm[i:i + 1280])
+        f = np.asarray(model.preprocessor.get_features(T)).reshape(-1, 96)
+        out.append(((i + 1280) / RATE - len(pad) / RATE, f[-T:].copy()))
+    return out
+
+
+class VoicePrint:
+    """Your own 'Jarvis', Siri-style: a few recordings of you saying it (menu → Teach 'Jarvis') become templates in
+    openWakeWord's embedding space. Live windows that look like them (cosine similarity after normalisation)
+    propose a wake that Whisper confirms — so your own pronunciation ("jaravis") is caught even when the generic
+    models score it low. ~0.1 ms per check."""
+    word = "jarvis"
+
+    def __init__(self, path: Path | str | None = None):
+        import numpy as np
+        z = np.load(str(path or print_file()))
+        self.templates = z["templates"].astype(np.float32)
+        self.mu, self.sd = z["mu"].astype(np.float32), z["sd"].astype(np.float32)
+        self.T = int(z["T"])
+        self.threshold = self.base_threshold = float(z["detect"])
+        self.gate = float(z["gate"])
+        self.clips = int(z["clips"])
+        self.streak = 0
+        self.last_score = 0.0
+        self.recent: deque[float] = deque(maxlen=8)  # ~0.6 s of similarities
+        self.rejects: deque[float] = deque(maxlen=40)
+        self.false_wakes: deque[float] = deque(maxlen=20)
+
+    def _vec(self, feats):
+        import numpy as np
+        v = (np.asarray(feats, dtype=np.float32).reshape(-1) - self.mu) / self.sd
+        return v / (float(np.linalg.norm(v)) + 1e-6)
+
+    def similarity(self, feats) -> float:
+        return float((self.templates @ self._vec(feats)).max())
+
+    def step(self, feats) -> float | None:
+        s = self.similarity(feats)
+        self.last_score = s
+        self.recent.append(s)
+        self.streak = self.streak + 1 if s >= self.threshold else 0
+        if self.streak >= 2:
+            self.streak = 0
+            return s
+        return None
+
+    def recent_max(self) -> float:
+        return max(self.recent, default=0.0)
+
+    def rejected(self, now: float) -> None:
+        self.rejects.append(now)
+        if len([t for t in self.rejects if now - t < 600]) >= 8 and self.threshold < 0.95:
+            self.threshold = min(0.95, self.threshold + 0.03)
+            self.rejects.clear()
+
+    def false_wake(self, now: float) -> None:
+        self.rejected(now)
+
+    def good_wake(self) -> None:
+        self.threshold = max(self.base_threshold, self.threshold - 0.01)
+
+    @staticmethod
+    def build(clips: list, out: Path | str | None = None, model=None) -> dict:
+        """clips: float arrays (16 kHz) of you saying the word -> templates + calibrated thresholds, saved to `out`.
+        Templates: the windows ending 0-320 ms after the word ends (where the live detector decides)."""
+        import numpy as np
+        z = np.load(NORM_FILE)
+        mu, sd, T = z["mu"], z["sd"], int(z["T"])
+        per_clip = []
+        for c in clips:
+            end = _speech_end(c)
+            # a fresh feature pipeline per clip (Model.reset() does not clear features in every openwakeword version)
+            wins = [w for t, w in stream_windows(c, model() if callable(model) else None, T) if end - 0.02 <= t <= end + 0.34]
+            if wins:
+                vs = [((w.reshape(-1) - mu) / sd) for w in wins]
+                per_clip.append(np.stack([v / (np.linalg.norm(v) + 1e-6) for v in vs]).astype(np.float32))
+        if len(per_clip) < 2:
+            raise ValueError("need at least 2 usable recordings")
+        loo = []  # each clip against the others: how alike your own repetitions are
+        for i, a in enumerate(per_clip):
+            others = np.concatenate([b for j, b in enumerate(per_clip) if j != i])
+            loo.append(float((a @ others.T).max()))
+        # generous on purpose: every voice candidate is still confirmed by Whisper; random speech sits ~0.3-0.6
+        detect = float(np.clip(np.percentile(loo, 25) - 0.15, 0.6, 0.75))
+        gate = float(np.clip(detect - 0.12, 0.45, 0.6))
+        templates = np.concatenate(per_clip)
+        out = Path(out or print_file())
+        out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(out, templates=templates, mu=mu, sd=sd, T=T, detect=detect, gate=gate, clips=len(per_clip))
+        return {"clips": len(per_clip), "templates": int(len(templates)), "self_similarity": [round(x, 2) for x in loo],
+                "detect": round(detect, 2), "gate": round(gate, 2), "file": str(out)}
+
+
+def decide(hard: float, threshold: float, hits: list, soft, voice_hit):
+    """Which wake (if any) a chunk produces: (word, source, score) or None. Pure — tested headless.
+    hard/threshold: the hey-jarvis model's score and level (instant, no confirmation); hits: [(score, head)];
+    soft: (score, source) or None; voice_hit: (score, voiceprint) or None. Everything but the instant path is a
+    candidate that Whisper confirms. (A voice-print *gate* on the other candidates was tried and dropped: under
+    a playing video it cut recall to ~15% in the streaming tests.)"""
+    if hard >= threshold:
+        return ("hey jarvis", None, hard)
+    if voice_hit is not None:
+        return ("jarvis", voice_hit[1], voice_hit[0])
+    if hits:
+        r, h = max(hits, key=lambda x: x[0])
+        return (h.word, h, r)
+    if soft is not None:
+        return ("jarvis", soft[1], soft[0])
+    return None
+
+
 class WakeDetector:
     """openWakeWord 'hey jarvis' (ONNX model) + custom heads ('dee dee', plain 'jarvis') when their weights exist +
     soft 'jarvis' candidates. 80 ms chunks, ~3% of one CPU core, ignores speech that isn't a wake phrase — so the
@@ -829,6 +982,20 @@ class WakeDetector:
         self.dd = load(dd_head, "dd", DD_HEAD_FILE, default="0")  # opt-in (DD_WAKE_DD=1): media audio fools it
         self.jarvis = load(jarvis_head, "jarvis", JARVIS_HEAD_FILE)
         self.soft = SoftJarvis(hard=self.threshold)
+        self.voice = None
+        self.gated = 0  # (kept for log compatibility; nothing is gated any more)
+        self.reload_voice(log)
+
+    def reload_voice(self, log=print) -> bool:
+        """(Re)load your voice print (menu → Teach 'Jarvis'); True when one is active."""
+        self.voice = None
+        f = print_file()
+        if os.environ.get("DD_WAKE_VOICE", "1") != "0" and f.is_file():
+            try:
+                self.voice = VoicePrint(f)
+            except Exception as e:
+                log(f"  (voice print not loaded: {str(e)[:100]})")
+        return self.voice is not None
 
     @property
     def heads(self) -> list:
@@ -837,7 +1004,7 @@ class WakeDetector:
     def _fire(self, word: str, source, score: float) -> float:
         self.last_word, self.last_source = word, source
         self.model.reset()
-        for h in self.heads:
+        for h in self.heads + ([self.voice] if self.voice is not None else []):
             h.streak = 0
         self.soft.reset()
         self.cooldown = 20  # 1.6 s: one trigger per wake
@@ -853,28 +1020,27 @@ class WakeDetector:
         scores = self.model.predict(np.frombuffer(chunk, dtype=np.int16))
         s = max(scores.values()) if scores else 0.0
         self.last_score = s
-        hits = []
-        if self.heads:
+        hits, vhit = [], None
+        users = self.heads + ([self.voice] if self.voice is not None else [])
+        if users:
             try:
-                feats = np.asarray(self.model.preprocessor.get_features(max(h.T for h in self.heads))).reshape(-1, 96)
+                feats = np.asarray(self.model.preprocessor.get_features(max(u.T for u in users))).reshape(-1, 96)
                 for h in self.heads:
                     r = h.step(feats[-h.T:])
                     if r is not None:
                         hits.append((r, h))
+                if self.voice is not None:
+                    v = self.voice.step(feats[-self.voice.T:])
+                    vhit = (v, self.voice) if v is not None else None
             except Exception:
-                hits = []
+                hits, vhit = [], None
         soft = self.soft.step(s) if self.soft_enabled else None
         if self.cooldown > 0:
             self.cooldown -= 1
             return None
-        if s >= self.threshold:
-            return self._fire("hey jarvis", None, s)
-        if hits:
-            r, h = max(hits, key=lambda x: x[0])
-            return self._fire(h.word, h, r)
-        if soft is not None:
-            return self._fire("jarvis", self.soft, soft)
-        return None
+        d = decide(s, self.threshold, hits, (soft, self.soft) if soft is not None else None,
+                   vhit if self.soft_enabled else None)
+        return None if d is None else self._fire(*d)
 
 
 def make_wake_detector():
@@ -905,6 +1071,7 @@ class Listener:
         self.work = threading.Event()
         self.worker: threading.Thread | None = None
         self.stt, self.speak_fn = stt_fn or stt, speak or default_speak
+        self.verify_stt = stt_fn or stt_plain  # wake confirmation: no prompt that could put "Jarvis" in the text
         self.handle = handle  # built lazily (loads rules + skills) unless injected
         self.on_state = on_state or (lambda s: None)
         self.on_heard = on_heard or (lambda text, secs: None)
@@ -924,6 +1091,7 @@ class Listener:
         self.agc = AutoGain()      # quiet raw mics are brought up to speech level before anything else sees them
         self.wake_peak = 0.0       # highest hey-jarvis score since the last idle log line (sensitivity check)
         self.tentative_until = 0.0  # a "dd" candidate is being confirmed: keep capturing the command meanwhile
+        self.verify_pending: dict | None = None  # a candidate waiting for the rest of the word before Whisper
         self.verify = os.environ.get("DD_WAKE_VERIFY", "1") != "0"
         self.wake_source = None    # the head that proposed the current wake (learns from what follows)
         if self.wake is not None and hasattr(self.wake, "soft_enabled"):
@@ -941,6 +1109,68 @@ class Listener:
         self._frames = 0
         self._last_activity = clock()
         self.test: dict | None = None   # mic test in progress: {"frames": [...], "left": n, "done": callback}
+        self.capture: dict | None = None  # voice setup: waiting for one recording {"event", "utt"}
+        self.enrolling = False
+
+    def enroll(self, n: int = 5, done=None, build=None) -> None:
+        """Siri-style voice setup (call on its own thread): dd asks for 'Jarvis' n times, captures each with the
+        segmenter, builds your voice print and switches it on. done(report) at the end ({"error": ...} on failure)."""
+        build = build or VoicePrint.build
+        prompts = ["Voice setup. Beep kettadhum, 'Jarvis' nu sollu."] + ["Innoru thadava."] * (n - 2) + ["Last time."]
+        clips, misses = [], 0
+        self.enrolling = True
+        try:
+            while len(clips) < n and misses < 4:
+                self.say(prompts[min(len(clips), len(prompts) - 1)])
+                self.ack(sound_only=True)
+                time.sleep(0.35)  # let the beep pass: it must not become the recording
+                utt = self._capture(7.0)
+                if utt is None or not (0.25 <= len(utt) / (RATE * 2) <= 4.0):
+                    misses += 1
+                    self.say("Kekkala. Konjam sathama sollu.")
+                    continue
+                clips.append(utt)
+                self.log(f"  voice setup: clip {len(clips)}/{n} ({len(utt) / (RATE * 2):.1f}s)")
+            if len(clips) < 3:
+                raise ValueError("not enough clear recordings")
+            import numpy as np
+            import wave
+            vd = voice_dir()
+            vd.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            for i, c in enumerate(clips, 1):  # kept for later retraining (wakeword_train.py --my-voice)
+                with wave.open(str(vd / f"jarvis-{stamp}-{i}.wav"), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(RATE)
+                    wf.writeframes(c)
+            floats = [np.frombuffer(c, dtype=np.int16).astype(np.float32) / 32768.0 for c in clips]
+            report = build(floats)
+            if self.wake is not None and hasattr(self.wake, "reload_voice"):
+                self.wake.reload_voice(self.log)
+            self.log(f"  voice setup: done {report}")
+            self.say("Mudinjiduchu. Ini un 'Jarvis' mattum kekkum.")
+        except Exception as e:
+            report = {"error": f"{type(e).__name__}: {e}"}
+            self.log(f"  voice setup failed: {report['error']}")
+            self.say("Voice setup mudiyala. Menu la innoru thadava try pannu.")
+        finally:
+            self.enrolling = False
+            self.capture = None
+            self.set_state("listening")
+        (done or (lambda r: None))(report)
+
+    def _capture(self, timeout: float):
+        """The next utterance from the mic (segmenter), or None after `timeout` seconds."""
+        import threading as _t
+        box = {"event": _t.Event(), "utt": None}
+        self.seg.reset()
+        self.seg.pre.clear()
+        self.capture = box
+        self.set_state("recording")
+        box["event"].wait(timeout)
+        self.capture = None
+        return box["utt"]
 
     def mic_test(self, seconds: float = 3.0, done=None) -> None:
         """Capture the next N seconds from the live stream, then report level + what Whisper heard (via `done`)."""
@@ -1107,6 +1337,14 @@ class Listener:
                 self.interrupt()
                 self.pending_wake = True
             return
+        if self.capture is not None:  # voice setup: the segmenter alone decides what one recording is
+            utt = self.seg.feed(frame)
+            if utt:
+                self.capture["utt"] = utt
+                self.capture["event"].set()
+            return
+        if self.enrolling:
+            return
         if self.pending_wake:  # the wake that interrupted dd: arm now that it is quiet
             self.pending_wake = False
             self.tail = 0
@@ -1125,6 +1363,12 @@ class Listener:
         else:
             self.zero_run = 0
         self.recent.append(frame)
+        if self.verify_pending is not None:
+            vp = self.verify_pending
+            vp["left"] -= 1
+            if vp["left"] <= 0:
+                self.verify_pending = None
+                self._send_verify(vp["score"], vp["word"], vp["source"])
         if self.wake is not None:
             score = self.wake.feed(frame)
             if score:
@@ -1153,16 +1397,21 @@ class Listener:
         if utt:
             self.submit(utt)
 
+    VERIFY_DELAY_FRAMES = 20  # 400 ms: detectors often fire mid-word; Whisper needs the whole word
+
     def confirm_wake(self, score: float, word: str = "dd", source=None) -> None:
-        """A candidate from a head / the soft detector: hand the last 2 s to Whisper (worker thread); meanwhile the
-        segmenter keeps running so a command said in the same breath is not lost. on_wake() runs only if Whisper
-        agrees."""
-        pcm = b"".join(self.recent)
-        self.tentative_until = self.clock() + 2.5
+        """A candidate from a head / the soft detector: 400 ms later the last 2 s go to Whisper (worker thread);
+        meanwhile the segmenter keeps running so a command said in the same breath is not lost. on_wake() runs
+        only if Whisper agrees."""
+        self.tentative_until = self.clock() + 2.5 + self.VERIFY_DELAY_FRAMES * FRAME_MS / 1000
         self.seg.reset()
         self.seg.pre.clear()
         self.seg.pre.extend(list(self.recent)[-self.seg.pre.maxlen:])  # a command in the same breath starts right now
         self.log(f"  wake? {word} candidate ({score:.2f}) — confirming")
+        self.verify_pending = {"left": self.VERIFY_DELAY_FRAMES, "score": score, "word": word, "source": source}
+
+    def _send_verify(self, score: float, word: str, source) -> None:
+        pcm = b"".join(self.recent)
         job = ("verify", pcm, score, word, source)
         if self.inline:
             self._verify(pcm, score, word, source)
@@ -1176,7 +1425,7 @@ class Listener:
     def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None) -> None:
         t0 = self.clock()
         try:
-            text = self.stt(pcm).strip()
+            text = self.verify_stt(pcm).strip()
         except Exception as e:
             text = ""
             self.log(f"  (wake confirmation failed: {e})")
@@ -1190,6 +1439,8 @@ class Listener:
             self.tentative_until = 0.0
             self.seg.reset()
             self.seg.pre.clear()
+            if self.wake is not None and hasattr(self.wake, "cooldown"):
+                self.wake.cooldown = 0  # an early, wrong candidate must not block the real word that follows
             if source is not None:
                 source.rejected(self.clock())
             thr = f"; threshold {source.threshold:.2f}" if source is not None else ""
@@ -1378,6 +1629,7 @@ def selftest() -> int:
     assert blocked("Sollu.") and blocked("Bump. Bump. Bump. Bump.") and blocked("Jarvis. dd.") and not blocked("dd")
     assert blocked("Innaiku weather enna. Screenshot edu.") and blocked("Volume thirty. Innaiku weather enna.")
     assert not blocked("Innaiku weather enna?") and not blocked("Innaiku weather enna, screenshot edu, then chrome open pannu")
+    assert not blocked("Jarvis. Chrome open pannu.") and not blocked("dd. Screenshot edu.")
     assert not blocked("open open sesame") and not blocked("Rude. Sollu.")
     listing = ("[AVFoundation indev @ 0x1] AVFoundation video devices:\n[AVFoundation indev @ 0x1] [0] FaceTime HD Camera\n"
                "[AVFoundation indev @ 0x1] AVFoundation audio devices:\n[AVFoundation indev @ 0x1] [0] AirPods Pro\n"
@@ -1578,16 +1830,20 @@ def selftest() -> int:
     fw.last_source = fw.dd
     # stage two: a dd candidate is confirmed by Whisper on the last 2 s — rejected when it heard something else
     real_stt = lg.stt
-    lg.stt = lambda b: "the weather is nice"
+    lg.stt = lg.verify_stt = lambda b: "the weather is nice"
     fw.fire_in = 1
     lg.feed(_quiet(20)[0])
+    assert lg.verify_pending is not None and lg.tentative_until > now["t"], "Whisper waits for the rest of the word"
+    for f in _quiet(Listener.VERIFY_DELAY_FRAMES * FRAME_MS):
+        lg.feed(f)
     assert lg.state == "listening" and fw.dd.calls[-1][0] == "rejected" and lg.tentative_until == 0.0, (lg.state, fw.dd.calls)
-    lg.stt = lambda b: "D.D."
+    lg.stt = lg.verify_stt = lambda b: "D.D."
     fw.dd.calls.clear()
     fw.fire_in = 1
-    lg.feed(_quiet(20)[0])
+    for f in _quiet((Listener.VERIFY_DELAY_FRAMES + 1) * FRAME_MS):
+        lg.feed(f)
     assert lg.state == "recording" and lg.last_heard == "dd ✓" and lg.wake_answered is False and lg.tentative_until == 0.0
-    lg.stt = real_stt
+    lg.stt = lg.verify_stt = real_stt
     lg.verify = False  # the rest of this block exercises the head's bookkeeping without the Whisper stage
     now["t"] += 30
     for f in _quiet(2000):
@@ -1617,6 +1873,44 @@ def selftest() -> int:
         head.rejected(1000.0 + t)
     assert abs(head.threshold - 0.95) < 1e-9, head.threshold
 
+    # decide(): instant hey-jarvis > your voice print > heads > soft; with a voice print, heads/soft must sound like you
+    class _H:
+        word = "jarvis"
+    hh = _H()
+    assert decide(0.9, 0.5, [], None, None) == ("hey jarvis", None, 0.9)
+    assert decide(0.1, 0.5, [(0.95, hh)], None, None) == ("jarvis", hh, 0.95)
+    assert decide(0.1, 0.5, [], (0.3, "soft"), None) == ("jarvis", "soft", 0.3)
+    assert decide(0.1, 0.5, [(0.95, hh)], (0.3, "soft"), (0.8, "vp")) == ("jarvis", "vp", 0.8)
+    assert decide(0.9, 0.5, [], None, (0.8, "vp"))[0] == "hey jarvis" and decide(0.1, 0.5, [], None, None) is None
+
+    # voice setup: dd asks n times, each recording comes from the segmenter, the print is built and reported
+    built = {}
+
+    def fake_build(clips):
+        built["n"] = len(clips)
+        return {"clips": len(clips), "detect": 0.7, "gate": 0.58}
+    said_vs = []
+    lv = Listener(source=lambda: iter([]), stt_fn=lambda b: "", speak=said_vs.append, handle=lambda c: "ok",
+                  followup_s=8, log=lambda *_: None, inline=True, wake=False)
+    import tempfile as _tfv
+    os.environ["DD_HOME_SAVED"] = os.environ.get("DD_HOME", "")
+    os.environ["DD_HOME"] = _tfv.mkdtemp(prefix="dd-voice-")
+    result = {}
+    tv = threading.Thread(target=lv.enroll, kwargs={"n": 3, "done": result.update, "build": fake_build}, daemon=True)
+    tv.start()
+    t_end = time.time() + 20
+    while tv.is_alive() and time.time() < t_end:
+        if lv.capture is not None:
+            for f in _tone(700) + _quiet(900):
+                lv.feed(f)
+        else:
+            time.sleep(0.02)
+    tv.join(timeout=2)
+    assert result.get("clips") == 3 and built["n"] == 3, (result, built)
+    assert said_vs[0].startswith("Voice setup") and said_vs[-1].startswith("Mudinjiduchu") and not lv.enrolling
+    assert len(list((Path(os.environ["DD_HOME"]) / "voice").glob("jarvis-*.wav"))) == 3
+    os.environ["DD_HOME"] = os.environ.pop("DD_HOME_SAVED") or os.environ["DD_HOME"]
+
     # soft 'jarvis': a score that peaks between the soft and the hard level becomes a candidate at the peak;
     # a real 'hey jarvis' (crossing the hard level) never produces a soft candidate
     sj = SoftJarvis(soft=0.2, hard=0.5)
@@ -1635,6 +1929,14 @@ def selftest() -> int:
     except ImportError:
         have_oww = False
     if have_oww:
+        # a voice print from three synthetic 'recordings': builds, loads, a template matches itself
+        import numpy as _npv
+        tones = [(_npv.sin(2 * _npv.pi * f0 * _npv.arange(RATE // 2) / RATE) * 0.4).astype(_npv.float32) for f0 in (300, 320, 340)]
+        vfile = Path(_tfv.mkdtemp(prefix="dd-vp-")) / "jarvis_print.npz"
+        rep = VoicePrint.build([_npv.concatenate([_npv.zeros(RATE // 3, _npv.float32), t, _npv.zeros(RATE // 2, _npv.float32)]) for t in tones], vfile)
+        assert rep["clips"] == 3 and 0.6 <= rep["detect"] <= 0.75 and 0.45 <= rep["gate"] <= 0.6, rep
+        vp = VoicePrint(vfile)
+        assert vp.templates.shape[1] == 16 * 96 and abs(float(vp.templates[0] @ vp.templates[0]) - 1.0) < 1e-3
         real = WakeDetector(log=lambda *a: None)
         assert all(isinstance(h, WakeHead) for h in real.heads) and real.soft.hard == real.threshold
         assert real.dd is None or os.environ.get("DD_WAKE_DD") == "1", "dee dee is opt-in"

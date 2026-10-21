@@ -26,6 +26,7 @@ import dd_loop_ollama as dd  # noqa: E402  (loads ~/.dd/.env, skills, rules, age
 import dd_listen  # noqa: E402
 
 CHAT = HERE / "dd_chat.py"
+TEACH = "Teach 'Jarvis' (your voice)…"
 ICONS = {"starting": "⏳", "listening": "🤖", "recording": "🎙", "thinking": "💭", "speaking": "🔊",
          "paused": "💤", "error": "⚠️", "stopped": "⏹"}
 
@@ -50,6 +51,7 @@ class AppCore:
         self.problems: list[str] = []
         self.thread: threading.Thread | None = None
         self.hud = None                      # dd_hud.Hud when the on-screen panel could be created
+        self.teach_result: dict | None = None  # voice setup outcome, shown once by the menu
         self._seen_wake, self._seen_said = 0.0, ""
         self._update_check = 0.0
 
@@ -125,6 +127,22 @@ class AppCore:
             return f"Heard: (nothing yet) · {lvl}"
         return f"Heard: {last[:40]}" + ("…" if len(last) > 40 else "") + f" · {lvl}"
 
+    def teach(self) -> bool:
+        """Siri-style voice setup: dd asks for 'Jarvis' five times and learns how *you* say it. False if busy."""
+        if self.listener.enrolling:
+            return False
+        self.teach_result = None
+        threading.Thread(target=self.listener.enroll, kwargs={"done": lambda r: setattr(self, "teach_result", r)},
+                         daemon=True, name="dd-voice-setup").start()
+        return True
+
+    def teach_text(self) -> str:
+        r = self.teach_result or {}
+        if r.get("error"):
+            return f"Voice setup mudiyala: {r['error']}\nAmaidhiyana idathula, mic pakkathula try pannu."
+        return (f"Ready ✅ — {r.get('clips')} recordings of your 'Jarvis'.\n"
+                f"Ini un voice la 'Jarvis' sonna wake aagum; video / vera sound ignore aagum.")
+
     def mic_test(self) -> None:
         """Say something for 3 s; the result (level + transcript) pops up in the menu bar app."""
         self.test_result = None
@@ -166,7 +184,7 @@ class AppCore:
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
     def menu_labels(self) -> list[str]:
-        return [self.listening_label(), self.last_label(), "Mic test (3 s)", "Open chat", "Status", "Update dd", "Quit dd"]
+        return [self.listening_label(), self.last_label(), TEACH, "Mic test (3 s)", "Open chat", "Status", "Update dd", "Quit dd"]
 
     def open_chat(self) -> list[str]:
         cmd = [sys.executable, str(CHAT)]
@@ -186,7 +204,7 @@ def run_menu_bar(core: AppCore) -> int:
     class DDBar(rumps.App):
         def __init__(self):
             super().__init__("dd", title=core.icon(), quit_button=None)
-            self.menu = ["Pause listening", "Heard: (nothing yet)", "Mic test (3 s)", "Open chat", "Status", "Update dd", None, "Quit dd"]
+            self.menu = ["Pause listening", "Heard: (nothing yet)", TEACH, "Mic test (3 s)", "Open chat", "Status", "Update dd", None, "Quit dd"]
             self.menu["Heard: (nothing yet)"].set_callback(None)
             self.timer = rumps.Timer(self.refresh, 0.4)
             self.timer.start()
@@ -217,6 +235,9 @@ def run_menu_bar(core: AppCore) -> int:
             if core.test_result is not None:
                 text, core.test_result = core.test_text(), None
                 rumps.alert("dd mic test", text)
+            if core.teach_result is not None:
+                text, core.teach_result = core.teach_text(), None
+                rumps.alert("dd voice setup", text)
             if core.update_requested():
                 self.do_update()
 
@@ -233,6 +254,10 @@ def run_menu_bar(core: AppCore) -> int:
         @rumps.clicked("Mic test (3 s)")
         def mic_test(self, _):
             core.mic_test()
+
+        @rumps.clicked(TEACH)
+        def teach(self, _):
+            core.teach()
 
         @rumps.clicked("Pause listening")
         def toggle(self, _):
@@ -351,6 +376,9 @@ def run_app() -> int:
                        + " — Whisper runs only after the wake") if wake
                       else "Whisper text wake (install openwakeword for the always-on model)"), flush=True)
     print(f"brain: {dd.brain_label()}", flush=True)
+    vp = getattr(wake, "voice", None) if wake else None
+    print(f"voice print: {vp.clips} recordings, detect {vp.threshold:.2f}, gate {vp.gate:.2f}" if vp
+          else "voice print: none yet — menu → " + TEACH, flush=True)
 
     def warm_all():
         dd_listen.warm_stt()
@@ -464,6 +492,16 @@ def selftest() -> int:
     assert hud.tick()["mode"] == "listen"
     lis.state = "listening"
     assert "AppKit" not in sys.modules
+    assert TEACH in core.menu_labels()
+    core.teach_result = {"clips": 5, "detect": 0.7}
+    assert "Ready" in core.teach_text() and "5 recordings" in core.teach_text()
+    core.teach_result = {"error": "ValueError: not enough clear recordings"}
+    assert "mudiyala" in core.teach_text()
+    core.teach_result = None
+    # crash guard: three crashes inside ten minutes stop the automatic restart
+    cdir = Path(os.environ["DD_HOME"]) / "logs"
+    assert crash_guard(cdir, now=1000) and crash_guard(cdir, now=1100) and not crash_guard(cdir, now=1200)
+    assert crash_guard(cdir, now=1200 + 700), "old crashes expire"
     os.environ["DD_NO_UPDATE"] = "1"
     assert auto_update() is False
     os.environ.pop("DD_NO_UPDATE")

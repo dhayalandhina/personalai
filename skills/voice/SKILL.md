@@ -36,6 +36,11 @@ python3 scripts/wakeword_train.py all          # ~30-40 min CPU: Piper voices �
 ```
 Writes `assets/wake_dd.npz` (~0.6 MB; the shipped one was trained on 20 Oct 2026 from 6 Piper voices + espeak-ng, held-out-voice streaming recall 20/20, see `assets/wake_dd.report.json`). The Mac app can load it next to the pre-trained "hey jarvis" model (`examples/dd_listen.py` `WakeHead`) — opt-in with `DD_WAKE_DD=1` (under a playing video it proposes many candidates): "dee dee" / "hey dee dee" then wakes dd too. Fires only when two 80 ms chunks agree; wakes with no command raise its threshold by itself (`DD_WAKE_DD_THRESHOLD`, default 0.8;  `DD_WAKE_VERIFY=0` skips the Whisper confirmation). Held-out-voice recall / false-positive rates are printed and saved to `report.json` in the work dir. Positives/negatives are synthetic (Piper, 900+ speakers) — if it misses *your* voice: `python3 scripts/wakeword_train.py record` (10 clips, terminal) then `python3 scripts/wakeword_train.py all --pos-only` (your clips become 24× augmented positives; negatives reused).
 
+Plain "jarvis" (the shipped `assets/wake_jarvis.npz`): `python3 scripts/wakeword_train.py all --word jarvis --reuse-neg <dd work dir>` — positives include slow speech; confusables: travis, davis, service, nervous, harvest…
+
+## Your voice (Siri-style setup)
+Menu → **Teach 'Jarvis' (your voice)…**: dd asks for "Jarvis" five times; the recordings become a voice print in `~/.dd/voice/jarvis_print.npz` (templates in openWakeWord's embedding space, thresholds calibrated from how alike your repetitions are) and the wavs stay in `~/.dd/voice/` for retraining. Live audio that looks like your recordings proposes a wake that Whisper confirms — catches your own pronunciation when the generic models score it low. `DD_WAKE_VOICE=0` turns it off.
+
 ## Rules
 1. Reply to a voice note in text by default; speak only when asked or for video narration.
 2. Never store raw audio in memory; store the transcript only if it contains a durable fact.
