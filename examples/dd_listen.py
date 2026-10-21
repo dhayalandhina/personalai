@@ -922,6 +922,44 @@ def slow_check() -> None:
     threading.Thread(target=job, daemon=True, name="dd-slow-check").start()
 
 
+_last_decode_at = 0.0
+_keep_warm_started = False
+
+
+def keep_whisper_warm(every: float = 45.0) -> None:
+    """Background: a 0.3 s decode on the command model whenever none ran for `every` seconds. On the 8 GB Mac
+    (Chrome + Ollama + dd: 8.9 GB of swap in use, 21 Oct) Whisper's weights were paged out between commands —
+    the first decode after a quiet spell took 13-27 s, the next one 2 s. Touching them keeps them resident."""
+    global _keep_warm_started
+    if _keep_warm_started or os.environ.get("DD_STT_KEEP_WARM", "1") != "1":
+        return
+    _keep_warm_started = True
+
+    def loop():
+        import numpy as np
+        pad = np.zeros(int(0.3 * RATE), dtype=np.float32)
+        while True:
+            time.sleep(5.0)
+            if time.monotonic() - _last_decode_at < every or _whisper is None:
+                continue
+            try:
+                model = _whisper
+                if getattr(model, "_dd_name", "") != "base" and (mac_busy() or small_slow()):
+                    model = model_named("base") or model
+                segs, _ = model.transcribe(pad, language="en", beam_size=1, vad_filter=False,
+                                           condition_on_previous_text=False, no_speech_threshold=0.6)
+                list(segs)
+                _touch_decode()
+            except Exception:
+                pass
+    threading.Thread(target=loop, daemon=True, name="dd-whisper-warm").start()
+
+
+def _touch_decode() -> None:
+    global _last_decode_at
+    _last_decode_at = time.monotonic()
+
+
 def note_decode(name: str, took: float, audio_s: float) -> None:
     """A decode far slower than its audio (small next to a film on the 8 GB M1: 13-27 s for a 1-4 s command):
     base for the next 10 minutes, plus one look at what the Mac is busy with."""
@@ -1014,6 +1052,7 @@ def stt_confirm(pcm: bytes, film: bool = False) -> tuple[str, float, float, floa
                                word_timestamps=True)
     segs = list(segs)
     note_decode(getattr(model, "_dd_name", ""), time.monotonic() - t0, len(a) / RATE)
+    _touch_decode()
     text = " ".join(x.text.strip() for x in segs).strip()
     lp = max((float(x.avg_logprob) for x in segs), default=-9.0)
     ns = min((float(x.no_speech_prob) for x in segs), default=1.0)
@@ -1101,6 +1140,7 @@ def stt(pcm: bytes, hint: str | None = None) -> str:
                                initial_prompt=prompt, no_speech_threshold=0.6)
     text = " ".join(s.text.strip() for s in segs).strip()
     note_decode(getattr(model, "_dd_name", ""), time.monotonic() - t0, len(pcm) / (RATE * 2))
+    _touch_decode()
     return text
 
 
@@ -1336,9 +1376,11 @@ class WakeHead:
         return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, o))))
 
     # While a film / video keeps proposing candidates that Whisper rejects, the bar rises for a while and falls back
-    # by itself (half-life ~1.5 min). Capped at 0.97: Dhina's own "Jarvis" scores ~1.0 on the retrained head, so he
-    # still gets through, while dd stops running Whisper on the film every few seconds (CPU, queued checks).
-    BOOST_CAP = 0.97
+    # by itself (half-life ~1.5 min). Capped at 0.90: Dhina's own "Jarvis" scores ~1.0 on the retrained head in a
+    # quiet room but 0.79-0.89 (lower quartile) when a film plays over it (vp_mix, 0-6 dB) — the 0.97 cap ignored
+    # his real "Jarvis" at 0.83 (22:27, 21 Oct). Whisper (base, 1.5 s) checks the extra film candidates, one at a
+    # time with the best of the rest queued; that bounds the cost instead of the cap.
+    BOOST_CAP = float(os.environ.get("DD_WAKE_BOOST_CAP", "0.90"))
 
     @property
     def effective_threshold(self) -> float:
@@ -1445,7 +1487,7 @@ def diag_dir() -> Path:
     return dd.ROOT / "logs" / "voice"
 
 
-def save_clip(pcm: bytes, name: str, keep: int = 80, channels: int = 1) -> str | None:
+def save_clip(pcm: bytes, name: str, keep: int = 400, channels: int = 1) -> str | None:
     """16 kHz int16 (mono, or interleaved stereo) -> logs/voice/<name>.wav, keeping only the newest `keep` clips."""
     import wave
     try:
@@ -1798,6 +1840,7 @@ class Listener:
         self._near_pending: list | None = None
         self.tentative_until = 0.0  # a "dd" candidate is being confirmed: keep capturing the command meanwhile
         self.verify_pending: dict | None = None  # a candidate waiting for the rest of the word before Whisper
+        self._verify_next: dict | None = None    # film mode: the best candidate that arrived while a check ran
         self.verify = os.environ.get("DD_WAKE_VERIFY", "1") != "0"
         self.wake_source = None    # the head that proposed the current wake (learns from what follows)
         if self.wake is not None and hasattr(self.wake, "soft_enabled"):
@@ -2114,6 +2157,12 @@ class Listener:
             if vp["left"] <= 0:
                 self.verify_pending = None
                 self._send_verify(vp["score"], vp["word"], vp["source"])
+        if self._verify_next is not None:  # (a candidate during a check: its audio is snapshotted 400 ms on, queued)
+            vn = self._verify_next
+            vn["left"] -= 1
+            if vn["left"] <= 0:
+                self._verify_next = None
+                self._send_verify(vn["score"], vn["word"], vn["source"], queued=True)
         if self._near_pending is not None:
             self._near_pending[0] -= 1
             w = self.wake
@@ -2170,6 +2219,8 @@ class Listener:
         if utt:
             self._hold_or_submit(utt, self._utt_started)
 
+    PARK_MAX_S = 8.0  # a command is 1-4 s: what a slow check parks beyond this is film, not him
+
     def _hold_or_submit(self, utt: bytes, started: float | None) -> None:
         """An utterance that ends while its wake candidate is still being checked waits for the verdict: kept (the
         command said in the same breath) when Whisper says "Jarvis", dropped when not. Film dialogue used to be
@@ -2180,7 +2231,8 @@ class Listener:
             if pending and not ts < max(self.armed_until, self.followup_until):
                 if self._parked is None:
                     self._parked = (utt, started)
-                else:  # two pieces inside one candidate window ("Jarvis" ... "chrome open pannu"): one command
+                elif len(self._parked[0]) < self.PARK_MAX_S * RATE * 2:
+                    # two pieces inside one candidate window ("Jarvis" ... "chrome open pannu"): one command
                     self._parked = (self._parked[0] + utt, self._parked[1])
                 return
         self.submit(utt, started)
@@ -2197,6 +2249,8 @@ class Listener:
             self.log(f"  (not a wake: {len(p[0]) / (RATE * 2):.1f}s heard meanwhile dropped unread)")
 
     VERIFY_DELAY_FRAMES = 20  # 400 ms: detectors often fire mid-word; Whisper needs the whole word
+    TENTATIVE_HOLD_S = 6.0    # the command keeps being captured this long while Whisper checks the candidate (the
+    #                           8 GB Mac took 12 s per check with a film on: a 2.9 s window lost "Jarvis, <command>")
 
     def confirm_wake(self, score: float, word: str = "dd", source=None) -> None:
         """A candidate from a head / the soft detector: 400 ms later the last 2 s go to Whisper (worker thread);
@@ -2215,9 +2269,19 @@ class Listener:
         # sound) -> never skipped; the skip below once dropped Dhina's real "Jarvis" 1.6 s after a film candidate
         ear_on = EAR_STATUS["active"] and EAR_STATUS["playing"]
         voice_over_film = ear_on and near_end(list(EAR_STATS)) >= EAR_NEAR_SURE
-        if busy and not voice_over_film and (self._verify_inflight or now - self._last_verify_at < 4.0):
-            self._verify_skipped += 1
-            return
+        if busy and not voice_over_film:
+            # a check is running (or one just started): this candidate is not dropped — the best one that arrives
+            # meanwhile waits its turn (its audio is kept), so his "Jarvis" 2 s after a film line is still checked
+            spacing = 2.0 if mac_busy() or small_slow() else 4.0  # (base: ~0.5 s a check; small: 2-26 s)
+            if self._verify_inflight or self.verify_pending is not None or now - self._last_verify_at < spacing:
+                if self._verify_next is None or score > self._verify_next["score"]:
+                    if self._verify_next is not None:
+                        self._verify_skipped += 1
+                    self._verify_next = {"left": self.VERIFY_DELAY_FRAMES, "score": score, "word": word,
+                                         "source": source, "at": now}
+                else:
+                    self._verify_skipped += 1
+                return
         self._last_verify_at = now
         self.tentative_until = self.clock() + 2.5 + self.VERIFY_DELAY_FRAMES * FRAME_MS / 1000
         self.seg.reset()
@@ -2226,12 +2290,22 @@ class Listener:
         self.log(f"  wake? {word} candidate ({score:.2f}) — confirming")
         self.verify_pending = {"left": self.VERIFY_DELAY_FRAMES, "score": score, "word": word, "source": source}
 
-    def _send_verify(self, score: float, word: str, source) -> None:
+    def _send_verify(self, score: float, word: str, source, queued: bool = False) -> None:
         pcm = b"".join(self.recent)
         raw = b"".join(self.recent_raw) if len(self.recent_raw) == len(self.recent) else None
         ear = list(EAR_STATS) if EAR_STATUS["active"] and EAR_STATUS["playing"] else None
         job = ("verify", pcm, score, word, source, raw, self.clock(), ear)
+        if queued:  # (behind the running check; at most one waits — the newest best replaces an older one)
+            if self.inline:
+                return
+            while len(self.vqueue) > 1:
+                self.vqueue.pop()
+            self.vqueue.append(job)
+            self.vwork.set()
+            return
         self._verify_inflight = True
+        # the command said after the word is captured (and parked) until the verdict, however slow the check
+        self.tentative_until = max(self.tentative_until, self.clock() + self.TENTATIVE_HOLD_S)
         if self.inline:
             self._verify(pcm, score, word, source, raw, None, ear)
             return
@@ -2248,6 +2322,11 @@ class Listener:
                 self.vwork.clear()
                 continue
             job = self.vqueue.popleft()
+            with self._park_lock:
+                self._verify_inflight = True
+            if self.clock() < max(self.armed_until, self.followup_until) and job[6] < self.clock() - 0.5:
+                self._release_parked(False)  # (already awake from the check before it: this one is moot)
+                continue
             try:
                 self._verify(*job[1:])
             except Exception as e:  # a failed check must not stop the next one
@@ -2264,7 +2343,7 @@ class Listener:
     def _verify_one(self, pcm: bytes, score: float, word: str, source, raw: bytes | None,
                     queued_at: float | None, ear: list | None = None) -> bool:
         t0 = self.clock()
-        if queued_at is not None and t0 - queued_at > 4.0:  # the machine was busy: a wake this late only confuses
+        if queued_at is not None and t0 - queued_at > 6.0:  # the machine was busy: a wake this late only confuses
             self.log(f"  wake: {word} candidate dropped (waited {t0 - queued_at:.1f}s for Whisper)")
             if self.wake is not None and hasattr(self.wake, "cooldown"):
                 self.wake.cooldown = 0
@@ -2415,6 +2494,7 @@ def warm_stt() -> None:
         stt(b"\x00\x00" * (RATE // 2))  # loads the Whisper model so the first command isn't slow
         if default_stt_model() != "base":
             model_named("base")  # (background: ready the moment the Mac plays sound or small crawls)
+        keep_whisper_warm()
     except Exception as e:
         print(f"(whisper not ready: {e})")
 
@@ -3290,6 +3370,22 @@ def selftest() -> int:
     assert wait_for(lambda: c_handled == ["chrome open pannu"]), (c_handled, c_logs[-4:])
     assert lc.vworker is not None and lc.vworker.name == "dd-verify" and lc._parked is None
     vgate.clear()
+    assert wait_for(lambda: lc.followup_until > 0)
+    lc.followup_until = lc.armed_until = 0.0
+    # a slow check (the Mac busy with a film): a command that starts 2 s after the word and ends 4.5 s after it is
+    # still captured, parked, and answered once the word is confirmed
+    for f in _quiet(600):
+        lc.feed(f)
+    for f in _tone(300, amp=3000):
+        lc.feed(f)
+    fwc.fire_in = 1
+    for f in _quiet(2000) + _tone(1800) + _quiet(800):
+        lc.feed(f)
+    assert lc._parked is not None and len(lc._parked[0]) >= 1800 * 32, "the late command was captured and parked"
+    verdicts.append(("Jarvis.", -0.3, 0.1))
+    vgate.set()
+    assert wait_for(lambda: c_handled == ["chrome open pannu"] * 2), (c_handled, c_logs[-4:])
+    vgate.clear()
     assert wait_for(lambda: lc.followup_until > 0)  # (the reply is out: its follow-up window opened)
     lc.followup_until = lc.armed_until = 0.0
     candidate_with_command()  # film: rejected -> what it said is never transcribed
@@ -3297,13 +3393,45 @@ def selftest() -> int:
     verdicts.append(("Don't miss.", -0.8, 0.1))
     vgate.set()
     assert wait_for(lambda: lc._parked is None and not lc._verify_inflight)
-    assert c_stt == [1] and c_handled == ["chrome open pannu"] and any("dropped unread" in m for m in c_logs), c_logs[-3:]
+    assert c_stt == [1, 1] and c_handled == ["chrome open pannu"] * 2 and any("dropped unread" in m for m in c_logs), c_logs[-3:]
+    # film mode (3 rejections in the last minute): a candidate that arrives while a check runs is not dropped — the
+    # best one waits its turn with its own audio, and is confirmed when the first was the film
+    lc.followup_until = lc.armed_until = 0.0
+    src = fwc.last_source
+    src.rejects[:] = [lc.clock() - 5, lc.clock() - 4, lc.clock() - 3]
+    lc._last_verify_at = -1e9  # (the test runs faster than real time: the spacing rule would queue the first one)
+    vgate.clear()
+    for f in _quiet(600):
+        lc.feed(f)
+    for f in _tone(300, amp=3000):  # film line that looks like the word
+        lc.feed(f)
+    fwc.fire_in = 1
+    for f in _quiet(800):
+        lc.feed(f)
+    assert lc._verify_inflight and lc._verify_next is None
+    for f in _tone(300, amp=3000):  # his "Jarvis" 1.5 s later, while the first check still runs
+        lc.feed(f)
+    fwc.fire_in = 1
+    for f in _quiet(100):
+        lc.feed(f)
+    assert lc._verify_next is not None and lc._verify_next["score"] == 0.97, "queued, not dropped"
+    for f in _quiet(500):
+        lc.feed(f)
+    assert lc._verify_next is None and len(lc.vqueue) == 1, (lc._verify_next, len(lc.vqueue))
+    verdicts.extend([("Don't miss.", -0.8, 0.1), ("Jarvis.", -0.3, 0.1)])  # film, then him
+    vgate.set()
+    assert wait_for(lambda: lc.last_heard == "jarvis ✓" and len(lc.vqueue) == 0), (lc.last_heard, c_logs[-4:])
+    vgate.clear()
+    assert any("candidate rejected" in m for m in c_logs[-6:]) and lc.armed_until > lc.clock()
+    lc.followup_until = lc.armed_until = 0.0
+    src.rejects.clear()
+    vgate.set()  # (the cases below expect an open gate, as before this one)
     # brain busy for a long time: a real "Jarvis" is still confirmed at once
     brain_gate.clear()
     lc.followup_until = time.monotonic() + 8
     for f in utterance:  # a follow-up command: the brain thread now hangs in c_handle
         lc.feed(f)
-    assert wait_for(lambda: len(c_stt) == 2)
+    assert wait_for(lambda: len(c_stt) == 3)
     lc.followup_until = lc.armed_until = 0.0
     verdicts.append(("Jarvis.", -0.3, 0.1))
     for f in _quiet(600):
@@ -3314,9 +3442,9 @@ def selftest() -> int:
     for f in _quiet(Listener.VERIFY_DELAY_FRAMES * FRAME_MS + 40):
         lc.feed(f)
     assert wait_for(lambda: lc.last_heard == "jarvis ✓"), (lc.last_heard, c_logs[-3:])
-    assert len(c_handled) == 1, "confirmed while the brain was still busy"
+    assert len(c_handled) == 2, "confirmed while the brain was still busy"
     brain_gate.set()
-    assert wait_for(lambda: len(c_handled) == 2)
+    assert wait_for(lambda: len(c_handled) == 3)
     lc.stop.set()
 
     _brain_selftest()

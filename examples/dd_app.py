@@ -125,6 +125,24 @@ class AppCore:
                 return True
         return False
 
+    def diag_requested(self) -> bool:
+        """True once when someone touched <repo>/logs/diag.req (or ~/.dd/diag.req): run_diag() then writes
+        logs/diag.txt — permissions, model speeds, ears, memory — so a fix can start from facts, not guesses."""
+        for p in (dd.ROOT / "logs" / "diag.req", Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "diag.req"):
+            if p.is_file():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+                return True
+        return False
+
+    def diag(self) -> None:
+        if getattr(self, "_diag_thread", None) is not None and self._diag_thread.is_alive():
+            return
+        self._diag_thread = threading.Thread(target=lambda: run_diag(self.listener), daemon=True, name="dd-diag")
+        self._diag_thread.start()
+
     def watch_updates(self, every: float | None = None) -> None:
         """Background: every 15 min `git fetch`; newer code on GitHub -> update_due() rolls it out when dd is idle.
         (Fixes used to wait for a manual update or a restart.) DD_NO_UPDATE=1 turns it off."""
@@ -366,6 +384,8 @@ def run_menu_bar(core: AppCore) -> int:
                 rumps.alert("dd voice setup", text)
             if core.update_requested() or core.update_due():
                 self.do_update(quiet=True)
+            elif core.diag_requested():
+                core.diag()
             elif core.ear_restart_due():
                 print("ear: restarting dd once so macOS applies the System Audio Recording permission", flush=True)
                 quiet_start_mark()
@@ -422,6 +442,112 @@ def run_menu_bar(core: AppCore) -> int:
 
 
 RUNNING_COMMIT = ""  # the commit this process started from (auto_update sets it)
+
+
+def _sh(cmd: list[str], timeout: float = 20) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout or r.stderr).strip()
+    except Exception as e:
+        return f"({type(e).__name__})"
+
+
+def run_diag(listener=None, out: Path | None = None) -> str:
+    """What this Mac lets dd do and how fast it is, written to logs/diag.txt (and the summary to the log):
+    permissions (Accessibility, Screen Recording, Full Disk Access, Automation), the ears (source, dd-ear, playback),
+    Whisper base/small decode time, the brain, memory/CPU, installed apps the router can see. Read-only."""
+    lines = [f"dd diag {time.strftime('%Y-%m-%d %H:%M:%S')} code {RUNNING_COMMIT or '?'}"]
+    add = lines.append
+    try:
+        add(dd_listen.machine_info())
+        add(f"python {sys.executable}")
+        # ---- permissions
+        try:
+            import Quartz  # (pyobjc: rumps needs it)
+            add(f"screen recording: {'OK' if Quartz.CGPreflightScreenCaptureAccess() else 'NOT allowed (read-screen cannot see other apps)'}")
+        except Exception as e:
+            add(f"screen recording: ? ({type(e).__name__})")
+        try:
+            from ApplicationServices import AXIsProcessTrusted
+            add(f"accessibility: {'OK' if AXIsProcessTrusted() else 'NOT allowed (type-text / keys will fail)'}")
+        except Exception as e:
+            add(f"accessibility: ? ({type(e).__name__})")
+        r = _sh(["osascript", "-e", 'tell application "System Events" to get name of first process'], 15)
+        add("automation (System Events): " + ("OK" if r and "error" not in r.lower() else f"NOT allowed: {r[:120]}"))
+        mac_py = dd.ROOT / "skills" / "mac-control" / "scripts" / "mac.py"
+        wa = _sh([sys.executable, str(mac_py), "whatsapp-db"], 20)
+        add("full disk access / WhatsApp db: " + (("OK — " + wa[:160].replace("\n", " ")) if '"ok": true' in wa else
+                                                 ("NOT allowed (System Settings > Privacy & Security > Full Disk Access > dd)" if "denied" in wa else
+                                                  f"{wa[:160]}".replace("\n", " "))))
+        wa_app = any(os.path.isdir(p) for p in ("/Applications/WhatsApp.app", os.path.expanduser("~/Applications/WhatsApp.app")))
+        add(f"WhatsApp app installed: {wa_app}")
+        # ---- ears
+        if listener is not None:
+            add(f"ears: state {listener.state}, source {'dd-ear' if dd_listen.EAR_STATUS.get('active') else 'other'}, "
+                f"dd-ear playing {dd_listen.EAR_STATUS.get('playing')}, erle {dd_listen.EAR_STATUS.get('erle', 0):.1f} dB, "
+                f"room floor {listener.seg.floor:.0f}, gain {listener.agc.gain:.1f}x, film mode {listener.film_mode()}")
+        add("playback now: " + (dd_listen.playback_report() or "nothing"))
+        # ---- speech models: a 3 s clip through each loaded model
+        import numpy as np
+        rng = np.random.default_rng(0)
+        pcm = (rng.normal(size=16000 * 3) * 300).astype(np.int16).tobytes()
+        for name in ("base", "small"):
+            m = dd_listen.model_named(name)
+            for _ in range(30):  # (a background load was just started: give it a moment)
+                if m is not None or name in dd_listen._load_failed:
+                    break
+                time.sleep(1)
+                m = dd_listen.model_named(name)
+            if m is None:
+                add(f"whisper {name}: not loaded")
+                continue
+            t0 = time.monotonic()
+            try:
+                segs, _ = m.transcribe(np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0, language="en", beam_size=1)
+                list(segs)
+                add(f"whisper {name}: 3 s clip decoded in {time.monotonic() - t0:.1f}s")
+            except Exception as e:
+                add(f"whisper {name}: failed {type(e).__name__}")
+        add(f"stt choice now: {'base (Mac busy / small slow)' if dd_listen.mac_busy() or dd_listen.small_slow() else dd_listen.default_stt_model()}")
+        # ---- brain
+        add(f"brain: {dd.brain_label()}")
+        add("ollama ps: " + _sh(["ollama", "ps"], 10).replace("\n", " | ")[:300])
+        t0 = time.monotonic()
+        try:
+            dd.ollama_chat([{"role": "user", "content": "hi"}], [], num_predict=1)
+            add(f"ollama ping: {time.monotonic() - t0:.1f}s")
+        except Exception as e:
+            add(f"ollama ping failed: {type(e).__name__}")
+        # ---- machine load
+        add("memory: " + _sh(["memory_pressure", "-Q"], 10).replace("\n", " ")[:120] + " | swap " + _sh(["sysctl", "-n", "vm.swapusage"], 5)[:80])
+        add("load: " + _sh(["sysctl", "-n", "vm.loadavg"], 5))
+        top = _sh(["ps", "-Ao", "pcpu=,rss=,comm=", "-r"], 10).splitlines()[:8]
+        add("top cpu: " + "; ".join(" ".join(x.split(None, 2)[i] for i in (0, 2)).rsplit("/", 1)[-1][:40] for x in top if len(x.split(None, 2)) == 3))
+        # ---- apps the router can open
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("dd_mac_diag", mac_py)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            apps = mod.installed_apps()
+            add(f"installed apps seen: {len(apps)} — " + ", ".join(sorted(apps)[:40]))
+            for q in ("chrome", "whatsapp", "word", "spotify", "vs code", "telegram"):
+                r_ = mod.resolve_open(q)
+                add(f"  open '{q}' -> {r_['kind']} {r_['target']}")
+        except Exception as e:
+            add(f"apps: failed {type(e).__name__}: {str(e)[:100]}")
+        # ---- certificates
+        add(f"SSL_CERT_FILE: {os.environ.get('SSL_CERT_FILE', '(python default)')}")
+    except Exception as e:
+        add(f"diag failed: {type(e).__name__}: {str(e)[:200]}")
+    text = "\n".join(lines)
+    out = out or (dd.ROOT / "logs" / "diag.txt")
+    try:
+        out.write_text(text + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    print("diag: " + " | ".join(lines[3:9])[:600] + f"\n  (full report: {out})", flush=True)
+    return text
 
 
 def relaunch_app() -> None:
@@ -761,6 +887,13 @@ def selftest() -> int:
     assert core.update_requested() is True and not marker.exists()
     core._update_check = 0.0
     assert core.update_requested() is False
+    # diag marker -> a report file (read-only checks; off the Mac most lines say what could not be checked)
+    dmark = Path(os.environ["DD_HOME"]) / "diag.req"
+    dmark.write_text("")
+    assert core.diag_requested() is True and not dmark.exists() and core.diag_requested() is False
+    dout = Path(os.environ["DD_HOME"]) / "diag-test.txt"
+    report = run_diag(lis, out=dout)
+    assert dout.is_file() and report.startswith("dd diag ") and "brain:" in report and "whisper base:" in report, report[:300]
     # newer code found by the background check: rolled out only when dd is idle (listening, quiet for 2 min)
     core._newer = True
     lis.state, lis._last_activity, lis.armed_until, lis.followup_until = "recording", lis.clock(), 0.0, 0.0
