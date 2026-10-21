@@ -1334,6 +1334,9 @@ class Listener:
         # the same 2 s before the AutoGain: Whisper confirms on this (normalised once, smoothly) — the gain's fast
         # moves at the start of a word after a quiet minute turned Dhina's "Jarvis" into "Damis"
         self.recent_raw: deque[bytes] = deque(maxlen=100)
+        self._verify_inflight = False   # a Whisper check queued or running
+        self._last_verify_at = -1e9
+        self._verify_skipped = 0        # candidates skipped while a film kept Whisper busy (shown in the next log)
         self.agc = AutoGain()      # quiet raw mics are brought up to speech level before anything else sees them
         self.wake_peak = 0.0       # highest hey-jarvis score since the last idle log line (sensitivity check)
         self.diag = os.environ.get("DD_WAKE_DIAG", "1") != "0"  # keep near-miss clips in logs/voice for tuning
@@ -1686,7 +1689,15 @@ class Listener:
     def confirm_wake(self, score: float, word: str = "dd", source=None) -> None:
         """A candidate from a head / the soft detector: 400 ms later the last 2 s go to Whisper (worker thread);
         meanwhile the segmenter keeps running so a command said in the same breath is not lost. on_wake() runs
-        only if Whisper agrees."""
+        only if Whisper agrees. While a film keeps proposing candidates (3+ rejections in a minute) at most one check
+        runs at a time and they start >= 4 s apart — the 8 GB Mac took 2-26 s per check with a film playing."""
+        now = self.clock()
+        rej = getattr(source, "rejects", None)
+        busy = rej is not None and len([t for t in rej if now - t < 60]) >= 3
+        if busy and (self._verify_inflight or now - self._last_verify_at < 4.0):
+            self._verify_skipped += 1
+            return
+        self._last_verify_at = now
         self.tentative_until = self.clock() + 2.5 + self.VERIFY_DELAY_FRAMES * FRAME_MS / 1000
         self.seg.reset()
         self.seg.pre.clear()
@@ -1698,6 +1709,7 @@ class Listener:
         pcm = b"".join(self.recent)
         raw = b"".join(self.recent_raw) if len(self.recent_raw) == len(self.recent) else None
         job = ("verify", pcm, score, word, source, raw, self.clock())
+        self._verify_inflight = True
         if self.inline:
             self._verify(pcm, score, word, source, raw)
             return
@@ -1709,6 +1721,13 @@ class Listener:
 
     def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None, raw: bytes | None = None,
                 queued_at: float | None = None) -> None:
+        try:
+            self._verify_one(pcm, score, word, source, raw, queued_at)
+        finally:
+            self._verify_inflight = False
+
+    def _verify_one(self, pcm: bytes, score: float, word: str, source, raw: bytes | None,
+                    queued_at: float | None) -> None:
         t0 = self.clock()
         if queued_at is not None and t0 - queued_at > 4.0:  # the machine was busy: a wake this late only confuses
             self.log(f"  wake: {word} candidate dropped (waited {t0 - queued_at:.1f}s for Whisper)")
@@ -1746,6 +1765,9 @@ class Listener:
             if source is not None:
                 source.rejected(self.clock())
             thr = f"; threshold {getattr(source, 'effective_threshold', source.threshold):.2f}" if source is not None else ""
+            if self._verify_skipped:
+                thr += f"; {self._verify_skipped} more skipped while busy"
+                self._verify_skipped = 0
             why = f"{how}; " if how and not how.startswith("unsure") else ""
             if self.diag and how != "no voice in it":  # rejected candidates: the data that shows a missed "Jarvis"
                 save_clip(pcm, time.strftime("cand-%H%M%S") + f"-{word}-{score:.2f}-rej-lp{lp:.2f}")
