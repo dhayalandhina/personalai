@@ -354,6 +354,8 @@ def run_app() -> int:
 
     def warm_all():
         dd_listen.warm_stt()
+        if dd_listen.ram_gb() < 12:
+            time.sleep(20)  # 8 GB Mac: let Whisper settle before the LLM load (both at once starve the mic)
         dd.warm()
         if dd_listen.mlx_wanted():
             dd_listen.setup_mlx()

@@ -8,7 +8,8 @@ speech embeddings (the same features the pre-trained "hey jarvis" model reads). 
 examples/dd_listen.py loads them next to the hey-jarvis model (DDHead). CPU only; ~30-40 min on 2 cores.
 
   python3 wakeword_train.py voices  [--voices DIR]        # download 6 Piper voices from Hugging Face (~400 MB)
-  python3 wakeword_train.py all     [--work DIR] [--out skills/voice/assets/wake_dd.npz]
+  python3 wakeword_train.py all     [--word dd|jarvis] [--work DIR] [--out FILE]   (default assets/wake_<word>.npz)
+  python3 wakeword_train.py all --word jarvis --reuse-neg ~/.dd/wake-train   # plain "jarvis", reusing dd's negatives
   python3 wakeword_train.py gen|feats|train|export        # single stages (cached in --work)
   python3 wakeword_train.py record                        # 10 clips of YOUR 'dee dee' -> ~/.dd/wake-train/my-voice
   python3 wakeword_train.py all --pos-only                # retrain with them (negatives reused): misses on your voice gone
@@ -50,6 +51,16 @@ HARD_NEG = ["daddy", "teddy", "ready", "steady", "TV", "CD", "DVD", "deep", "ind
             "dude", "dad", "did", "deal", "dear", "dean", "a d", "idea", "video", "media", "pdf", "d day", "db",
             "chrome open pannu", "volume thirty", "innaiku weather enna", "screenshot edu", "sollu", "enna", "pannu",
             "dee", "tee tee", "bee bee", "pee pee", "key key", "gee gee", "we we", "me me", "see see", "knee knee"]
+JARVIS_POS = ["jarvis", "jarvis.", "Jarvis!", "jarvis?", "ok jarvis", "hey jarvis", "hi jarvis", "jarvis jarvis",
+              "yo jarvis", "Jarvis,"]
+JARVIS_HARD = ["travis", "davis", "mavis", "service", "nervous", "harvest", "jar", "jars", "garbage", "office", "jasmine",
+               "javascript", "jarring", "carving", "marvelous", "car wash", "artist", "harvey", "marvin", "jarred",
+               "jockey", "chavez", "purpose", "canvas", "starbucks", "dee dee", "hey siri", "alexa", "ok google", "hey",
+               "jealous", "gravis", "service desk", "travel", "carpet", "harness", "jargon", "nervous system"]
+WORDS = {  # what each wake word's head learns: positives, confusables, and how slowly people may say it
+    "dd": {"pos": POS_TEXTS, "hard": HARD_NEG, "slow": 1.35, "out": "wake_dd.npz"},
+    "jarvis": {"pos": JARVIS_POS, "hard": JARVIS_HARD, "slow": 1.7, "out": "wake_jarvis.npz"},
+}
 VOCAB = ("the of and to in is you that it he was for on are as with his they I at be this have from or one had by word "
          "but not what all were we when your can said there use an each which she do how their if will up other about "
          "out many then them these so some her would make like him into time has look two more write go see number no "
@@ -200,11 +211,14 @@ def load_voices(folder: Path) -> dict:
     return out
 
 
+SLOW = 1.35  # max length_scale (slowest speech) for synth(); stage_gen sets it per wake word
+
+
 def synth(voice, text: str, spk=None):
     np = _np()
     from scipy.signal import resample_poly
     from piper.config import SynthesisConfig
-    cfg = SynthesisConfig(speaker_id=spk, length_scale=rng.uniform(0.75, 1.35), noise_scale=rng.uniform(0.3, 0.9),
+    cfg = SynthesisConfig(speaker_id=spk, length_scale=rng.uniform(0.75, SLOW), noise_scale=rng.uniform(0.3, 0.9),
                           noise_w_scale=rng.uniform(0.4, 1.1))
     a = np.concatenate([c.audio_float_array for c in voice.synthesize(text, cfg)]).astype(np.float32)
     a = resample_poly(a, 320, 441).astype(np.float32)  # 22050 -> 16000
@@ -264,9 +278,19 @@ def record(folder: Path, n: int = 10, seconds: float = 2.0) -> int:
 
 
 # ---------------- stages ----------------
+def _norm(t: str) -> str:
+    return "".join(ch for ch in t.lower() if ch.isalnum() or ch == " ").strip()
+
+
 def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500, n_noise=600, pos_only: bool = False,
-              my_voice: Path | None = None) -> None:
+              my_voice: Path | None = None, word: str = "dd", reuse_neg: Path | None = None) -> None:
+    """Clips for one wake word. reuse_neg: another word's work dir — its negative *embeddings* are reused (minus
+    clips that say this word), so only positives + this word's confusables are synthesised."""
+    global SLOW
     np = _np()
+    spec = WORDS[word]
+    SLOW = spec["slow"]
+    pos_texts, hard_texts = spec["pos"], spec["hard"]
     voices = load_voices(voices_dir)
     names = list(voices)
     multi = [n for n in names if "libritts" in n]
@@ -290,7 +314,7 @@ def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500,
         return name, spk, synth(v, text, spk)
 
     for i in range(n_pos):
-        text = rng.choice(POS_TEXTS)
+        text = rng.choice(pos_texts)
         name, spk, a = say(text)
         tail = None
         if i % 3 == 2:  # one in three: the command follows in the same breath ("dee dee chrome open pannu")
@@ -314,7 +338,7 @@ def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500,
             b = a if k == 0 else speed_perturb(a, 0.9, 1.1)
             x = place(b, rng.uniform(0.0, 0.4))
             pos.append(x if k == 0 else augment(x))
-            posmeta.append({"voice": "me", "spk": None, "text": "dee dee", "aug": k, "mine": True})
+            posmeta.append({"voice": "me", "spk": None, "text": pos_texts[0], "aug": k, "mine": True})
     if mine:
         print(f"your recordings: {len(mine)} clips -> {len(mine) * 24} positives", flush=True)
     if pos_only and (work / "neg.npy").is_file() and (work / "meta.json").is_file():
@@ -323,6 +347,16 @@ def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500,
         np.save(work / "pos.npy", np.stack(pos))
         print(f"gen done (positives only): pos {len(pos)}, negatives kept ({len(old_meta['neg'])}) in {time.time() - t0:.0f}s", flush=True)
         return
+    if reuse_neg is not None:
+        src_meta = json.loads((reuse_neg / "meta.json").read_text())["neg"]
+        src_emb = np.load(reuse_neg / "neg_emb.npy", mmap_mode="r")
+        bad = {_norm(t) for t in pos_texts}
+        keep = [i for i, m in enumerate(src_meta) if _norm(m.get("text", "")) not in bad]
+        work.mkdir(parents=True, exist_ok=True)
+        np.save(work / "neg_reuse_emb.npy", np.asarray(src_emb[keep]))
+        (work / "neg_reuse_meta.json").write_text(json.dumps([src_meta[i] for i in keep]))
+        print(f"reusing {len(keep)}/{len(src_meta)} negative embeddings from {reuse_neg}", flush=True)
+        n_neg, n_noise = 0, 0  # sentences and noise come from there; confusables for this word are made below
     for i in range(n_neg):
         text = sentence()
         name, spk, a = say(text)
@@ -337,7 +371,7 @@ def stage_gen(work: Path, voices_dir: Path, n_pos=2400, n_neg=3000, n_hard=1500,
         if i % 300 == 0:
             print(f"neg {i}/{n_neg} {time.time() - t0:.0f}s", flush=True)
     for i in range(n_hard):
-        text = rng.choice(HARD_NEG)
+        text = rng.choice(hard_texts)
         name, spk, a = say(text)
         for k in range(4):  # confusables get one more augmented copy: they are what the head must learn to refuse
             b = a if k == 0 else speed_perturb(a)
@@ -419,6 +453,10 @@ def stage_train(work: Path, out: Path) -> dict:
     def last(e):
         return e[:, -T:, :].reshape(len(e), -1)
 
+    if (work / "neg_reuse_emb.npy").is_file():
+        re_ = np.load(work / "neg_reuse_emb.npy")
+        ne = np.concatenate([ne, re_])
+        meta["neg"] = meta["neg"] + json.loads((work / "neg_reuse_meta.json").read_text())
     Xp = last(pe)
     Xn = np.concatenate([last(ne), ne[:, :T, :].reshape(len(ne), -1)])  # end window + start window
     X = np.concatenate([Xp, Xn])
@@ -507,6 +545,7 @@ def selftest() -> int:
         af = audio_features()
         emb = af.embed_clips((np.stack([w, aug]) * 32767).astype(np.int16), batch_size=2)
         assert emb.shape[0] == 2 and emb.shape[2] == 96 and emb.shape[1] >= T, emb.shape
+    assert set(WORDS) == {"dd", "jarvis"} and all(set(map(_norm, w["pos"])).isdisjoint(map(_norm, w["hard"])) for w in WORDS.values())
     print("wakeword_train selftest ok (placement, augmentation, noise/reverb, head fit + export, numpy forward == sklearn)")
     return 0
 
@@ -519,12 +558,15 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--my-voice", default="", help="folder of your own 'dee dee' recordings (record stage writes it)")
     ap.add_argument("--work", default=str(Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "wake-train"))
     ap.add_argument("--voices", default=str(Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "piper-voices"))
-    ap.add_argument("--out", default=str(SKILL / "assets" / "wake_dd.npz"))
+    ap.add_argument("--out", default="", help="weights file (default skills/voice/assets/wake_<word>.npz)")
     ap.add_argument("--pos", type=int, default=2400)
     ap.add_argument("--neg", type=int, default=3000)
     ap.add_argument("--pos-only", action="store_true", help="regenerate positives only, keep the work dir's negatives")
+    ap.add_argument("--word", default="dd", choices=sorted(WORDS), help="which wake word to train (dd | jarvis)")
+    ap.add_argument("--reuse-neg", default="", help="work dir of another word: reuse its negative embeddings")
     a = ap.parse_args(argv)
-    work, voices, out = Path(a.work), Path(a.voices), Path(a.out)
+    work, voices = Path(a.work), Path(a.voices)
+    out = Path(a.out) if a.out else SKILL / "assets" / WORDS[a.word]["out"]
     mine = Path(a.my_voice) if a.my_voice else Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "wake-train" / "my-voice"
     if a.stage == "voices":
         print(json.dumps({"voices": download_voices(voices), "dir": str(voices)}))
@@ -534,7 +576,8 @@ def main(argv: list[str]) -> int:
     if a.stage in ("gen", "all"):
         if not glob.glob(str(voices / "*.onnx")):
             download_voices(voices)
-        stage_gen(work, voices, n_pos=a.pos, n_neg=a.neg, pos_only=a.pos_only, my_voice=mine if mine.is_dir() else None)
+        stage_gen(work, voices, n_pos=a.pos, n_neg=a.neg, pos_only=a.pos_only, my_voice=mine if mine.is_dir() else None,
+                  word=a.word, reuse_neg=Path(a.reuse_neg) if a.reuse_neg else None)
     if a.stage in ("feats", "all"):
         stage_feats(work)
     if a.stage in ("train", "all"):
