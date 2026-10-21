@@ -665,7 +665,7 @@ def stt_confirm(pcm: bytes) -> tuple[str, float, float]:
         except Exception as e:
             print(f"(mlx confirm failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
     model = load_confirm_whisper()
-    beam = int(os.environ.get("DD_CONFIRM_BEAM", "1"))
+    beam = int(os.environ.get("DD_CONFIRM_BEAM", "5"))  # beam 5: +13% of his "Jarvis" over anime, same cost
     segs, _ = model.transcribe(audio, language=lang, beam_size=beam, vad_filter=False, condition_on_previous_text=False,
                                initial_prompt=CONFIRM_HINT, no_speech_threshold=None, log_prob_threshold=None)
     segs = list(segs)
