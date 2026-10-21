@@ -720,7 +720,7 @@ def run(action: str, args: list[str]) -> dict:
     if action == "read-screen":
         return read_screen()
     if action == "time":
-        return {"ok": True, "action": "time", "say": time.strftime("Ippo mani %I:%M %p, %A %d %B")}
+        return {"ok": True, "action": "time", "say": "Ippo mani " + time.strftime("%I:%M %p, %A %d %B").lstrip("0")}
     if action == "date":
         return {"ok": True, "action": "date", "say": time.strftime("Innaiku %A, %d %B %Y.").replace(" 0", " ")}
     if action in ("weather", "news", "remind"):
@@ -985,6 +985,13 @@ REPLIES = {"open-folder": "{0} folder open panniten.", "open-app": "{0} open pan
            "press-key": "{0} press panniten."}
 
 
+KEY_SAY = {"cmd+t": "Pudhu tab open panniten.", "cmd+w": "Close panniten.", "cmd+n": "Pudhu window open panniten.",
+           "cmd+m": "Minimize panniten.", "ctrl+cmd+f": "Full screen panniten.", "cmd+r": "Refresh panniten.",
+           "cmd+[": "Back ponen.", "cmd+s": "Save panniten.", "cmd+c": "Copy panniten.", "cmd+v": "Paste panniten.",
+           "cmd+z": "Undo panniten.", "cmd+shift+z": "Redo panniten.", "cmd+a": "Ellam select panniten.",
+           "pagedown": "Keezha scroll panniten.", "pageup": "Mela scroll panniten.", "cmd+tab": "App switch panniten."}
+
+
 def do(text: str) -> dict:
     r = route(text)
     if not r["action"] or (on_server() and r["action"] not in SERVER_OK):
@@ -1002,6 +1009,8 @@ def do(text: str) -> dict:
         say = wifi_say(res["output"])
     elif res.get("output") and r["action"] in ("apps", "clipboard"):
         say = res["output"][:300]
+    elif r["action"] == "press-key" and r["args"] and r["args"][0] in KEY_SAY:
+        say = KEY_SAY[r["args"][0]]
     else:
         args = [SPOKEN.get(a.lower(), a) if r["action"] in ("open-app", "quit-app") else a for a in (r["args"] or [""])]
         say = REPLIES.get(r["action"], "Done.").format(*args)
@@ -1088,6 +1097,7 @@ def selftest() -> int:
     assert build("press-key", ["enter"])[0][-1].endswith("key code 36")
     assert build("press-key", ["cmd+shift+t"])[0][-1].endswith('keystroke "t" using {command down, shift down}')
     assert do("tab press pannu")["say"] == "tab press panniten." and do("press enter")["would_run"][0][-1].endswith("key code 36")
+    assert do("new tab")["say"] == "Pudhu tab open panniten." and do("Scroll down.")["say"] == "Keezha scroll panniten."
     d = do("chrome open pannu")
     assert d["handled"] and d["say"] == "chrome open panniten." and d["dry_run"], d
     assert do("Gurum tire.")["say"] == "chrome open panniten."
