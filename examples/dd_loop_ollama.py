@@ -67,7 +67,27 @@ def run_script(skill: str, script: str, args: list[str]) -> dict:
     return LIB.run(skill, script, args)
 
 
-def boot_system_prompt() -> str:
+VOICE_INDEX_SKIP = {"dd-core-identity", "security-privacy", "rules-guard", "telegram-interface"}  # (already in the prompt / not for speech)
+
+
+def voice_index(limit: int = 100) -> str:
+    """The skill index for spoken commands: one short line per skill (~3,000 characters instead of ~9,500). On the
+    8 GB Mac the local model reads ~185 prompt tokens a second, so every 1,000 characters is ~1.4 s of waiting."""
+    lines = ["<available_skills>", "load_skill(name) before a task a skill covers; run its helpers with run_skill_script."]
+    for s in LIB.offered():
+        if s.name in VOICE_INDEX_SKIP:
+            continue
+        d = re.sub(r"\s+", " ", s.description).strip()
+        if len(d) > limit:
+            d = d[:limit].rsplit(" ", 1)[0].rstrip(",;:—-(") + "…"
+        lines.append(f"- {s.name}: {d}")
+    lines.append("</available_skills>")
+    return "\n".join(lines)
+
+
+def boot_system_prompt(voice: bool = False) -> str:
+    """voice=True: the compact variant for spoken commands (short skill index; identity, security and the locked
+    owner rules stay whole)."""
     guard = run_script("rules-guard", "rules_guard.py", ["verify"])
     if not guard["ok"]:
         print("RULES CHECK FAILED:", guard["stdout"].strip() or guard["stderr"].strip())
@@ -86,7 +106,8 @@ def boot_system_prompt() -> str:
         workflow = ("\n\nWorkflow: to control the Mac (apps, websites, volume, music, screenshot, lock) call mac_action; "
                     "to run or check anything else on the computer call run_shell. ")
     return (where + "\n\n" + identity + "\n\n" + security +
-            "\n\n<owner_rules locked=\"true\">\n" + rules + "\n</owner_rules>\n\n" + LIB.index_prompt() + workflow +
+            "\n\n<owner_rules locked=\"true\">\n" + rules + "\n</owner_rules>\n\n" +
+            (voice_index() if voice else LIB.index_prompt()) + workflow +
             "A message may start with an <employee> brief: you are that specialist for this task — use their skills, "
             "meet the 'Done when' bar and do the 'Verify' steps before answering. "
             "For bigger tasks call load_skill first, "
@@ -371,7 +392,8 @@ def maybe_daily_learning(now: float | None = None) -> bool:
     return True
 
 
-def turn(messages: list[dict], user_text: str, model_fn=chat) -> str:
+def turn(messages: list[dict], user_text: str, model_fn=chat, tool_chars: int = 12000) -> str:
+    """One exchange. tool_chars: how much of each tool result the model reads back (voice keeps it short)."""
     record_feedback(user_text)
     quick = fast_action(user_text)
     if quick:
@@ -406,7 +428,9 @@ def turn(messages: list[dict], user_text: str, model_fn=chat) -> str:
                 except json.JSONDecodeError:
                     args = {}
             result = LIB.dispatch(fn.get("name", ""), args)
-            messages.append({"role": "tool", "content": result[:12000], "tool_name": fn.get("name", "")})
+            if len(result) > tool_chars:
+                result = result[:tool_chars] + f"\n[... {len(result) - tool_chars} more characters cut]"
+            messages.append({"role": "tool", "content": result, "tool_name": fn.get("name", "")})
     return "Step limit reached — task partly done; see plan/status."
 
 

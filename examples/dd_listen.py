@@ -480,7 +480,106 @@ def helper_source(binary: str, log=print, mode: int = 0):
     raise RuntimeError(f"dd-mic ended: {' | '.join(said[-2:]) or 'no output'}")
 
 
+def ear_binary() -> str:
+    return os.environ.get("DD_EAR_BIN") or str(Path.home() / ".dd" / "bin" / "dd-ear")
+
+
+_ear_failures = 0
+EAR_FATAL = {3: "no input device", 5: "system-audio tap unavailable (macOS 14.2+)", 6: "mic permission denied",
+             9: "aggregate device failed", 10: "audio start failed", 11: "unexpected stream layout"}
+EAR_STATUS = {"active": False, "playing": False, "erle": 0.0}  # what the echo canceller is doing (log / HUD)
+
+
+def ear_wanted() -> bool:
+    """dd-ear (the mic + this Mac's own sound on one clock; the film is subtracted from the mic): DD_EAR=1 turns
+    it on — off by default until it has proven itself on Dhina's Mac (permission: System Audio Recording)."""
+    return os.environ.get("DD_EAR", "0") == "1" and _ear_failures < 2 and os.access(ear_binary(), os.X_OK)
+
+
+def ear_source(binary: str, log=print):
+    """20 ms mono frames from dd-ear with this Mac's own playback removed (dd_aec.EchoCanceller, 10 ms blocks).
+    Same contract as helper_source: raises RuntimeError when the helper stops; fatal exits are not retried."""
+    global _ear_failures
+    import numpy as np
+    import dd_aec
+    import queue as _queue
+    started = time.monotonic()
+    p = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    _children.append(p)
+    said: list[str] = []
+    relay = threading.Thread(target=_relay_stderr, args=(p, "dd-ear", said, log), daemon=True)
+    relay.start()
+    frames_q: _queue.Queue = _queue.Queue(maxsize=500)
+    stereo = FRAME_BYTES * 2
+
+    def pump():
+        try:
+            while True:
+                b = p.stdout.read(stereo)
+                frames_q.put(b)
+                if len(b) < stereo:
+                    return
+        except Exception:
+            frames_q.put(b"")
+    threading.Thread(target=pump, daemon=True, name="dd-ear-pump").start()
+    aec = dd_aec.EchoCanceller()
+    half = FRAME_BYTES // 4  # samples in 10 ms
+    got = zeros = 0
+    stalled = silent = False
+    EAR_STATUS["active"] = True
+    try:
+        while True:
+            try:
+                b = frames_q.get(timeout=HELPER_STALL_S)
+            except _queue.Empty:
+                stalled = True
+                break
+            if len(b) < stereo:
+                break
+            got += 1
+            a = np.frombuffer(b, dtype=np.int16).reshape(-1, 2).astype(np.float32)
+            mic, ref = a[:, 0], a[:, 1]
+            if not mic.any():
+                zeros += 1
+                if zeros == got and zeros * FRAME_MS >= SILENCE_FALLBACK_MS:
+                    silent = True
+                    break
+            else:
+                zeros = 0
+            out = np.concatenate([aec.process(mic[:half], ref[:half]), aec.process(mic[half:], ref[half:])])
+            EAR_STATUS["playing"] = aec.ref_power > 1e-5
+            EAR_STATUS["erle"] = aec.erle
+            yield out.astype(np.int16).tobytes()
+    finally:
+        EAR_STATUS["active"] = False
+        try:
+            p.terminate()  # (SIGTERM: dd-ear removes its tap and aggregate device)
+            code = p.wait(timeout=1.5)
+        except Exception:
+            p.kill()
+            code = None
+        relay.join(timeout=1)
+    if code in EAR_FATAL:
+        _ear_failures = 2
+        raise RuntimeError(f"dd-ear: {EAR_FATAL[code]}")
+    if stalled or code == 8 or silent:
+        _ear_failures = 2
+        raise RuntimeError("dd-ear delivered no audio" if not silent else "dd-ear: mic gives digital silence")
+    if time.monotonic() - started < 3 or got == 0:
+        _ear_failures += 1
+    raise RuntimeError(f"dd-ear ended: {' | '.join(said[-2:]) or 'no output'}")
+
+
 def mic_source(log=print):
+    if ear_wanted():
+        log(f"  mic: dd-ear (mic + this Mac's own sound; echo canceller removes what the Mac plays) {ear_binary()}")
+        try:
+            yield from ear_source(ear_binary(), log)
+            return
+        except RuntimeError as e:
+            if _ear_failures < 2:
+                raise  # it worked and then died: the listener restarts the stream
+            log(f"  mic: {e} -> the plain mic instead")
     kind, path = choose_source()
     if kind == "helper":
         mode = min(4, load_mic_mode())
@@ -652,6 +751,7 @@ CONFIRM_HINT = "Jarvis."
 
 CONFIRM_MIN_LOGPROB = float(os.environ.get("DD_CONFIRM_LOGPROB", "-1.0"))
 CONFIRM_MAX_NOSPEECH = float(os.environ.get("DD_CONFIRM_NOSPEECH", "0.6"))
+BUSY_CROP_S = float(os.environ.get("DD_CONFIRM_BUSY_CROP", "1.5"))  # film playing: confirm on the last 1.5 s only
 
 
 def stt_plain(pcm: bytes) -> str:
@@ -714,6 +814,38 @@ def stt_confirm(pcm: bytes) -> tuple[str, float, float]:
     lp = max((float(x.avg_logprob) for x in segs), default=-9.0)
     ns = min((float(x.no_speech_prob) for x in segs), default=1.0)
     return text, lp, ns
+
+
+def playback_report() -> str:
+    """Who is playing sound on this Mac right now, from pmset's audio assertions ('' = nothing / not a Mac).
+    Diagnostics for a room where a film keeps proposing wake candidates: a film on this Mac's own speakers can be
+    cancelled out of the mic (its sound is known); a TV or phone elsewhere in the room cannot."""
+    if not MAC:
+        return ""
+    try:
+        lines = subprocess.run(["pmset", "-g", "assertions"], capture_output=True, text=True, timeout=5).stdout.splitlines()
+    except Exception as e:
+        return f"(pmset failed: {type(e).__name__})"
+    found: list[str] = []
+    for i, line in enumerate(lines):
+        if "com.apple.audio" not in line and "audio-out" not in line:
+            continue
+        block = " ".join(x.strip() for x in lines[i:i + 3])
+        name = re.search(r'named: "([^"]+)"', block)
+        pid = re.search(r"Created for PID: (\d+)", block)
+        who = ""
+        if pid:
+            try:
+                who = subprocess.run(["ps", "-p", pid.group(1), "-o", "comm="], capture_output=True, text=True,
+                                     timeout=3).stdout.strip().rsplit("/", 1)[-1]
+            except Exception:
+                pass
+        res = re.search(r"Resources: ([^\n]+?)(?:\s{2,}|$)", block)
+        found.append((name.group(1) if name else line.strip()[:80]) + (f" <- {who}" if who else "")
+                     + (f" [{res.group(1)[:40]}]" if res else ""))
+    if not found:  # (a format this parser does not know yet: show the raw lines instead of "nothing")
+        found = [x.strip()[:120] for x in lines if "audio" in x.lower()][:3]
+    return "; ".join(dict.fromkeys(found))[:600]
 
 
 def speech_in(pcm: bytes, floor: float = 0.0, min_rms: float = 150.0) -> bool:
@@ -783,20 +915,75 @@ def default_stop_speaking() -> bool:
     return dd_jarvis.stop_speaking()
 
 
+VOICE_TURNS = int(os.environ.get("DD_VOICE_TURNS", "3"))  # earlier exchanges the voice brain still sees
+VOICE_TOOL_CHARS = int(os.environ.get("DD_VOICE_TOOL_CHARS", "3000"))
+KEEP_WARM_EVERY = 25 * 60  # (Ollama unloads the model 30 min after the last request: dd keep_alive)
+KEEP_WARM_FOR = float(os.environ.get("DD_KEEP_WARM_H", "2")) * 3600  # ... for this long after the last command
+
+
 def make_handle():
-    """The brain: same dd agent loop + skills; short answers for speech (num_predict cap keeps it quick)."""
+    """The brain for spoken commands: the same agent loop + skills, tuned for the 8 GB Mac. The local model read
+    ~185 prompt tokens a second there, and every first command re-read the whole 5,400-token prompt (29 s), then a
+    9,000-character tool result (13 s more). Now: a compact system prompt (one line per skill); handle.prefill()
+    reads it into Ollama's cache at start-up and a light ping every 25 min keeps it there (for 2 h after the last
+    command), so a command only reads its own words; the history is the last few exchanges as plain
+    question/answer pairs (no old tool output, a stable prefix the cache can reuse); tool results are capped."""
     try:
-        messages = [{"role": "system", "content": dd.boot_system_prompt() + VOICE_SUFFIX}]
+        messages = [{"role": "system", "content": dd.boot_system_prompt(voice=True) + VOICE_SUFFIX}]
     except SystemExit:
         return lambda _text: "Rules file hash mismatch — terminal la rules_guard.py reinit run pannu."
+    tokens = int(os.environ.get("DD_VOICE_TOKENS", "220"))
+    state = {"last": 0.0, "warm": None}
+    lock = threading.Lock()
 
     def model(m, t):
-        return dd.chat(m, t, num_predict=int(os.environ.get("DD_VOICE_TOKENS", "220")))
+        return dd.chat(m, t, num_predict=tokens)
 
     def handle(text: str) -> str:
-        reply = dd.turn(messages, text, model)
-        messages[:] = [messages[0]] + messages[-20:]
-        return reply
+        with lock:
+            start = len(messages)
+            try:
+                reply = dd.turn(messages, text, model, tool_chars=VOICE_TOOL_CHARS)
+            except BaseException:
+                del messages[start:]
+                raise
+            finally:
+                state["last"] = time.time()
+            del messages[start:]  # kept as one clean question/answer pair
+            messages.extend([{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
+            if len(messages) > 1 + 2 * VOICE_TURNS:
+                del messages[1:len(messages) - 2 * VOICE_TURNS]
+            return reply
+
+    def _ping() -> float:
+        t0 = time.time()
+        dd.ollama_chat(messages[:1] + [{"role": "user", "content": "hi"}], dd.LIB.tool_schemas(), num_predict=1)
+        return time.time() - t0
+
+    def _keep_warm() -> None:
+        while True:
+            time.sleep(KEEP_WARM_EVERY)
+            if dd.brain() is None and time.time() - state["last"] < KEEP_WARM_FOR:
+                try:
+                    _ping()
+                except Exception:
+                    pass
+
+    def prefill(log=print) -> bool:
+        """Local model only (a cloud brain needs nothing): read the system prompt into the cache now."""
+        if dd.brain() is not None:
+            return False
+        secs = _ping()
+        state["last"] = state["last"] or time.time()
+        if state["warm"] is None:
+            state["warm"] = threading.Thread(target=_keep_warm, daemon=True, name="dd-brain-warm")
+            state["warm"].start()
+        log(f"  brain: voice prompt pre-read in {secs:.0f}s (~{len(messages[0]['content']) // 4} tokens) — "
+            "commands now only read their own words")
+        return True
+
+    handle.prefill = prefill
+    handle.messages = messages
     return handle
 
 
@@ -1351,12 +1538,20 @@ class Listener:
         # Utterances are transcribed/answered on a worker thread, so the mic keeps streaming while Whisper or the
         # model is busy (a slow turn never backs up the audio pipe). inline=True runs them synchronously (tests).
         self.inline = inline
-        self.queue: deque = deque(maxlen=2)   # utterances (and 'verify' jobs); older ones are stale and dropped
+        self.queue: deque = deque(maxlen=2)   # utterances; older ones are stale and dropped
         self.work = threading.Event()
         self.worker: threading.Thread | None = None
+        # Wake candidates are checked by Whisper on their own thread: on the 8 GB Mac a 30-50 s brain call held every
+        # check behind it ("candidate dropped (waited 24 s for Whisper)") — a real "Jarvis" then could never wake dd.
+        self.vqueue: deque = deque(maxlen=1)  # only the newest candidate matters
+        self.vwork = threading.Event()
+        self.vworker: threading.Thread | None = None
+        self._park_lock = threading.Lock()
+        self._parked: tuple | None = None     # an utterance that ended while its candidate was still being checked
         self.stt, self.speak_fn = stt_fn or stt, speak or default_speak
         self.verify_stt = stt_fn or stt_confirm  # wake confirmation: (text, log-prob, no-speech) or plain text
         self.handle = handle  # built lazily (loads rules + skills) unless injected
+        self._handle_lock = threading.Lock()
         self.on_state = on_state or (lambda s: None)
         self.on_heard = on_heard or (lambda text, secs: None)
         self.on_problem = on_problem or (lambda msg: None)
@@ -1380,6 +1575,7 @@ class Listener:
         self._verify_inflight = False   # a Whisper check queued or running
         self._last_verify_at = -1e9
         self._verify_skipped = 0        # candidates skipped while a film kept Whisper busy (shown in the next log)
+        self._media_checked = -1e9
         self.agc = AutoGain()      # quiet raw mics are brought up to speech level before anything else sees them
         self.wake_peak = 0.0       # highest hey-jarvis score since the last idle log line (sensitivity check)
         self.diag = os.environ.get("DD_WAKE_DIAG", "1") != "0"  # keep near-miss clips in logs/voice for tuning
@@ -1540,6 +1736,18 @@ class Listener:
         self.armed_until = self.clock() + self.followup_s
         self.set_state("recording")
 
+    def _ensure_handle(self):
+        with self._handle_lock:
+            if self.handle is None:
+                self.handle = make_handle()
+            return self.handle
+
+    def prepare_brain(self) -> bool:
+        """At start-up (warm thread): build the brain (rules check, skills, prompt) and pre-read its prompt into the
+        local model's cache — the first command used to pay for both."""
+        pre = getattr(self._ensure_handle(), "prefill", None)
+        return bool(pre and pre(self.log))
+
     def ack(self, sound_only: bool = False) -> None:
         """Wake word heard. sound_only: a short system sound (command already understood, action follows).
         Otherwise a spoken 'Sollu.' — unmistakable: dd is waiting for the command."""
@@ -1585,7 +1793,8 @@ class Listener:
             return
         if woke and not cmd:  # just the wake word
             self.woke_at, self.last_command = self.clock(), ""
-            self.ack()
+            if not armed:  # (a confirmed wake already beeped: no spoken "Sollu." over the command that follows)
+                self.ack()
             self.followup_until = self.clock() + self.followup_s
             self.set_state("recording")
             return
@@ -1600,8 +1809,7 @@ class Listener:
             self.ack(sound_only=True)  # "heard you" — instant, before the action or the model
         self.set_state("thinking")
         t1 = self.clock()
-        if self.handle is None:
-            self.handle = make_handle()
+        self._ensure_handle()
         try:
             reply = self.handle(command) or "Done."
         except Exception as e:
@@ -1631,7 +1839,9 @@ class Listener:
         if self._frames % 750 == 0 and self.clock() - self._last_activity > 15:  # idle: a level line every 15 s
             self.log(f"  mic level: peak {self.level:.0f} (room floor {self.seg.floor:.0f}/p90 {self.seg.p90:.0f}; "
                      f"speech starts above {self.seg.threshold():.0f}, ends below {self.seg.end_threshold():.0f}; "
-                     f"gain {self.agc.gain:.1f}x; wake max {self.wake_peak:.2f}) — nothing heard yet")
+                     f"gain {self.agc.gain:.1f}x; wake max {self.wake_peak:.2f}"
+                     + ((f"; Mac sound playing, {EAR_STATUS['erle']:.0f} dB of it removed" if EAR_STATUS["playing"]
+                         else "; Mac silent") if EAR_STATUS["active"] else "") + ") — nothing heard yet")
             self.wake_peak = 0.0
         if self.paused:
             self.set_state("paused")
@@ -1731,7 +1941,33 @@ class Listener:
         if not was and self.seg.speaking:
             self._utt_started = self.clock()
         if utt:
-            self.submit(utt, started=self._utt_started)
+            self._hold_or_submit(utt, self._utt_started)
+
+    def _hold_or_submit(self, utt: bytes, started: float | None) -> None:
+        """An utterance that ends while its wake candidate is still being checked waits for the verdict: kept (the
+        command said in the same breath) when Whisper says "Jarvis", dropped when not. Film dialogue used to be
+        transcribed (1-27 s of Whisper each on the 8 GB Mac) just because a candidate had opened the window."""
+        ts = started if started is not None else self.clock()
+        with self._park_lock:
+            pending = self.verify_pending is not None or self._verify_inflight
+            if pending and not ts < max(self.armed_until, self.followup_until):
+                if self._parked is None:
+                    self._parked = (utt, started)
+                else:  # two pieces inside one candidate window ("Jarvis" ... "chrome open pannu"): one command
+                    self._parked = (self._parked[0] + utt, self._parked[1])
+                return
+        self.submit(utt, started)
+
+    def _release_parked(self, keep: bool) -> None:
+        with self._park_lock:
+            p, self._parked = self._parked, None
+            self._verify_inflight = False
+        if p is None:
+            return
+        if keep:
+            self.submit(*p)
+        else:
+            self.log(f"  (not a wake: {len(p[0]) / (RATE * 2):.1f}s heard meanwhile dropped unread)")
 
     VERIFY_DELAY_FRAMES = 20  # 400 ms: detectors often fire mid-word; Whisper needs the whole word
 
@@ -1743,6 +1979,11 @@ class Listener:
         now = self.clock()
         rej = getattr(source, "rejects", None)
         busy = rej is not None and len([t for t in rej if now - t < 60]) >= 3
+        if busy and MAC and now - self._media_checked > 600:  # (diagnostics: where is the film playing?)
+            self._media_checked = now
+            threading.Thread(target=lambda: self.log("  media check: " + (playback_report() or (
+                "nothing plays on this Mac — the sound comes from the room (TV / phone / people)"))),
+                daemon=True, name="dd-media-check").start()
         if busy and (self._verify_inflight or now - self._last_verify_at < 4.0):
             self._verify_skipped += 1
             return
@@ -1762,35 +2003,54 @@ class Listener:
         if self.inline:
             self._verify(pcm, score, word, source, raw)
             return
-        if self.worker is None or not self.worker.is_alive():
-            self.worker = threading.Thread(target=self._worker, daemon=True, name="dd-brain")
-            self.worker.start()
-        self.queue.append(job)
-        self.work.set()
+        if self.vworker is None or not self.vworker.is_alive():
+            self.vworker = threading.Thread(target=self._verify_worker, daemon=True, name="dd-verify")
+            self.vworker.start()
+        self.vqueue.append(job)
+        self.vwork.set()
+
+    def _verify_worker(self) -> None:
+        while not self.stop.is_set():
+            if not self.vqueue:
+                self.vwork.wait(0.5)
+                self.vwork.clear()
+                continue
+            job = self.vqueue.popleft()
+            try:
+                self._verify(*job[1:])
+            except Exception as e:  # a failed check must not stop the next one
+                self.log(f"  (wake check failed: {type(e).__name__}: {e})")
 
     def _verify(self, pcm: bytes, score: float, word: str = "dd", source=None, raw: bytes | None = None,
                 queued_at: float | None = None) -> None:
+        ok = False
         try:
-            self._verify_one(pcm, score, word, source, raw, queued_at)
+            ok = self._verify_one(pcm, score, word, source, raw, queued_at)
         finally:
-            self._verify_inflight = False
+            self._release_parked(bool(ok))
 
     def _verify_one(self, pcm: bytes, score: float, word: str, source, raw: bytes | None,
-                    queued_at: float | None) -> None:
+                    queued_at: float | None) -> bool:
         t0 = self.clock()
         if queued_at is not None and t0 - queued_at > 4.0:  # the machine was busy: a wake this late only confuses
             self.log(f"  wake: {word} candidate dropped (waited {t0 - queued_at:.1f}s for Whisper)")
             if self.wake is not None and hasattr(self.wake, "cooldown"):
                 self.wake.cooldown = 0
-            return
+            return False
         text, how = "", ""
         lp, ns = 0.0, 0.0
         voice = getattr(self.wake, "voice", None) if self.wake is not None else None
+        rej = getattr(source, "rejects", None)
+        film = rej is not None and len([t for t in rej if t0 - t < 60]) >= 3  # a film keeps proposing candidates
+        clip = raw if raw else pcm
+        n_crop = int(BUSY_CROP_S * RATE) * 2
+        if film and len(clip) > n_crop:  # (his "Jarvis" mixed into his room's film: 61% heard on the last 1.5 s
+            clip = clip[-n_crop:]       #  vs 51% on all 2 s — less film speech before the word to read instead)
         if not speech_in(pcm, self.seg.floor):
             how = "no voice in it"
         else:
             try:
-                res = self.verify_stt(raw if raw else pcm)
+                res = self.verify_stt(clip)
                 text, lp, ns = (res, 0.0, 0.0) if isinstance(res, str) else res
                 text = (text or "").strip()
             except Exception as e:
@@ -1802,9 +2062,12 @@ class Listener:
             if not how.startswith("whisper") and voice is not None and voice.recent_max() >= voice.gate + 0.1:
                 how = f"your voice {voice.recent_max():.2f}"  # sounds like your own recorded 'Jarvis'
         conf = f", log-prob {lp:.2f} no-speech {ns:.2f}" if text else ""
+        if film and clip is not (raw if raw else pcm):
+            conf += f"; film mode: last {BUSY_CROP_S:.1f}s"
         if how == "whisper" or how.startswith("your voice"):
             self.log(f"  wake: {word} confirmed by {how} ({text!r}{conf}, {self.clock() - t0:.1f}s)")
             self.on_wake(score, word, source)
+            return True
         else:
             self.tentative_until = 0.0
             self.seg.reset()
@@ -1821,6 +2084,7 @@ class Listener:
             if self.diag and how != "no voice in it":  # rejected candidates: the data that shows a missed "Jarvis"
                 save_clip(pcm, time.strftime("cand-%H%M%S") + f"-{word}-{score:.2f}-rej-lp{lp:.2f}")
             self.log(f"  wake: {word} candidate rejected ({why}{text!r}{conf}, {self.clock() - t0:.1f}s{thr})")
+            return False
 
     def _idle_state(self) -> str:
         """'recording' while a wake/follow-up window is open (the next words are a command), else 'listening'."""
@@ -1954,6 +2218,53 @@ def _quiet(ms: int, amp: int = 40) -> list[bytes]:
 
 def _zeros(ms: int) -> list[bytes]:
     return [b"\x00" * FRAME_BYTES] * (ms // FRAME_MS)
+
+
+def _brain_selftest() -> None:
+    """The voice brain (make_handle) with a fake model: prefill reads exactly the prompt + tools real turns use,
+    history keeps the last VOICE_TURNS clean question/answer pairs, tool output is capped."""
+    import tempfile
+    saved = {k: os.environ.get(k) for k in ("DD_HOME", "DD_FAST_ROUTER", "DD_EMPLOYEES", "DD_BRAIN")}
+    os.environ.update(DD_HOME=tempfile.mkdtemp(prefix="dd-brain-test-"), DD_FAST_ROUTER="0", DD_EMPLOYEES="0",
+                      DD_BRAIN="ollama")
+    real_chat, real_ollama = dd.chat, dd.ollama_chat
+    calls: list[tuple] = []
+
+    def fake_ollama(messages, tools, **opt):
+        calls.append(("ping", [dict(m) for m in messages], tools, opt))
+        return {"role": "assistant", "content": "."}
+
+    def fake_chat(messages, tools, **opt):
+        calls.append(("chat", [dict(m) for m in messages], tools, opt))
+        if messages[-1]["role"] == "user" and "skills" in messages[-1]["content"]:
+            return {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "list_skills", "arguments": {}}}]}
+        return {"role": "assistant", "content": f"answer {len(calls)}"}
+    try:
+        assert dd.run_script("rules-guard", "rules_guard.py", ["init"])["ok"]
+        dd.chat, dd.ollama_chat = fake_chat, fake_ollama
+        h = make_handle()
+        assert h.prefill(log=lambda *_: None) is True
+        kind, msgs, tools, opt = calls[0]
+        assert kind == "ping" and len(msgs) == 2 and msgs[0] == h.messages[0] and opt == {"num_predict": 1}
+        assert "<available_skills>" in msgs[0]["content"] and len(msgs[0]["content"]) < 14000, len(msgs[0]["content"])
+        assert tools == dd.LIB.tool_schemas()
+        r1 = h("what skills do you have")  # a tool call: its (long) output reaches the model capped
+        tool_msg = [m for m in calls[-1][1] if m["role"] == "tool"][0]
+        assert len(tool_msg["content"]) <= VOICE_TOOL_CHARS + 60 and "more characters cut" in tool_msg["content"]
+        assert calls[-1][2] == tools and calls[-1][1][0] == msgs[0], "same prefix as the prefill (cache reuse)"
+        assert h.messages[1:] == [{"role": "user", "content": "what skills do you have"},
+                                  {"role": "assistant", "content": r1}], h.messages[1:]
+        for i in range(5):
+            h(f"question {i}")
+        assert len(h.messages) == 1 + 2 * VOICE_TURNS and h.messages[-2]["content"] == "question 4"
+        assert all(m["role"] in ("user", "assistant") and "tool_calls" not in m for m in h.messages[1:])
+    finally:
+        dd.chat, dd.ollama_chat = real_chat, real_ollama
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def selftest() -> int:
@@ -2517,6 +2828,46 @@ def selftest() -> int:
         assert any("ffmpeg avfoundation instead" in m for m in logged), logged
     finally:
         g["ffmpeg_source"] = real_ffmpeg
+    # dd-ear: stereo [mic, Mac's own sound] in, the mic with the Mac's sound removed out (20 ms mono frames); a
+    # fatal exit (no tap on this macOS) is not retried and mic_source carries on with the plain mic
+    global _ear_failures
+    import numpy as _npe
+    rng_e = _npe.random.default_rng(2)
+    ref_e = (rng_e.normal(size=RATE * 3) * 4000).astype(_npe.float32)
+    echo_e = _npe.concatenate([_npe.zeros(40, _npe.float32), ref_e[:-40] * 0.5])  # 2.5 ms later, half as loud
+    pcm_e = _npe.stack([echo_e, ref_e], axis=1).astype(_npe.int16).tobytes()
+    ear_dat = fake.parent / "ear.raw"
+    ear_dat.write_bytes(pcm_e)
+    ear = fake.parent / "dd-ear"
+    ear.write_text(f"#!/bin/sh\necho 'listening: mic + tap' >&2\ncat '{ear_dat}'\n")
+    ear.chmod(ear.stat().st_mode | _stat.S_IEXEC)
+    _ear_failures = 0
+    outs, said_e = [], []
+    try:
+        for f in ear_source(str(ear), log=said_e.append):
+            outs.append(f)
+    except RuntimeError:
+        pass
+    assert len(outs) == 3 * 1000 // FRAME_MS and all(len(f) == FRAME_BYTES for f in outs), len(outs)
+    late_in = _npe.frombuffer(b"".join(outs[-50:]), _npe.int16).astype(_npe.float32)
+    late_mic = echo_e[-50 * FRAME_BYTES // 2:]
+    assert (late_in ** 2).mean() < 0.05 * (late_mic ** 2).mean(), "the Mac's own sound must be cancelled"
+    assert any("listening: mic + tap" in m for m in said_e)
+    tapless = fake.parent / "dd-ear-old-macos"
+    tapless.write_text("#!/bin/sh\necho 'system audio capture needs macOS 14.2 or newer' >&2\nexit 5\n")
+    tapless.chmod(tapless.stat().st_mode | _stat.S_IEXEC)
+    _ear_failures = 0
+    try:
+        list(ear_source(str(tapless), log=lambda *_: None))
+        raise AssertionError("must raise")
+    except RuntimeError as e:
+        assert "tap unavailable" in str(e) and _ear_failures == 2, (e, _ear_failures)
+    os.environ["DD_EAR"], os.environ["DD_EAR_BIN"] = "1", str(tapless)
+    assert not ear_wanted(), "a fatal dd-ear failure keeps it off for this run"
+    _ear_failures = 0
+    assert ear_wanted()
+    os.environ.pop("DD_EAR"), os.environ.pop("DD_EAR_BIN")
+    assert not ear_wanted(), "off unless DD_EAR=1"
     _helper_failures = 0
     os.environ["DD_AEC"] = "0"
     assert choose_source()[0] == "ffmpeg"
@@ -2551,6 +2902,87 @@ def selftest() -> int:
     time.sleep(0.4)
     assert 2 <= len(slow_calls) <= 4, slow_calls
     lw.stop.set()
+
+    # 4c2. the wake check has its own thread (a 30-50 s brain call on the 8 GB Mac used to hold it: "candidate dropped
+    #      (waited 24 s for Whisper)"), and an utterance that ends while its candidate is still being checked waits
+    #      for the verdict: kept on "Jarvis", dropped unread otherwise (film lines were transcribed for nothing)
+    class _CandHead:
+        word, threshold, effective_threshold = "jarvis", 0.7, 0.7
+
+        def __init__(self): self.rejects = []
+        def rejected(self, t): self.rejects.append(t)
+        def good_wake(self): pass
+        def false_wake(self, t): pass
+    fwc = FakeWake()
+    fwc.last_word, fwc.last_source = "jarvis", _CandHead()
+    vgate, verdicts, c_stt, c_handled, c_logs = threading.Event(), [], [], [], []
+    brain_gate = threading.Event()
+    brain_gate.set()
+
+    def blocking_verify(pcm):
+        assert vgate.wait(5), "verify gate"
+        return verdicts.pop(0)
+
+    def c_handle(cmd):
+        brain_gate.wait(5)
+        c_handled.append(cmd)
+        return "ok"
+    lc = Listener(source=lambda: iter([]), stt_fn=lambda b: (c_stt.append(1), "jarvis chrome open pannu")[1],
+                  speak=lambda t: None, handle=c_handle, followup_s=8.0, log=c_logs.append, wake=fwc)
+    lc.agc.enabled = False
+    lc.verify_stt = blocking_verify
+
+    def wait_for(cond, secs=5.0):
+        end = time.monotonic() + secs
+        while not cond() and time.monotonic() < end:
+            time.sleep(0.02)
+        return cond()
+
+    def candidate_with_command():
+        for f in _quiet(600):  # (drains dd's own-voice tail)
+            lc.feed(f)
+        for f in _tone(300, amp=3000):  # "Jarvis"
+            lc.feed(f)
+        fwc.fire_in = 1
+        for f in _tone(800) + _quiet(800):  # "... chrome open pannu" in the same breath
+            lc.feed(f)
+    candidate_with_command()
+    assert lc._parked is not None and c_stt == [] and lc._verify_inflight, (lc._parked is not None, c_stt)
+    verdicts.append(("Jarvis.", -0.3, 0.1))
+    vgate.set()
+    assert wait_for(lambda: c_handled == ["chrome open pannu"]), (c_handled, c_logs[-4:])
+    assert lc.vworker is not None and lc.vworker.name == "dd-verify" and lc._parked is None
+    vgate.clear()
+    assert wait_for(lambda: lc.followup_until > 0)  # (the reply is out: its follow-up window opened)
+    lc.followup_until = lc.armed_until = 0.0
+    candidate_with_command()  # film: rejected -> what it said is never transcribed
+    assert lc._parked is not None
+    verdicts.append(("Don't miss.", -0.8, 0.1))
+    vgate.set()
+    assert wait_for(lambda: lc._parked is None and not lc._verify_inflight)
+    assert c_stt == [1] and c_handled == ["chrome open pannu"] and any("dropped unread" in m for m in c_logs), c_logs[-3:]
+    # brain busy for a long time: a real "Jarvis" is still confirmed at once
+    brain_gate.clear()
+    lc.followup_until = time.monotonic() + 8
+    for f in utterance:  # a follow-up command: the brain thread now hangs in c_handle
+        lc.feed(f)
+    assert wait_for(lambda: len(c_stt) == 2)
+    lc.followup_until = lc.armed_until = 0.0
+    verdicts.append(("Jarvis.", -0.3, 0.1))
+    for f in _quiet(600):
+        lc.feed(f)
+    for f in _tone(300, amp=3000):
+        lc.feed(f)
+    fwc.fire_in = 1
+    for f in _quiet(Listener.VERIFY_DELAY_FRAMES * FRAME_MS + 40):
+        lc.feed(f)
+    assert wait_for(lambda: lc.last_heard == "jarvis ✓"), (lc.last_heard, c_logs[-3:])
+    assert len(c_handled) == 1, "confirmed while the brain was still busy"
+    brain_gate.set()
+    assert wait_for(lambda: len(c_handled) == 2)
+    lc.stop.set()
+
+    _brain_selftest()
 
     # 4d. spoken form: short, no dialogue hallucinations, no code
     sp = spoken_form("Chrome open panniten. User: \"hi\"\ndd: \"hello\"\n```bash\nls\n```" + " x" * 300)

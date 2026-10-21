@@ -66,6 +66,8 @@ class AppCore:
         self.teach_result: dict | None = None  # voice setup outcome, shown once by the menu
         self._seen_wake, self._seen_said = 0.0, ""
         self._update_check = 0.0
+        self._newer = False          # the background check found newer dd code on GitHub
+        self._watch: threading.Thread | None = None
 
     # ----- listener wiring -----
     def start(self) -> None:
@@ -120,6 +122,39 @@ class AppCore:
                     pass
                 return True
         return False
+
+    def watch_updates(self, every: float | None = None) -> None:
+        """Background: every 15 min `git fetch`; newer code on GitHub -> update_due() rolls it out when dd is idle.
+        (Fixes used to wait for a manual update or a restart.) DD_NO_UPDATE=1 turns it off."""
+        if os.environ.get("DD_NO_UPDATE") == "1" or not (dd.ROOT / ".git").is_dir() or self._watch is not None:
+            return
+        every = UPDATE_CHECK_S if every is None else every
+
+        def loop():
+            git = ["git", "-C", str(dd.ROOT)]
+            while True:
+                time.sleep(every)
+                try:
+                    subprocess.run(git + ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=10", "fetch", "-q"],
+                                   capture_output=True, text=True, timeout=60)
+                    n = subprocess.run(git + ["rev-list", "--count", "HEAD..@{u}"], capture_output=True, text=True,
+                                       timeout=10).stdout.strip()
+                    if n.isdigit() and int(n) > 0:
+                        self._newer = True
+                except Exception:
+                    pass
+        self._watch = threading.Thread(target=loop, daemon=True, name="dd-update-watch")
+        self._watch.start()
+
+    def update_due(self) -> bool:
+        """True once when newer code is waiting and dd is idle: listening, nothing heard for 2 min, no window open."""
+        lis = self.listener
+        if not self._newer or lis.state not in ("listening", "paused"):
+            return False
+        if lis.clock() - getattr(lis, "_last_activity", 0.0) < 120 or lis.clock() < max(lis.armed_until, lis.followup_until):
+            return False
+        self._newer = False
+        return True
 
     # ----- menu -----
     def icon(self) -> str:
@@ -317,14 +352,17 @@ def run_menu_bar(core: AppCore) -> int:
             if core.teach_result is not None:
                 text, core.teach_result = core.teach_text(), None
                 rumps.alert("dd voice setup", text)
-            if core.update_requested():
-                self.do_update()
+            if core.update_requested() or core.update_due():
+                self.do_update(quiet=True)
 
-        def do_update(self) -> None:
+        def do_update(self, quiet: bool = False) -> None:
             changed, msg = core.update()
-            notify(msg)
+            if not quiet:
+                notify(msg)
             print(f"update: {msg}", flush=True)
             if changed:
+                if quiet:  # (an automatic roll-out: no "Vanakkam Dhina" greeting over his film after the restart)
+                    quiet_start_mark()
                 core.relaunch()
                 core.stop()
                 threading.Timer(2.0, lambda: os._exit(0)).start()
@@ -365,6 +403,29 @@ def run_menu_bar(core: AppCore) -> int:
 
 
 RUNNING_COMMIT = ""  # the commit this process started from (auto_update sets it)
+UPDATE_CHECK_S = float(os.environ.get("DD_UPDATE_EVERY_MIN", "15")) * 60
+
+
+def _quiet_marker() -> Path:
+    return Path(os.environ.get("DD_HOME", Path.home() / ".dd")) / "quiet_start"
+
+
+def quiet_start_mark() -> None:
+    try:
+        _quiet_marker().write_text(f"{time.time():.0f}")
+    except OSError:
+        pass
+
+
+def quiet_start() -> bool:
+    """True (once) when this start is an automatic update restart: skip the spoken greeting."""
+    p = _quiet_marker()
+    try:
+        fresh = time.time() - float(p.read_text().strip() or 0) < 300
+        p.unlink()
+        return fresh
+    except (OSError, ValueError):
+        return False
 
 
 def auto_update() -> bool:
@@ -389,11 +450,12 @@ def auto_update() -> bool:
         return False
 
 
-def mic_helper_build_cmd() -> tuple[list[str] | None, str]:
-    """swiftc command to (re)build the echo-cancelling mic helper, or (None, reason) when nothing to do."""
-    src, out = dd.ROOT / "macapp" / "dd-mic.swift", Path.home() / ".dd" / "bin" / "dd-mic"
+def mic_helper_build_cmd(name: str = "dd-mic") -> tuple[list[str] | None, str]:
+    """swiftc command to (re)build a mic helper (dd-mic: voice processing; dd-ear: mic + this Mac's own sound for
+    the echo canceller), or (None, reason) when nothing to do."""
+    src, out = dd.ROOT / "macapp" / f"{name}.swift", Path.home() / ".dd" / "bin" / name
     if not src.is_file():
-        return None, "no dd-mic.swift"
+        return None, f"no {name}.swift"
     if out.is_file() and out.stat().st_mtime >= src.stat().st_mtime:
         return None, "up to date"
     swiftc = shutil.which("swiftc")
@@ -403,19 +465,25 @@ def mic_helper_build_cmd() -> tuple[list[str] | None, str]:
 
 
 def ensure_mic_helper() -> None:
-    cmd, note = mic_helper_build_cmd()
-    if cmd is None:
-        print(f"mic helper: {note}", flush=True)
-        return
-    Path(note).parent.mkdir(parents=True, exist_ok=True)
-    print("building dd-mic (echo cancellation)...", flush=True)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-    print(("dd-mic built: " + note) if r.returncode == 0 else f"dd-mic build failed: {r.stderr.strip()[-400:]}", flush=True)
-    if r.returncode == 0:  # a new helper may manage voice processing where the old one could not: try all again
+    for name in ("dd-mic", "dd-ear"):
+        cmd, note = mic_helper_build_cmd(name)
+        if cmd is None:
+            print(f"mic helper {name}: {note}", flush=True)
+            continue
+        Path(note).parent.mkdir(parents=True, exist_ok=True)
+        print(f"building {name}...", flush=True)
         try:
-            dd_listen.mic_mode_file().unlink()
-        except OSError:
-            pass
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        except subprocess.TimeoutExpired:
+            print(f"{name} build timed out", flush=True)
+            continue
+        print((f"{name} built: " + note) if r.returncode == 0 else f"{name} build failed: {r.stderr.strip()[-600:]}",
+              flush=True)
+        if r.returncode == 0 and name == "dd-mic":  # a new helper may manage voice processing where the old one
+            try:                                     # could not: try all its wirings again
+                dd_listen.mic_mode_file().unlink()
+            except OSError:
+                pass
 
 
 def ensure_python_deps(mods=(("openwakeword", "openwakeword"), ("faster_whisper", "faster-whisper"),
@@ -473,6 +541,10 @@ def run_app() -> int:
         if dd_listen.ram_gb() < 12:
             time.sleep(20)  # 8 GB Mac: let Whisper settle before the LLM load (both at once starve the mic)
         dd.warm()
+        try:  # the voice brain's prompt read into the local model's cache now, not on the first command (29 s)
+            core.listener.prepare_brain()
+        except Exception as e:
+            print(f"(brain prefill skipped: {type(e).__name__}: {str(e)[:120]})", flush=True)
         try:  # the Tamil Nadu voices (edge-tts, a few MB): installed once; Kokoro stays as the offline fallback
             if dd_voice.setup(log=lambda m: print(m, flush=True)):
                 # (Kokoro is only the offline fallback now: loaded when first needed, not held in RAM — 8 GB Macs)
@@ -490,7 +562,9 @@ def run_app() -> int:
     threading.Thread(target=warm_all, daemon=True, name="dd-warm").start()
     dd.start_reminder_watcher(lambda text: core.listener.say(text))
     core.start()
-    threading.Timer(1.5, lambda: core.listener.say("Vanakkam Dhina. dd ready.")).start()
+    if not quiet_start():
+        threading.Timer(1.5, lambda: core.listener.say("Vanakkam Dhina. dd ready.")).start()
+    core.watch_updates()
     try:
         return run_menu_bar(core)
     except ImportError:
@@ -570,8 +644,9 @@ def selftest() -> int:
     core.stop()
     core.thread.join(timeout=3)
     assert not core.thread.is_alive() and lis.state == "stopped"
-    cmd, note = mic_helper_build_cmd()  # no swiftc / no macOS here: a reason, never an exception
-    assert cmd is None or cmd[0].endswith("swiftc"), (cmd, note)
+    for name in ("dd-mic", "dd-ear"):  # no swiftc / no macOS here: a reason, never an exception
+        cmd, note = mic_helper_build_cmd(name)
+        assert cmd is None or (cmd[0].endswith("swiftc") and cmd[-1].endswith(f"{name}.swift")), (cmd, note)
     # events for the notification fallback: a wake and a spoken reply are each reported once
     assert core.events() == [("said", "Sollu, moonu second.")] and core.events() == []  # the mic test's prompt above
     lis.woke_at = 123.0
@@ -585,6 +660,17 @@ def selftest() -> int:
     assert core.update_requested() is True and not marker.exists()
     core._update_check = 0.0
     assert core.update_requested() is False
+    # newer code found by the background check: rolled out only when dd is idle (listening, quiet for 2 min)
+    core._newer = True
+    lis.state, lis._last_activity, lis.armed_until, lis.followup_until = "recording", lis.clock(), 0.0, 0.0
+    assert core.update_due() is False, "never in the middle of a command"
+    lis.state = "listening"
+    assert core.update_due() is False, "not right after something was heard"
+    lis._last_activity = lis.clock() - 200
+    assert core.update_due() is True and core.update_due() is False and core._newer is False
+    # an automatic update restart skips the spoken greeting (once)
+    quiet_start_mark()
+    assert quiet_start() is True and quiet_start() is False
     # the HUD model follows the same listener (panel itself needs macOS; the model is exercised here)
     import dd_hud
     hud = dd_hud.Hud(lis, panel=type("P", (), {"render": lambda self, f, t: None})())
