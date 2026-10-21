@@ -36,6 +36,7 @@ OVERRIDES = {
     "peru": "பேரு", "veetu": "வீட்டு", "kettaen": "கேட்டேன்", "mazhaiya": "மழையா", "pannidava": "பண்ணிடவா",
     "purinjucha": "புரிஞ்சுச்சா", "dhina": "தினா", "poi": "போய்", "paakava": "பாக்கவா", "yaaravadhu": "யாராவது",
     "paatukku": "பாட்டுக்கு", "pakkathu": "பக்கத்து", "mudinjadhu": "முடிஞ்சது", "aen": "ஏன்", "kodu": "கொடு",
+    "valluvar": "வள்ளுவர்", "pallavi": "பல்லவி",
 }
 SKIP = {"um", "per"}  # also everyday English: left to the English list
 HEADER = ("# Thanglish word -> Tamil script, for dd's Tamil voices. Built with skills/voice/scripts/build_thanglish.py:\n"
