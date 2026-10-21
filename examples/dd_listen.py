@@ -558,11 +558,19 @@ def ear_source(binary: str, log=print):
     ref_zero = loud = 0  # frames: Mac sound all-zero in a row / of those, how many with a loud room
     global _ear_tap_restart_at
     EAR_STATUS["active"] = True
+    told = False
     try:
         while True:
             try:
                 b = frames_q.get(timeout=HELPER_STALL_S)
             except _queue.Empty:
+                # dd-ear asked macOS for the Microphone and waits for the click: wait with it (5 min), do not fall
+                # back after 6 s (that left dd on a plain mic still blocked by the same prompt)
+                if got == 0 and any("asking" in line for line in said) and time.monotonic() - started < 300:
+                    if not told:
+                        told = True
+                        log("  dd-ear: waiting for you to Allow the Microphone in the macOS prompt")
+                    continue
                 stalled = True
                 break
             if len(b) < stereo:
@@ -3051,6 +3059,22 @@ def selftest() -> int:
     late_mic = echo_e[-50 * FRAME_BYTES // 2:]
     assert (late_in ** 2).mean() < 0.05 * (late_mic ** 2).mean(), "the Mac's own sound must be cancelled"
     assert any("listening: mic + tap" in m for m in said_e)
+    # dd-ear waiting for the Microphone prompt: no audio for a while is not a stall then
+    asking = fake.parent / "dd-ear-asking"
+    asking.write_text(f"#!/bin/sh\necho 'mic permission: asking (Allow in the macOS prompt)...' >&2\nsleep 1.5\n"
+                      f"head -c 2560 '{ear_dat}'\n")
+    asking.chmod(asking.stat().st_mode | _stat.S_IEXEC)
+    real_stall2, HELPER_STALL_S = HELPER_STALL_S, 0.5
+    _ear_failures = 0
+    waited, got_a = [], []
+    try:
+        for f in ear_source(str(asking), log=waited.append):
+            got_a.append(f)
+    except RuntimeError:
+        pass
+    finally:
+        HELPER_STALL_S = real_stall2
+    assert any("Allow the Microphone" in m for m in waited) and len(got_a) == 2, (waited, len(got_a))
     tapless = fake.parent / "dd-ear-old-macos"
     tapless.write_text("#!/bin/sh\necho 'system audio capture needs macOS 14.2 or newer' >&2\nexit 5\n")
     tapless.chmod(tapless.stat().st_mode | _stat.S_IEXEC)
