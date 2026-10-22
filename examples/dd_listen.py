@@ -1850,6 +1850,7 @@ class Listener:
         self.tentative_until = 0.0  # a "dd" candidate is being confirmed: keep capturing the command meanwhile
         self.verify_pending: dict | None = None  # a candidate waiting for the rest of the word before Whisper
         self._verify_next: dict | None = None    # film mode: the best candidate that arrived while a check ran
+        self._transcribing = False               # a command decode is running: suppress film Whisper checks
         self.verify = os.environ.get("DD_WAKE_VERIFY", "1") != "0"
         self.wake_source = None    # the head that proposed the current wake (learns from what follows)
         if self.wake is not None and hasattr(self.wake, "soft_enabled"):
@@ -2047,7 +2048,11 @@ class Listener:
             self.set_state(self._idle_state())
             return
         t0 = self.clock()
-        text = self.stt(utt).strip()
+        self._transcribing = True  # while the command decodes, no film Whisper checks (they starved it to 19-26 s)
+        try:
+            text = self.stt(utt).strip()
+        finally:
+            self._transcribing = False
         secs = self.clock() - t0
         self._last_activity = self.clock()
         if text and ts < self.armed_until and prompt_echo(text):
@@ -2223,9 +2228,12 @@ class Listener:
             if score:
                 self._near_pending = None  # it was not a near miss after all
                 word, source = getattr(self.wake, "last_word", "") or "hey jarvis", getattr(self.wake, "last_source", None)
-                if source is not None and self.clock() < max(self.armed_until, self.followup_until):
-                    # already awake and taking the command: a head firing on "...chrome open pannu" over a film must
-                    # not restart the capture (it cut the command short) — the words are being recorded anyway
+                # While dd is already awake and taking / transcribing / answering a command, do NOT run Whisper on
+                # film candidates: on the 2-core 8 GB M1 those checks starved his command decode to 19-26 s (22 Oct,
+                # a film playing). The wake already happened; his words are being recorded regardless.
+                taking_command = (self.clock() < max(self.armed_until, self.followup_until)
+                                  or self._transcribing or self.speaking)
+                if source is not None and taking_command:
                     if hasattr(self.wake, "cooldown"):
                         self.wake.cooldown = 0
                 elif source is not None and self.verify:
@@ -2295,6 +2303,10 @@ class Listener:
         only if Whisper agrees. While a film keeps proposing candidates (3+ rejections in a minute) at most one check
         runs at a time and they start >= 4 s apart — the 8 GB Mac took 2-26 s per check with a film playing."""
         now = self.clock()
+        if self._transcribing:  # a command decode is running: a film check now would starve it (19-26 s, 22 Oct)
+            if self.wake is not None and hasattr(self.wake, "cooldown"):
+                self.wake.cooldown = 0
+            return
         rej = getattr(source, "rejects", None)
         busy = rej is not None and len([t for t in rej if now - t < 60]) >= 3
         if busy and MAC and now - self._media_checked > 600:  # (diagnostics: where is the film playing?)
@@ -2365,8 +2377,11 @@ class Listener:
             job = self.vqueue.popleft()
             with self._park_lock:
                 self._verify_inflight = True
-            if self.clock() < max(self.armed_until, self.followup_until) and job[6] < self.clock() - 0.5:
-                self._release_parked(False)  # (already awake from the check before it: this one is moot)
+            # a command is being taken or transcribed/answered now: this film check is moot and would starve the
+            # command decode — drop it
+            if self._transcribing or (self.clock() < max(self.armed_until, self.followup_until)
+                                      and job[6] < self.clock() - 0.5):
+                self._release_parked(False)  # a command decode is running (or a stale check): free the CPU for it
                 continue
             try:
                 self._verify(*job[1:])
@@ -3477,6 +3492,11 @@ def selftest() -> int:
     lc.followup_until = lc.armed_until = 0.0
     src.rejects.clear()
     lc._verify_skipped = 0
+    # while the command decode runs, a film candidate starts NO Whisper check (it starved his command to 19-26 s)
+    lc._transcribing = True
+    lc.confirm_wake(0.95, "jarvis", src)
+    assert lc.verify_pending is None and lc._verify_next is None, "no film check while transcribing a command"
+    lc._transcribing = False
     vgate.set()
     # brain busy for a long time: a real "Jarvis" is still confirmed at once
     brain_gate.clear()
