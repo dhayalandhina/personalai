@@ -1129,8 +1129,8 @@ def stt(pcm: bytes, hint: str | None = None) -> str:
         except Exception as e:
             print(f"(mlx stt failed: {str(e)[:80]} — faster-whisper for this one)", flush=True)
     model = load_whisper()
-    if getattr(model, "_dd_name", "") != "base" and (mac_busy() or small_slow()):
-        model = model_named("base") or model  # (the Mac plays sound / small crawled: base answers in a few s)
+    # The command stays on small: base turned his spoken Tamil into "Open one, sir." (22 Oct) — a fast wrong command
+    # is useless. (base is only for the *wake confirmation*, where the word alone matters; see confirm_model.)
     # English decoding: Thanglish comes out as written Thanglish; spoken Tamil / Hindi as readable romanised words
     # ("Ippo mani enna?", "Abhi kitne baje hai?"). Auto language detection on a 2 s command wandered (Japanese,
     # Korean, Arabic...) and translation garbled half of them — tested 16 utterances, 4 languages.
@@ -1142,6 +1142,12 @@ def stt(pcm: bytes, hint: str | None = None) -> str:
     text = " ".join(s.text.strip() for s in segs).strip()
     note_decode(getattr(model, "_dd_name", ""), time.monotonic() - t0, len(pcm) / (RATE * 2))
     _touch_decode()
+    if not text.strip() and getattr(model, "_dd_name", "") != "base":  # small heard nothing: base is worth one try
+        b = model_named("base")
+        if b is not None:
+            segs, _ = b.transcribe(audio, language=None if lang == "auto" else lang, beam_size=1, vad_filter=False,
+                                   condition_on_previous_text=False, initial_prompt=prompt, no_speech_threshold=0.6)
+            text = " ".join(x.text.strip() for x in segs).strip()
     return text
 
 
@@ -3302,19 +3308,21 @@ def selftest() -> int:
     le.process(b"\x00\x00" * 16000, now["t"])
     assert e_handled == ["Volume thirty."], e_handled
 
-    # 4b2. Whisper model choice: small while the Mac is quiet; base while it plays sound, in film mode, or for
-    # 10 min after small crawled (13-27 s per command on the 8 GB M1 with a film on)
+    # 4b2. Whisper model choice. The COMMAND always uses small (base turned his Tamil into "Open one, sir."): a wrong
+    # command is useless, a slow-but-right one is not. base is for the WAKE CONFIRMATION under load (the word alone
+    # matters there) and as the fallback when small heard nothing.
     global _whisper, _small_slow_until, _film_seen_at
 
     class FakeModel:
-        def __init__(self, name):
-            self._dd_name, self.calls = name, 0
+        def __init__(self, name, text=""):
+            self._dd_name, self.calls, self._text = name, 0, text
 
         def transcribe(self, audio, **kw):
             self.calls += 1
-            return iter([]), None
+            seg = type("S", (), {"text": self._text, "avg_logprob": -0.3, "no_speech_prob": 0.1, "words": []})()
+            return iter([seg]), None
     saved_w, saved_m = _whisper, dict(_models)
-    fs, fb = FakeModel("small"), FakeModel("base")
+    fs, fb = FakeModel("small", "volume thirty"), FakeModel("base", "volume thirty")
     _whisper, _models["base"] = fs, fb
     os.environ["DD_STT_MODEL"] = "small"
     try:
@@ -3322,23 +3330,20 @@ def selftest() -> int:
         assert (fs.calls, fb.calls) == (1, 0), "quiet Mac: small"
         EAR_STATUS["active"] = EAR_STATUS["playing"] = True
         stt(b"\x00\x00" * 1600)
-        assert (fs.calls, fb.calls) == (1, 1), "the Mac plays sound: base"
+        assert (fs.calls, fb.calls) == (2, 0), "the command stays on small even while the Mac plays sound"
+        # the wake confirmation, by contrast, uses base under load
         assert confirm_model(False) is fb and confirm_model(True) is fb
         EAR_STATUS["active"] = EAR_STATUS["playing"] = False
         assert confirm_model(False) is fs and confirm_model(True) is fb
         _film_seen_at = time.monotonic()
-        stt(b"\x00\x00" * 1600)
-        assert fb.calls == 2, "film mode a moment ago: base"
+        assert confirm_model(False) is fb, "film mode a moment ago: base confirm"
         _film_seen_at = -1e9
-        note_decode("small", 4.0, 1.0)
-        assert not small_slow(), "4 s for 1 s of audio is fine"
-        note_decode("small", 13.1, 4.1)
-        assert small_slow(), "13 s for 4 s of audio: base for a while"
+        # small heard nothing -> base gets one try for the command
+        fs._text = ""
+        before = fb.calls
         stt(b"\x00\x00" * 1600)
-        assert fb.calls == 3
-        _small_slow_until = 0.0
-        stt(b"\x00\x00" * 1600)
-        assert fs.calls == 2, "after the window: small again"
+        assert fb.calls == before + 1, "small heard nothing: base is tried once"
+        fs._text = "volume thirty"
     finally:
         _whisper, _small_slow_until, _film_seen_at = saved_w, 0.0, -1e9
         _models.clear()

@@ -186,9 +186,12 @@ def resolve_open(name: str, web_ok: bool = True) -> dict:
         hit = match_app(q, apps)
         if hit:
             return {"kind": "app", "target": hit, "label": hit}
-    if not q or not web_ok or (not want_site and (NOT_A_SITE.match(q) or len(q.split()) > 3)):
-        return {"kind": "none", "target": "", "label": q}
-    return {"kind": "web", "target": ducky_url(q), "label": q}
+    # a known app alias whose app is not installed (e.g. "spotify") opens its website; a clear site request
+    # ("flipkart website", a domain) does too. A bare "open X" with an UNKNOWN X (often a mis-heard command:
+    # "Open one, sir.") goes to the LLM instead of a random web search.
+    if q and not NOT_A_SITE.match(q) and (want_site or q in APPS or q in SPOKEN):
+        return {"kind": "web", "target": ducky_url(q), "label": SPOKEN.get(q, q)}
+    return {"kind": "none", "target": "", "label": q}
 
 
 KIND_EXT = {"pdf": (".pdf",), "word": (".doc", ".docx", ".pages", ".rtf"), "doc": (".doc", ".docx", ".pages", ".rtf"),
@@ -1122,7 +1125,8 @@ def selftest() -> int:
     assert resolve_open("visual studio code app")["target"] == "Visual Studio Code"
     assert resolve_open("netflix")["target"] == "https://www.netflix.com" and resolve_open("amazon.in")["target"] == "https://amazon.in"
     assert resolve_open("spotify")["kind"] == "web", resolve_open("spotify")  # (alias, not installed here: its website)
-    assert resolve_open("hotstar website")["kind"] == "site" and resolve_open("some random shop")["kind"] == "web"
+    assert resolve_open("hotstar website")["kind"] == "site" and resolve_open("some random shop")["kind"] == "none"
+    assert resolve_open("zerodha")["kind"] == "none" and resolve_open("zerodha website")["kind"] == "web"
     assert do("open microsoft word")["would_run"] == [["open", "-a", "/Applications/Microsoft Word.app"]]
     assert do("word open pannu")["say"] == "Microsoft Word open panniten."
     assert do("chrome open pannu")["would_run"] == [["open", "-a", "/Applications/Google Chrome.app"]]
@@ -1132,7 +1136,9 @@ def selftest() -> int:
     for line in ("Open the gate!", "Open fire!", "Open your eyes.", "Switch to plan B.", "Go to hell.", "Open up!", "Stop him!"):
         assert do(line) == {"handled": False}, (line, do(line))
     assert do("switch to safari")["would_run"] == [["open", "-a", "/Applications/Safari.app"]]
-    assert do("open zerodha")["would_run"] == [["open", ducky_url("zerodha")]]
+    assert do("open zerodha") == {"handled": False}, do("open zerodha")  # unknown bare name -> the LLM, not a web search
+    assert do("zerodha website open pannu")["would_run"] == [["open", ducky_url("zerodha")]]
+    assert do("open one sir") == {"handled": False} and do("open the gate") == {"handled": False}
     assert do("what is 25 times 4")["say"] == "Answer 100." and do("100 divided by 8")["say"] == "Answer 12.5."
     assert calc_expr("21-10-2026") is None and calc_expr("volume 30") is None and calc_expr("2 ** 99999") == "2 ** 99999"
     assert do("2 ** 99999")["ok"] is False
