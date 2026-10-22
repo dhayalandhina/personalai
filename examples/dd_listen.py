@@ -944,12 +944,12 @@ def keep_whisper_warm(every: float = 45.0) -> None:
             if time.monotonic() - _last_decode_at < every or _whisper is None:
                 continue
             try:
-                model = _whisper
-                if getattr(model, "_dd_name", "") != "base" and (mac_busy() or small_slow()):
-                    model = model_named("base") or model
-                segs, _ = model.transcribe(pad, language="en", beam_size=1, vad_filter=False,
-                                           condition_on_previous_text=False, no_speech_threshold=0.6)
-                list(segs)
+                for model in (_whisper, _models.get("base")):  # keep the command model (small) + base resident
+                    if model is None:
+                        continue
+                    segs, _ = model.transcribe(pad, language="en", beam_size=1, vad_filter=False,
+                                               condition_on_previous_text=False, no_speech_threshold=0.6)
+                    list(segs)
                 _touch_decode()
             except Exception:
                 pass

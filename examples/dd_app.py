@@ -510,7 +510,8 @@ def run_diag(listener=None, out: Path | None = None) -> str:
                 add(f"whisper {name}: 3 s clip decoded in {time.monotonic() - t0:.1f}s")
             except Exception as e:
                 add(f"whisper {name}: failed {type(e).__name__}")
-        add(f"stt choice now: {'base (Mac busy / small slow)' if dd_listen.mac_busy() or dd_listen.small_slow() else dd_listen.default_stt_model()}")
+        add(f"stt: command always {dd_listen.default_stt_model()}; wake-confirm "
+            f"{'base (Mac busy / small slow)' if dd_listen.mac_busy() or dd_listen.small_slow() else dd_listen.default_stt_model()}")
         # ---- brain
         add(f"brain: {dd.brain_label()}")
         add("ollama ps: " + _sh(["ollama", "ps"], 10).replace("\n", " | ")[:300])
