@@ -1790,6 +1790,63 @@ def make_wake_detector():
 
 
 # ---------------- the listener ----------------
+class VolumeDucker:
+    """While dd listens for a command over a film it plays, the film is in the mic louder than Dhina (the echo
+    canceller only clears 3-5 dB). So the moment a wake is confirmed, lower this Mac's own output volume; raise it
+    back before dd speaks its reply (so the answer is heard) and when the command window closes. Dhina asked for
+    this (24 Oct). DD_DUCK=0 turns it off; DD_DUCK_LEVEL is the volume to duck to (default 18)."""
+
+    def __init__(self, level: int | None = None):
+        self.level = int(os.environ.get("DD_DUCK_LEVEL", "18")) if level is None else level
+        self.saved: int | None = None   # the volume before ducking (None = not ducked)
+        self._lock = threading.Lock()
+
+    def _get(self) -> int | None:
+        try:
+            r = subprocess.run(osa_cmd("output volume of (get volume settings)"), capture_output=True, text=True, timeout=5)
+            return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else None
+        except Exception:
+            return None
+
+    def _set(self, vol: int) -> None:
+        try:
+            subprocess.run(osa_cmd(f"set volume output volume {max(0, min(100, vol))}"), capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    def duck(self) -> None:
+        """Lower the volume if the Mac is playing above the duck level. Non-blocking (its own thread)."""
+        if not MAC or os.environ.get("DD_DUCK", "1") != "1" or os.environ.get("DD_MUTE") == "1":
+            return
+        threading.Thread(target=self._duck, daemon=True, name="dd-duck").start()
+
+    def _duck(self) -> None:
+        with self._lock:
+            if self.saved is not None:
+                return
+            cur = self._get()
+            if cur is None or cur <= self.level:  # nothing to gain (muted / already quiet)
+                return
+            self.saved = cur
+            self._set(self.level)
+
+    def restore(self) -> None:
+        if self.saved is None:
+            return
+        threading.Thread(target=self._restore, daemon=True, name="dd-unduck").start()
+
+    def _restore(self) -> None:
+        with self._lock:
+            if self.saved is None:
+                return
+            vol, self.saved = self.saved, None
+            self._set(vol)
+
+
+def osa_cmd(script: str) -> list:
+    return ["osascript", "-e", script]
+
+
 class Listener:
     def __init__(self, source=None, stt_fn=None, speak=None, handle=None, on_state=None, on_heard=None,
                  on_problem=None, followup_s: float | None = None, clock=time.monotonic, log=print,
@@ -1851,6 +1908,7 @@ class Listener:
         self.verify_pending: dict | None = None  # a candidate waiting for the rest of the word before Whisper
         self._verify_next: dict | None = None    # film mode: the best candidate that arrived while a check ran
         self._transcribing = False               # a command decode is running: suppress film Whisper checks
+        self.ducker = VolumeDucker()              # lower the Mac's own film volume while listening for a command
         self.verify = os.environ.get("DD_WAKE_VERIFY", "1") != "0"
         self.wake_source = None    # the head that proposed the current wake (learns from what follows)
         if self.wake is not None and hasattr(self.wake, "soft_enabled"):
@@ -1966,6 +2024,7 @@ class Listener:
             self.on_state(s)
 
     def say(self, text: str) -> None:
+        self.ducker.restore()  # never speak over a ducked film: raise it back first
         self.last_said = text
         self.set_state("speaking")
         self.speaking = True
@@ -2001,6 +2060,8 @@ class Listener:
             if EAR_STATUS["active"] and EAR_RECENT:
                 save_clip(b"".join(EAR_RECENT), name + "-st", channels=2)
         self.on_heard(word, 0.0)
+        if EAR_STATUS.get("playing") or mac_is_playing():  # a film is on: quiet it so the mic hears his command
+            self.ducker.duck()
         self.ack(sound_only=True)
         if self.clock() >= self.tentative_until:  # (a confirmed candidate keeps what it captured meanwhile)
             self.seg.reset()
@@ -2047,6 +2108,7 @@ class Listener:
             self.log(f"  skipped: {audio:.0f}s of continuous audio (media?) — pause dd or use earphones while a video plays")
             self.set_state(self._idle_state())
             return
+        self.ducker.restore()  # his command is captured: film back up, and dd's reply will be at normal volume
         t0 = self.clock()
         self._transcribing = True  # while the command decodes, no film Whisper checks (they starved it to 19-26 s)
         try:
@@ -2172,6 +2234,7 @@ class Listener:
             self.set_state("listening")
         if self.state == "recording" and self.clock() >= max(self.followup_until, self.armed_until):
             self.set_state("listening")
+            self.ducker.restore()  # window closed (he said "Jarvis" but no command): film back up
         if frame.count(b"\x00") == len(frame):  # digital silence = no mic at all (permission / device)
             self.zero_run += 1
             if self.zero_run * FRAME_MS >= 8000 and not self.problem_sent:
@@ -3520,6 +3583,35 @@ def selftest() -> int:
     lc.stop.set()
 
     _brain_selftest()
+
+    def _wait(cond, secs=2.0):
+        end = time.monotonic() + secs
+        while not cond() and time.monotonic() < end:
+            time.sleep(0.02)
+
+    # 4c3. volume ducking: a confirmed wake while the Mac plays quiets it; restore brings it back (osascript stubbed)
+    global MAC
+    saved_mac, saved_run = MAC, subprocess.run
+    MAC = True
+    dvol = {"v": 70}
+
+    def duck_run(cmd, **kw):
+        sc = cmd[-1]
+        r = type("R", (), {"returncode": 0, "stdout": str(dvol["v"]) if "output volume of" in sc else "", "stderr": ""})()
+        if "set volume output volume" in sc:
+            dvol["v"] = int(sc.split()[-1])
+        return r
+    subprocess.run = duck_run
+    try:
+        dk = VolumeDucker(level=18)
+        dk.duck(); _wait(lambda: dvol["v"] == 18)
+        assert dvol["v"] == 18 and dk.saved == 70, (dvol, dk.saved)
+        dk.restore(); _wait(lambda: dvol["v"] == 70)
+        assert dvol["v"] == 70 and dk.saved is None
+        dvol["v"] = 10; dk.duck(); time.sleep(0.15)
+        assert dk.saved is None and dvol["v"] == 10, "already quiet: untouched"
+    finally:
+        MAC, subprocess.run = saved_mac, saved_run
 
     # 4d. spoken form: short, no dialogue hallucinations, no code
     sp = spoken_form("Chrome open panniten. User: \"hi\"\ndd: \"hello\"\n```bash\nls\n```" + " x" * 300)
