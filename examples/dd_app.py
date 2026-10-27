@@ -774,6 +774,9 @@ def run_app() -> int:
                        + " — Whisper runs only after the wake") if wake
                       else "Whisper text wake (install openwakeword for the always-on model)"), flush=True)
     print(f"brain: {dd.brain_label()}", flush=True)
+    duck = os.environ.get("DD_DUCK", "1") == "1"
+    print(f"listening mode: {'dd-ear (echo cancel) + ' if dd_listen.ear_wanted() else 'plain mic + '}"
+          f"{'volume duck on (film lowered while taking a command)' if duck else 'no duck'}", flush=True)
     vp = getattr(wake, "voice", None) if wake else None
     print(f"voice print: {vp.clips} recordings, detect {vp.threshold:.2f}, gate {vp.gate:.2f}" if vp
           else "voice print: none yet — menu → " + TEACH, flush=True)
