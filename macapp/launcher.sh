@@ -4,6 +4,10 @@
 # then runs the menu-bar app (examples/dd_app.py). Log: ~/.dd/logs/app.log (+ personalai/logs/app.log)
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export LANG="${LANG:-en_US.UTF-8}" LC_ALL="${LC_ALL:-en_US.UTF-8}" DD_APP=1 PYTHONUNBUFFERED=1
+# dd-ear (the Core-Audio tap for echo cancellation) is unstable on this 8 GB M1 (the mic IO proc stops after ~60 s,
+# and restart overlaps leave it silent) and only ever cleared 3-5 dB. Volume ducking (dd lowers the film while it
+# takes a command) handles media far better and needs no tap, so dd-ear is off here. Unset this line to try it again.
+export DD_EAR="${DD_EAR:-0}"
 
 # Apple silicon: if something launched us under Rosetta, re-exec natively — the arm64 numpy/whisper wheels
 # cannot load into an x86_64 python.
