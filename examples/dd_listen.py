@@ -515,9 +515,12 @@ _ear_tap_restart_at = -1e9
 
 def ear_wanted() -> bool:
     """dd-ear: the mic + this Mac's own sound on one clock; the echo canceller subtracts the film from the mic.
-    On by default (21 Oct: the film in Dhina's room plays on this Mac's speakers, from Chrome — pmset); DD_EAR=0
-    turns it off. Needs the System Audio Recording permission for dd, else the tap is silent (plain mic)."""
-    return os.environ.get("DD_EAR", "1") == "1" and _ear_failures < 2 and os.access(ear_binary(), os.X_OK)
+    Default OFF on a low-RAM Mac (< 12 GB): on Dhina's 8 GB M1 the tap's mic IO proc stops after ~60 s and restart
+    overlaps leave it silent, and it only cleared 3-5 dB — volume ducking (lower the film while taking a command)
+    handles media far better there. On by default on 12 GB+. DD_EAR=1 forces it on, DD_EAR=0 off. Needs the System
+    Audio Recording permission, else the tap is silent."""
+    default = "1" if ram_gb() >= 12 else "0"
+    return os.environ.get("DD_EAR", default) == "1" and _ear_failures < 2 and os.access(ear_binary(), os.X_OK)
 
 
 def mac_is_playing(report: str | None = None) -> bool:
