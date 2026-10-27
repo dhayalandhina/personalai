@@ -1817,13 +1817,13 @@ class VolumeDucker:
         except Exception:
             pass
 
-    def duck(self) -> None:
+    def duck(self, log=None) -> None:
         """Lower the volume if the Mac is playing above the duck level. Non-blocking (its own thread)."""
         if not MAC or os.environ.get("DD_DUCK", "1") != "1" or os.environ.get("DD_MUTE") == "1":
             return
-        threading.Thread(target=self._duck, daemon=True, name="dd-duck").start()
+        threading.Thread(target=self._duck, args=(log,), daemon=True, name="dd-duck").start()
 
-    def _duck(self) -> None:
+    def _duck(self, log=None) -> None:
         with self._lock:
             if self.saved is not None:
                 return
@@ -1832,18 +1832,22 @@ class VolumeDucker:
                 return
             self.saved = cur
             self._set(self.level)
+            if log:
+                log(f"  volume ducked {cur} -> {self.level} (film lowered while taking your command)")
 
-    def restore(self) -> None:
+    def restore(self, log=None) -> None:
         if self.saved is None:
             return
-        threading.Thread(target=self._restore, daemon=True, name="dd-unduck").start()
+        threading.Thread(target=self._restore, args=(log,), daemon=True, name="dd-unduck").start()
 
-    def _restore(self) -> None:
+    def _restore(self, log=None) -> None:
         with self._lock:
             if self.saved is None:
                 return
             vol, self.saved = self.saved, None
             self._set(vol)
+            if log:
+                log(f"  volume restored to {vol}")
 
 
 def osa_cmd(script: str) -> list:
@@ -2027,7 +2031,7 @@ class Listener:
             self.on_state(s)
 
     def say(self, text: str) -> None:
-        self.ducker.restore()  # never speak over a ducked film: raise it back first
+        self.ducker.restore(self.log)  # never speak over a ducked film: raise it back first
         self.last_said = text
         self.set_state("speaking")
         self.speaking = True
@@ -2063,8 +2067,10 @@ class Listener:
             if EAR_STATUS["active"] and EAR_RECENT:
                 save_clip(b"".join(EAR_RECENT), name + "-st", channels=2)
         self.on_heard(word, 0.0)
-        if EAR_STATUS.get("playing") or mac_is_playing():  # a film is on: quiet it so the mic hears his command
-            self.ducker.duck()
+        # a film is on (dd-ear hears it, pmset sees it, or it kept proposing candidates): quiet it so the mic
+        # hears his command. film_mode() is the reliable signal — pmset misses audio played inside Chrome.
+        if EAR_STATUS.get("playing") or self.film_mode() or mac_is_playing():
+            self.ducker.duck(self.log)
         self.ack(sound_only=True)
         if self.clock() >= self.tentative_until:  # (a confirmed candidate keeps what it captured meanwhile)
             self.seg.reset()
@@ -2111,7 +2117,7 @@ class Listener:
             self.log(f"  skipped: {audio:.0f}s of continuous audio (media?) — pause dd or use earphones while a video plays")
             self.set_state(self._idle_state())
             return
-        self.ducker.restore()  # his command is captured: film back up, and dd's reply will be at normal volume
+        self.ducker.restore(self.log)  # his command is captured: film back up, and dd's reply at normal volume
         t0 = self.clock()
         self._transcribing = True  # while the command decodes, no film Whisper checks (they starved it to 19-26 s)
         try:
@@ -2237,7 +2243,7 @@ class Listener:
             self.set_state("listening")
         if self.state == "recording" and self.clock() >= max(self.followup_until, self.armed_until):
             self.set_state("listening")
-            self.ducker.restore()  # window closed (he said "Jarvis" but no command): film back up
+            self.ducker.restore(self.log)  # window closed (he said "Jarvis" but no command): film back up
         if frame.count(b"\x00") == len(frame):  # digital silence = no mic at all (permission / device)
             self.zero_run += 1
             if self.zero_run * FRAME_MS >= 8000 and not self.problem_sent:
